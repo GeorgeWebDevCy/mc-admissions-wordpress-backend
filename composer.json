@@ -1,0 +1,11 @@
+{
+    "name": "mesoyios/mc-admissions-wordpress-backend",
+    "description": "WordPress REST backend for the MC Admissions desktop app.",
+    "type": "wordpress-plugin",
+    "require": {
+        "yahnis-elsts/plugin-update-checker": "^5.5"
+    },
+    "config": {
+        "optimize-autoloader": true
+    }
+}
