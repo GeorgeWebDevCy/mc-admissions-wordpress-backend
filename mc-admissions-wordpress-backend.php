@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.7
+ * Version: 0.2.8
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -1131,6 +1131,25 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				);
 			}
 
+			if (
+				strtolower((string) ($row['wordpressEmail'] ?? '')) !== strtolower((string) $current_user->user_email)
+				|| strtolower((string) ($row['consultantEmail'] ?? '')) !== strtolower((string) $current_user->user_email)
+			) {
+				$wpdb->update(
+					$this->agency_profiles_table,
+					array(
+						'wordpressEmail'  => $current_user->user_email,
+						'consultantEmail' => $current_user->user_email,
+						'updatedAt'       => current_time('mysql', true),
+					),
+					array('wordpressUserId' => $user_id)
+				);
+
+				$row['wordpressEmail']  = $current_user->user_email;
+				$row['consultantEmail'] = $current_user->user_email;
+				$row['updatedAt']       = current_time('mysql', true);
+			}
+
 			return new WP_REST_Response(
 				array(
 					'ok'      => true,
@@ -1139,7 +1158,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						'source'                 => 'saved',
 						'agencyName'             => $row['agencyName'],
 						'consultantName'         => $row['consultantName'],
-						'consultantEmail'        => $row['consultantEmail'] ?? $current_user->user_email,
+						'consultantEmail'        => $current_user->user_email,
 						'consultantPhone'        => $row['consultantPhone'] ?? '',
 						'defaultApplicationRoute' => $row['defaultApplicationRoute'] ?? 'standard',
 						'agreementOnFile'        => !empty($row['agreementOnFile']),
@@ -1169,8 +1188,35 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return $this->json_error_response('Consultant name is required.', 400);
 			}
 
-			$user_id      = get_current_user_id();
-			$current_user = wp_get_current_user();
+			$user_id          = get_current_user_id();
+			$current_user     = wp_get_current_user();
+			$consultant_email = isset($draft['consultantEmail']) ? sanitize_email((string) $draft['consultantEmail']) : '';
+
+			if ('' !== $consultant_email && !is_email($consultant_email)) {
+				return $this->json_error_response('Consultant email must be a valid email address.', 400);
+			}
+
+			if ('' !== $consultant_email && strtolower($consultant_email) !== strtolower((string) $current_user->user_email)) {
+				$existing_email_user_id = email_exists($consultant_email);
+
+				if ($existing_email_user_id && (int) $existing_email_user_id !== (int) $user_id) {
+					return $this->json_error_response('That email address is already used by another WordPress account.', 400);
+				}
+
+				$email_update = wp_update_user(
+					array(
+						'ID'         => $user_id,
+						'user_email' => $consultant_email,
+					)
+				);
+
+				if (is_wp_error($email_update)) {
+					return $this->json_error_response($email_update->get_error_message(), 400);
+				}
+
+				clean_user_cache($user_id);
+				$current_user = get_userdata($user_id);
+			}
 
 			$existing = $wpdb->get_var(
 				$wpdb->prepare(
@@ -1188,7 +1234,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'wordpressEmail'         => $current_user->user_email,
 				'agencyName'             => $agency_name,
 				'consultantName'         => $consultant_name,
-				'consultantEmail'        => isset($draft['consultantEmail']) ? trim($draft['consultantEmail']) : null,
+				'consultantEmail'        => '' !== $consultant_email ? $consultant_email : null,
 				'consultantPhone'        => isset($draft['consultantPhone']) ? trim($draft['consultantPhone']) : null,
 				'defaultApplicationRoute' => $route,
 				'agreementOnFile'        => !empty($draft['agreementOnFile']) ? 1 : 0,
