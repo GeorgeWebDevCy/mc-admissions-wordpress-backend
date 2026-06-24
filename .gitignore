@@ -1,0 +1,6 @@
+# Local scratch artifacts
+*.log
+*.zip
+/$status"
+/\$status"
+/\\$status"

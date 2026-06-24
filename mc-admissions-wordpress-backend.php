@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.8
+ * Version: 0.2.13
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -630,6 +630,18 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			register_rest_route(
 				self::API_NAMESPACE,
+				'/library',
+				array(
+					array(
+						'methods' => WP_REST_Server::READABLE,
+						'callback' => array($this, 'rest_get_document_library'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
 				'/applications/(?P<application_id>[A-Za-z0-9_-]+)',
 				array(
 					array(
@@ -1078,6 +1090,105 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		// Count generated letters of a given template for the dashboard summary.
+		// Staff see all; agents are scoped to their own applications. Returns 0
+		// defensively if the Prisma-managed letters table is not present.
+		private function count_generated_letters($user, $template_id) {
+			global $wpdb;
+
+			$letters_table = 'mc_generated_letters';
+			$exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $letters_table));
+
+			if ($exists !== $letters_table) {
+				return 0;
+			}
+
+			if ($this->can_view_all_applications($user)) {
+				return (int) $wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT COUNT(*) FROM {$letters_table} WHERE templateId = %s",
+						$template_id
+					)
+				);
+			}
+
+			return (int) $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(*) FROM {$letters_table} letter
+					INNER JOIN {$this->applications_table} app ON app.id = letter.applicationId
+					WHERE letter.templateId = %s AND app.wordpressUserId = %d",
+					$template_id,
+					(int) $user['id']
+				)
+			);
+		}
+
+		// Aggregated document library: generated letters + ready uploaded
+		// documents across the user's visible applications. Returns raw rows;
+		// the Next side (listAgentAdmissionDocumentLibrary) builds the snapshot.
+		public function rest_get_document_library() {
+			global $wpdb;
+
+			try {
+				$user = $this->current_session_user();
+
+				$where = '';
+				$args = array();
+				if (!$this->can_view_all_applications($user)) {
+					$where = 'WHERE wordpressUserId = %d';
+					$args[] = (int) $user['id'];
+				}
+				$args[] = 50;
+
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$apps = $wpdb->get_results(
+					$wpdb->prepare(
+						"SELECT id, referenceCode, fullName, agencyName FROM {$this->applications_table} {$where} ORDER BY updatedAt DESC LIMIT %d",
+						$args
+					),
+					ARRAY_A
+				);
+				$apps = is_array($apps) ? $apps : array();
+
+				$letters_table = 'mc_generated_letters';
+				$has_letters =
+					$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $letters_table)) === $letters_table;
+
+				foreach ($apps as &$app) {
+					$aid = $app['id'];
+
+					$letters = array();
+					if ($has_letters) {
+						// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+						$letters = $wpdb->get_results(
+							$wpdb->prepare(
+								"SELECT id, applicationId, templateLabel, fileName, createdAt, generatedByName FROM {$letters_table} WHERE applicationId = %s ORDER BY createdAt DESC LIMIT 8",
+								$aid
+							),
+							ARRAY_A
+						);
+					}
+
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					$docs = $wpdb->get_results(
+						$wpdb->prepare(
+							"SELECT id, label, originalName, uploadedByName, uploadedAt, createdAt, mimeType, uploadedUrl FROM {$this->documents_table} WHERE applicationId = %s AND isReady = 1 ORDER BY updatedAt DESC, createdAt DESC LIMIT 12",
+							$aid
+						),
+						ARRAY_A
+					);
+
+					$app['generatedLetters'] = is_array($letters) ? $letters : array();
+					$app['documents'] = is_array($docs) ? $docs : array();
+				}
+				unset($app);
+
+				return new WP_REST_Response(array('ok' => true, 'applications' => $apps), 200);
+			} catch (Exception $error) {
+				return $this->json_error_response($error->getMessage(), 400);
+			}
+		}
+
 		public function rest_list_applications() {
 			try {
 				$user = $this->current_session_user();
@@ -1087,6 +1198,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					array(
 						'ok' => true,
 						'applications' => $applications,
+						'offerLetterCount' => $this->count_generated_letters($user, 'offer-letter'),
+						'acceptanceLetterCount' => $this->count_generated_letters($user, 'acceptance-letter'),
 					),
 					200
 				);
@@ -1535,6 +1648,29 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return !empty($user['roles']) && in_array('administrator', $user['roles'], true);
 		}
 
+		// Internal office staff (not just WordPress administrators) can see and act
+		// on every application, matching the desktop/Next.js visibility rules.
+		// External agents (mc_agent) remain scoped to their own applications.
+		private function can_view_all_applications($user) {
+			if ($this->is_admin_user($user)) {
+				return true;
+			}
+
+			if (empty($user['roles'])) {
+				return false;
+			}
+
+			$staff_roles = array(
+				'admissions-officer',
+				'finance-officer',
+				'migration-officer',
+				'immigration-officer',
+				'registrar',
+			);
+
+			return count(array_intersect($staff_roles, (array) $user['roles'])) > 0;
+		}
+
 		private function trim_to_null($value) {
 			if (null === $value) {
 				return null;
@@ -1699,12 +1835,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$where_sql = '';
 			$query_args = array();
 
-			if (!$this->is_admin_user($user)) {
+			if (!$this->can_view_all_applications($user)) {
 				$where_sql = 'WHERE app.wordpressUserId = %d';
 				$query_args[] = (int) $user['id'];
 			}
 
-			$query_args[] = 36;
+			// High safety cap only; the board shows every application (matches the desktop, which has no limit).
+			$query_args[] = 5000;
 
 			$sql = "
 				SELECT
@@ -1740,6 +1877,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'programme' => $application['programmeLabel'],
 				'semester' => trim($application['semester'] . ' ' . $application['year']),
 				'stage' => $status,
+				'stageKey' => isset($application['status']) ? (string) $application['status'] : $status,
+				'permitStatus' => isset($application['permitStatus']) ? $application['permitStatus'] : 'not-started',
+				'arrivalStatus' => isset($application['arrivalStatus']) ? $application['arrivalStatus'] : 'planning',
+				'enrollmentStatus' => isset($application['enrollmentStatus']) ? $application['enrollmentStatus'] : 'pending',
 				'lane' => $this->get_lane_for_status($status),
 				'progress' => $this->get_progress_for_status($status, $ready_documents),
 				'missingDocs' => $missing_docs,
@@ -1767,7 +1908,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Application not found.');
 			}
 
-			if (!$this->is_admin_user($user) && (int) $application['wordpressUserId'] !== (int) $user['id']) {
+			if (!$this->can_view_all_applications($user) && (int) $application['wordpressUserId'] !== (int) $user['id']) {
 				throw new Exception('You are not allowed to access this application.');
 			}
 
@@ -1805,8 +1946,37 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				ARRAY_A
 			);
 
+			// Case-detail sub-panels (payments / migration / immigration). These
+			// reuse the same queries as the dedicated REST endpoints so the web
+			// case detail renders them from this single fetch (it can't reach the
+			// DB directly to load them itself).
+			$payments = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT id, amount, currency, reference, swiftReference, confirmedDate, recordedByName, note, createdAt FROM {$this->payments_table} WHERE applicationId = %s ORDER BY createdAt DESC LIMIT 24",
+					$application_id
+				),
+				ARRAY_A
+			);
+			$migration_case = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT * FROM {$this->migration_cases_table} WHERE applicationId = %s LIMIT 1",
+					$application_id
+				),
+				ARRAY_A
+			);
+			$immigration_case = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT * FROM {$this->immigration_cases_table} WHERE applicationId = %s LIMIT 1",
+					$application_id
+				),
+				ARRAY_A
+			);
+
 			$application['documents'] = is_array($documents) ? $documents : array();
 			$application['activities'] = is_array($activities) ? $activities : array();
+			$application['paymentTransactions'] = is_array($payments) ? $payments : array();
+			$application['migrationCase'] = $migration_case ? $migration_case : null;
+			$application['immigrationCase'] = $immigration_case ? $immigration_case : null;
 
 			return $application;
 		}
@@ -2201,7 +2371,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Application not found.');
 			}
 
-			if (!$this->is_admin_user($user) && (int) $existing['wordpressUserId'] !== (int) $user['id']) {
+			if (!$this->can_view_all_applications($user) && (int) $existing['wordpressUserId'] !== (int) $user['id']) {
 				throw new Exception('You are not allowed to update this application.');
 			}
 
@@ -2289,7 +2459,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Application not found.');
 			}
 
-			if (!$this->is_admin_user($user) && (int) $existing['wordpressUserId'] !== (int) $user['id']) {
+			if (!$this->can_view_all_applications($user) && (int) $existing['wordpressUserId'] !== (int) $user['id']) {
 				throw new Exception('You are not allowed to update this application.');
 			}
 
