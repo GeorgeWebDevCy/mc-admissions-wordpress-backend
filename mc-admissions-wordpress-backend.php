@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.13
+ * Version: 0.2.14
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -56,6 +56,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			'higherSecondaryMarksheet' => 'Copy of Higher Secondary School (12th grade) marksheet',
 			'englishCertificate' => 'English proficiency certificate',
 			'studentSignature' => 'Student signature',
+			'insuranceCopy' => 'Copy of Insurance',
 		);
 
 		/** @var string[] */
@@ -117,11 +118,48 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		public function boot() {
 			$this->ensure_roles();
+			$this->ensure_immigration_insurance_columns();
 			$this->boot_update_checker();
 			add_filter('upgrader_source_selection', array($this, 'normalize_update_package_paths'), 10, 4);
 			add_action('admin_menu', array($this, 'register_admin_menu'));
 			add_action('rest_api_init', array($this, 'register_rest_routes'));
 			add_filter('rest_pre_serve_request', array($this, 'send_rest_cors_headers'), 10, 4);
+		}
+
+		private function ensure_immigration_insurance_columns() {
+			global $wpdb;
+
+			if ('0.2.14' === get_option('mc_admissions_schema_version')) {
+				return;
+			}
+
+			// The class boots once before the activation hook on a brand-new install.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			if ($this->immigration_cases_table !== $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->immigration_cases_table))) {
+				return;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$policy_column = $wpdb->get_var("SHOW COLUMNS FROM {$this->immigration_cases_table} LIKE 'insurancePolicyNumber'");
+			if (!$policy_column) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$wpdb->query("ALTER TABLE {$this->immigration_cases_table} ADD COLUMN insurancePolicyNumber VARCHAR(191) NULL AFTER paymentReference");
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$expiration_column = $wpdb->get_var("SHOW COLUMNS FROM {$this->immigration_cases_table} LIKE 'insuranceExpirationDate'");
+			if (!$expiration_column) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$wpdb->query("ALTER TABLE {$this->immigration_cases_table} ADD COLUMN insuranceExpirationDate VARCHAR(191) NULL AFTER insurancePolicyNumber");
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$policy_column = $wpdb->get_var("SHOW COLUMNS FROM {$this->immigration_cases_table} LIKE 'insurancePolicyNumber'");
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$expiration_column = $wpdb->get_var("SHOW COLUMNS FROM {$this->immigration_cases_table} LIKE 'insuranceExpirationDate'");
+			if ($policy_column && $expiration_column) {
+				update_option('mc_admissions_schema_version', '0.2.14');
+			}
 		}
 
 		public function activate() {
@@ -280,6 +318,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					xRayDate VARCHAR(191) NULL,
 					appointmentDate VARCHAR(191) NULL,
 					paymentReference VARCHAR(191) NULL,
+					insurancePolicyNumber VARCHAR(191) NULL,
+					insuranceExpirationDate VARCHAR(191) NULL,
 					pinkCardDate VARCHAR(191) NULL,
 					enrollmentAgreementDate VARCHAR(191) NULL,
 					note TEXT NULL,
@@ -3024,6 +3064,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'xRayDate' => isset($draft['xRayDate']) ? sanitize_text_field($draft['xRayDate']) : null,
 					'appointmentDate' => isset($draft['appointmentDate']) ? sanitize_text_field($draft['appointmentDate']) : null,
 					'paymentReference' => isset($draft['paymentReference']) ? sanitize_text_field($draft['paymentReference']) : null,
+					'insurancePolicyNumber' => isset($draft['insurancePolicyNumber']) ? sanitize_text_field($draft['insurancePolicyNumber']) : null,
+					'insuranceExpirationDate' => isset($draft['insuranceExpirationDate']) ? sanitize_text_field($draft['insuranceExpirationDate']) : null,
 					'pinkCardDate' => isset($draft['pinkCardDate']) ? sanitize_text_field($draft['pinkCardDate']) : null,
 					'enrollmentAgreementDate' => isset($draft['enrollmentAgreementDate']) ? sanitize_text_field($draft['enrollmentAgreementDate']) : null,
 					'note' => isset($draft['note']) ? sanitize_textarea_field($draft['note']) : null,
@@ -3041,7 +3083,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				}
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->immigration_cases_table} WHERE applicationId = %s LIMIT 1", $application_id), ARRAY_A);
-				return new WP_REST_Response(array('ok' => true, 'immigrationCase' => $row ?: null), 200);
+				return new WP_REST_Response(array(
+					'ok' => true,
+					'immigrationCase' => $row ?: null,
+					'application' => $this->to_admission_case($this->get_detailed_application_record($application_id)),
+				), 200);
 			} catch (Exception $error) {
 				return $this->json_error_response($error->getMessage(), 400);
 			}
@@ -3073,7 +3119,4 @@ function mc_admissions_wordpress_backend() {
 
 register_activation_hook(__FILE__, array(mc_admissions_wordpress_backend(), 'activate'));
 mc_admissions_wordpress_backend();
-
-
-
 
