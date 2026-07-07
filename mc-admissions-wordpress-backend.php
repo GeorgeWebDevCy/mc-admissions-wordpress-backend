@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.14
+ * Version: 0.2.15
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -68,6 +68,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		/** @var string[] */
 		private $pipeline_stages = array(
+			'profile-preparation',
+			'review-pending',
+			'offer-issued',
+			'prepayment-pending',
+			'acceptance-issued',
+			'migration-documents',
+			'arrival-immigration',
+			'enrollment-complete',
+			'rejected',
+			'trashed',
 			'Application in progress',
 			'Under review',
 			'Offer letter issued',
@@ -1743,6 +1753,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function workflow_note_for_status($status) {
 			switch ($status) {
+				case 'trashed':
+					return 'Application moved to Trash by an administrator.';
+				case 'review-pending':
+					return 'Application restored from Trash and returned to pending assessment.';
 				case 'Application in progress':
 					return 'Application is being prepared. Complete the profile and document pack before review.';
 				case 'Under review':
@@ -2409,6 +2423,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			if (!$existing) {
 				throw new Exception('Application not found.');
+			}
+
+			if (('trashed' === $status || 'trashed' === $existing['status']) && !$this->is_admin_user($user)) {
+				throw new Exception('Only an administrator can move applications to or restore them from Trash.');
 			}
 
 			if (!$this->can_view_all_applications($user) && (int) $existing['wordpressUserId'] !== (int) $user['id']) {
@@ -3119,4 +3137,3 @@ function mc_admissions_wordpress_backend() {
 
 register_activation_hook(__FILE__, array(mc_admissions_wordpress_backend(), 'activate'));
 mc_admissions_wordpress_backend();
-
