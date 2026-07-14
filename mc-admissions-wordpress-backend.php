@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.15
+ * Version: 0.2.16
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -1900,11 +1900,18 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$sql = "
 				SELECT
 					app.*,
+					MAX(migration.packSubmittedDate) AS permitPackSubmittedDate,
+					MAX(migration.paymentReference) AS permitPaymentReference,
+					MAX(migration.paymentDate) AS permitPaymentDate,
+					MAX(migration.decisionDate) AS permitDecisionDate,
+					MAX(migration.permitReference) AS permitReference,
 					COUNT(doc.id) AS documentCount,
 					COALESCE(SUM(CASE WHEN doc.isReady = 1 THEN 1 ELSE 0 END), 0) AS readyDocumentCount
 				FROM {$this->applications_table} app
 				LEFT JOIN {$this->documents_table} doc
 					ON doc.applicationId = app.id
+				LEFT JOIN {$this->migration_cases_table} migration
+					ON migration.applicationId = app.id
 				{$where_sql}
 				GROUP BY app.id
 				ORDER BY app.updatedAt DESC
@@ -1933,6 +1940,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'stage' => $status,
 				'stageKey' => isset($application['status']) ? (string) $application['status'] : $status,
 				'permitStatus' => isset($application['permitStatus']) ? $application['permitStatus'] : 'not-started',
+				'permitPackSubmittedDate' => !empty($application['permitPackSubmittedDate']) ? $application['permitPackSubmittedDate'] : null,
+				'permitPaymentReference' => !empty($application['permitPaymentReference']) ? $application['permitPaymentReference'] : null,
+				'permitPaymentDate' => !empty($application['permitPaymentDate']) ? $application['permitPaymentDate'] : null,
+				'permitDecisionDate' => !empty($application['permitDecisionDate']) ? $application['permitDecisionDate'] : null,
+				'permitReference' => !empty($application['permitReference']) ? $application['permitReference'] : null,
 				'arrivalStatus' => isset($application['arrivalStatus']) ? $application['arrivalStatus'] : 'planning',
 				'enrollmentStatus' => isset($application['enrollmentStatus']) ? $application['enrollmentStatus'] : 'pending',
 				'lane' => $this->get_lane_for_status($status),
