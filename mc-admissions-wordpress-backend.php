@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.16
+ * Version: 0.2.17
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -692,6 +692,33 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			register_rest_route(
 				self::API_NAMESPACE,
+				'/agent-media',
+				array(
+					array(
+						'methods' => WP_REST_Server::READABLE,
+						'callback' => array($this, 'rest_list_agent_media'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
+					array(
+						'methods' => WP_REST_Server::CREATABLE,
+						'callback' => array($this, 'rest_upload_agent_media'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
+				'/agent-media/(?P<media_id>[A-Za-z0-9_-]+)/file',
+				array(
+					'methods' => WP_REST_Server::READABLE,
+					'callback' => array($this, 'rest_download_agent_media'),
+					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
 				'/applications/(?P<application_id>[A-Za-z0-9_-]+)',
 				array(
 					array(
@@ -1239,6 +1266,129 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		public function rest_list_agent_media() {
+			try {
+				$user = $this->current_session_user();
+				if (!$this->can_access_agent_media($user)) {
+					return $this->json_error_response('Documents access is restricted to Administrators and Agents.', 403);
+				}
+
+				return new WP_REST_Response(
+					array(
+						'ok' => true,
+						'media' => $this->public_agent_media_records($this->get_agent_media_records()),
+					),
+					200
+				);
+			} catch (Exception $error) {
+				return $this->json_error_response($error->getMessage(), 400);
+			}
+		}
+
+		public function rest_upload_agent_media(WP_REST_Request $request) {
+			try {
+				$user = $this->current_session_user();
+				if (!$this->is_admin_user($user)) {
+					return $this->json_error_response('Administrator access required.', 403);
+				}
+
+				$files = $request->get_file_params();
+				$file = isset($files['file']) ? $files['file'] : null;
+				$category = sanitize_key((string) $request->get_param('category'));
+				$replace_id = sanitize_text_field((string) $request->get_param('replaceId'));
+				if (empty($file) || empty($file['tmp_name'])) {
+					throw new Exception('Choose a file to upload.');
+				}
+				if (!in_array($category, array('admission-policy', 'about-mesoyios', 'marketing', 'other'), true)) {
+					throw new Exception('Invalid media category.');
+				}
+
+				$file_name = sanitize_file_name(isset($file['name']) ? (string) $file['name'] : 'upload.bin');
+				$mime_type = !empty($file['type']) ? sanitize_mime_type((string) $file['type']) : 'application/octet-stream';
+				$file_size = isset($file['size']) ? (int) $file['size'] : 0;
+				$this->validate_agent_media_file($category, $file_name, $mime_type, $file_size);
+
+				$records = $this->get_agent_media_records();
+				$old_record = null;
+				if (in_array($category, array('admission-policy', 'about-mesoyios'), true)) {
+					foreach ($records as $record) {
+						if ($record['category'] === $category) {
+							$old_record = $record;
+							$replace_id = $record['id'];
+							break;
+						}
+					}
+				} elseif ('' !== $replace_id) {
+					foreach ($records as $record) {
+						if ($record['id'] === $replace_id && $category === $record['category']) {
+							$old_record = $record;
+							break;
+						}
+					}
+					if (null === $old_record) {
+						throw new Exception('The item to replace was not found.');
+					}
+				}
+
+				$id = '' !== $replace_id ? $replace_id : wp_generate_uuid4();
+				$stored = $this->store_document_file('_agent-library', $id, $file_name, $mime_type, (string) $file['tmp_name']);
+				$label = trim(sanitize_text_field((string) $request->get_param('label')));
+				if ('' === $label) {
+					$label = 'admission-policy' === $category ? 'Admission Policy' : ('about-mesoyios' === $category ? 'About Mesoyios College' : pathinfo($file_name, PATHINFO_FILENAME));
+				}
+				$new_record = array_merge(
+					array(
+						'id' => $id,
+						'category' => $category,
+						'label' => $label,
+						'fileName' => $file_name,
+						'mimeType' => $mime_type,
+						'fileSize' => $file_size,
+						'uploadedAt' => gmdate('c'),
+						'uploadedByName' => $user['name'],
+					),
+					$stored
+				);
+
+				$records = array_values(array_filter($records, function ($record) use ($id) { return $record['id'] !== $id; }));
+				$records[] = $new_record;
+				$this->save_setting('agent_document_media', wp_json_encode($records));
+				if ($old_record) {
+					$this->delete_document_file($old_record['storageDriveId'], $old_record['storageItemId']);
+				}
+
+				return new WP_REST_Response(
+					array('ok' => true, 'media' => $this->public_agent_media_records($records)),
+					200
+				);
+			} catch (Exception $error) {
+				return $this->json_error_response($error->getMessage(), 400);
+			}
+		}
+
+		public function rest_download_agent_media(WP_REST_Request $request) {
+			try {
+				$user = $this->current_session_user();
+				if (!$this->can_access_agent_media($user)) {
+					return $this->json_error_response('Documents access is restricted to Administrators and Agents.', 403);
+				}
+				$record = $this->find_agent_media_record((string) $request['media_id']);
+				$response = $this->download_document_file($record['storageDriveId'], $record['storageItemId']);
+				$body = wp_remote_retrieve_body($response);
+				if (empty($body)) {
+					throw new Exception('Media file not found.');
+				}
+				status_header(200);
+				header('Content-Type: ' . (!empty($record['mimeType']) ? $record['mimeType'] : 'application/octet-stream'));
+				header("Content-Disposition: inline; filename*=UTF-8''" . rawurlencode($record['fileName']));
+				header('Cache-Control: private, no-store');
+				echo $body; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+				exit;
+			} catch (Exception $error) {
+				return $this->json_error_response($error->getMessage(), 404);
+			}
+		}
+
 		public function rest_list_applications() {
 			try {
 				$user = $this->current_session_user();
@@ -1697,6 +1847,88 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private function is_admin_user($user) {
 			return !empty($user['roles']) && in_array('administrator', $user['roles'], true);
 		}
+
+		private function can_access_agent_media($user) {
+			if ($this->is_admin_user($user)) {
+				return true;
+			}
+
+			$agent_roles = array('mc_agent', 'mc-agent', 'agency', 'agent', 'consultant', 'admissions-agent', 'subscriber');
+			return !empty($user['roles']) && count(array_intersect($agent_roles, (array) $user['roles'])) > 0;
+		}
+
+		private function get_agent_media_records() {
+			$decoded = json_decode($this->get_setting('agent_document_media', '[]'), true);
+			if (!is_array($decoded)) {
+				return array();
+			}
+
+			return array_values(array_filter($decoded, function ($record) {
+				return is_array($record)
+					&& !empty($record['id'])
+					&& !empty($record['category'])
+					&& !empty($record['storageDriveId'])
+					&& !empty($record['storageItemId']);
+			}));
+		}
+
+		private function public_agent_media_records($records) {
+			return array_values(array_map(function ($record) {
+				return array(
+					'id' => (string) $record['id'],
+					'category' => (string) $record['category'],
+					'label' => isset($record['label']) ? (string) $record['label'] : '',
+					'fileName' => isset($record['fileName']) ? (string) $record['fileName'] : '',
+					'mimeType' => isset($record['mimeType']) ? (string) $record['mimeType'] : 'application/octet-stream',
+					'fileSize' => isset($record['fileSize']) ? (int) $record['fileSize'] : 0,
+					'uploadedAt' => isset($record['uploadedAt']) ? (string) $record['uploadedAt'] : '',
+					'uploadedByName' => isset($record['uploadedByName']) ? (string) $record['uploadedByName'] : '',
+					'url' => rest_url(self::API_NAMESPACE . '/agent-media/' . rawurlencode($record['id']) . '/file'),
+				);
+			}, $records));
+		}
+
+		private function find_agent_media_record($media_id) {
+			foreach ($this->get_agent_media_records() as $record) {
+				if (hash_equals((string) $record['id'], (string) $media_id)) {
+					return $record;
+				}
+			}
+
+			throw new Exception('Media file not found.');
+		}
+
+		private function validate_agent_media_file($category, $file_name, $mime_type, $file_size) {
+			if ($file_size <= 0 || $file_size > 200 * 1024 * 1024) {
+				throw new Exception('Files must be no larger than 200 MB.');
+			}
+
+			$extension = strtolower(pathinfo($file_name, PATHINFO_EXTENSION));
+			if (in_array($category, array('admission-policy', 'about-mesoyios'), true) && ('pdf' !== $extension || 'application/pdf' !== $mime_type)) {
+				throw new Exception('Admission Policy and About Mesoyios must be PDF files.');
+			}
+
+			$allowed_extensions = array('pdf', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'mp4', 'webm', 'mov');
+			$allowed_mimes = array('application/pdf', 'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime');
+			if ('marketing' === $category && (!in_array($extension, $allowed_extensions, true) || !in_array($mime_type, $allowed_mimes, true))) {
+				throw new Exception('Marketing materials must be a PDF, image, or video file.');
+			}
+
+			$document_extensions = array('pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt');
+			$document_mimes = array(
+				'application/pdf',
+				'application/msword',
+				'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+				'application/vnd.ms-excel',
+				'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+				'application/vnd.ms-powerpoint',
+				'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+				'text/plain',
+			);
+			if ('other' === $category && (!in_array($extension, $document_extensions, true) || !in_array($mime_type, $document_mimes, true))) {
+				throw new Exception('Other documents must be a PDF, Word, Excel, PowerPoint, or plain-text file.');
+			}
+			}
 
 		// Internal office staff (not just WordPress administrators) can see and act
 		// on every application, matching the desktop/Next.js visibility rules.
