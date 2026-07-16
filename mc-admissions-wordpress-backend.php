@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.17
+ * Version: 0.2.18
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -129,11 +129,46 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function boot() {
 			$this->ensure_roles();
 			$this->ensure_immigration_insurance_columns();
+			$this->ensure_resource_indexes();
 			$this->boot_update_checker();
 			add_filter('upgrader_source_selection', array($this, 'normalize_update_package_paths'), 10, 4);
 			add_action('admin_menu', array($this, 'register_admin_menu'));
 			add_action('rest_api_init', array($this, 'register_rest_routes'));
 			add_filter('rest_pre_serve_request', array($this, 'send_rest_cors_headers'), 10, 4);
+		}
+
+		private function ensure_resource_indexes() {
+			global $wpdb;
+
+			if ('1' === get_option('mc_admissions_resource_index_version')) {
+				return;
+			}
+
+			// These indexes support the two hottest reads: the full board ordered by
+			// updatedAt and agent-scoped boards filtered by wordpressUserId.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			if ($this->applications_table !== $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->applications_table))) {
+				return;
+			}
+
+			$indexes = array(
+				array($this->applications_table, 'mc_admission_applications_updatedAt_idx', 'updatedAt'),
+				array($this->applications_table, 'mc_admission_applications_user_updatedAt_idx', 'wordpressUserId, updatedAt'),
+				array($this->documents_table, 'mc_admission_documents_application_ready_idx', 'applicationId, isReady'),
+			);
+
+			foreach ($indexes as $index) {
+				list($table, $name, $columns) = $index;
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$present = $wpdb->get_var($wpdb->prepare("SHOW INDEX FROM {$table} WHERE Key_name = %s", $name));
+				if (!$present) {
+					// Names and columns are internal constants, never request input.
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					$wpdb->query("ALTER TABLE {$table} ADD INDEX {$name} ({$columns})");
+				}
+			}
+
+			update_option('mc_admissions_resource_index_version', '1', false);
 		}
 
 		private function ensure_immigration_insurance_columns() {
@@ -235,7 +270,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					createdAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 					updatedAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 					PRIMARY KEY (id),
-					UNIQUE KEY mc_admission_applications_referenceCode_key (referenceCode)
+					UNIQUE KEY mc_admission_applications_referenceCode_key (referenceCode),
+					KEY mc_admission_applications_updatedAt_idx (updatedAt),
+					KEY mc_admission_applications_user_updatedAt_idx (wordpressUserId, updatedAt)
 				) {$charset}
 				",
 				"
@@ -261,7 +298,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					updatedAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 					PRIMARY KEY (id),
 					UNIQUE KEY mc_admission_documents_applicationId_type_key (applicationId, type),
-					KEY mc_admission_documents_applicationId_idx (applicationId)
+					KEY mc_admission_documents_applicationId_idx (applicationId),
+					KEY mc_admission_documents_application_ready_idx (applicationId, isReady)
 				) {$charset}
 				",
 				"
@@ -2132,20 +2170,17 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$sql = "
 				SELECT
 					app.*,
-					MAX(migration.packSubmittedDate) AS permitPackSubmittedDate,
-					MAX(migration.paymentReference) AS permitPaymentReference,
-					MAX(migration.paymentDate) AS permitPaymentDate,
-					MAX(migration.decisionDate) AS permitDecisionDate,
-					MAX(migration.permitReference) AS permitReference,
-					COUNT(doc.id) AS documentCount,
-					COALESCE(SUM(CASE WHEN doc.isReady = 1 THEN 1 ELSE 0 END), 0) AS readyDocumentCount
+					migration.packSubmittedDate AS permitPackSubmittedDate,
+					migration.paymentReference AS permitPaymentReference,
+					migration.paymentDate AS permitPaymentDate,
+					migration.decisionDate AS permitDecisionDate,
+					migration.permitReference AS permitReference,
+					(SELECT COUNT(*) FROM {$this->documents_table} doc WHERE doc.applicationId = app.id) AS documentCount,
+					(SELECT COUNT(*) FROM {$this->documents_table} ready_doc WHERE ready_doc.applicationId = app.id AND ready_doc.isReady = 1) AS readyDocumentCount
 				FROM {$this->applications_table} app
-				LEFT JOIN {$this->documents_table} doc
-					ON doc.applicationId = app.id
 				LEFT JOIN {$this->migration_cases_table} migration
 					ON migration.applicationId = app.id
 				{$where_sql}
-				GROUP BY app.id
 				ORDER BY app.updatedAt DESC
 				LIMIT %d
 			";
