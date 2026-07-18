@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.18
+ * Version: 0.2.19
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -233,10 +233,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					gender VARCHAR(191) NOT NULL,
 					semester VARCHAR(191) NOT NULL,
 					year VARCHAR(191) NOT NULL,
+					applicationRoute VARCHAR(191) NOT NULL DEFAULT 'standard',
 					programmeCode VARCHAR(191) NOT NULL,
 					programmeLabel VARCHAR(191) NOT NULL,
 					agencyName VARCHAR(191) NOT NULL,
 					consultantName VARCHAR(191) NOT NULL,
+					consultantEmail VARCHAR(191) NULL,
+					consultantPhone VARCHAR(191) NULL,
+					submissionDate VARCHAR(191) NULL,
 					tuitionAcknowledged BOOLEAN NOT NULL,
 					offerTermsAcknowledged BOOLEAN NOT NULL,
 					gdprAcknowledged BOOLEAN NOT NULL,
@@ -1895,6 +1899,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return !empty($user['roles']) && count(array_intersect($agent_roles, (array) $user['roles'])) > 0;
 		}
 
+		private function can_edit_application_data($user) {
+			if ($this->is_admin_user($user)) {
+				return true;
+			}
+
+			$allowed_roles = array('mc_agent', 'mc-agent', 'agency', 'agent', 'consultant', 'admissions-agent', 'subscriber', 'migration-officer');
+			return !empty($user['roles']) && count(array_intersect($allowed_roles, (array) $user['roles'])) > 0;
+		}
+
 		private function get_agent_media_records() {
 			$decoded = json_decode($this->get_setting('agent_document_media', '[]'), true);
 			if (!is_array($decoded)) {
@@ -2368,8 +2381,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'gender' => $application['gender'],
 					'semesterCode' => $application['semester'],
 					'year' => $application['year'],
+					'applicationRoute' => !empty($application['applicationRoute']) ? $application['applicationRoute'] : 'standard',
 					'programmeCode' => $application['programmeCode'],
 					'consultantName' => $application['consultantName'],
+					'consultantEmail' => !empty($application['consultantEmail']) ? $application['consultantEmail'] : null,
+					'consultantPhone' => !empty($application['consultantPhone']) ? $application['consultantPhone'] : null,
+					'submissionDate' => !empty($application['submissionDate']) ? $application['submissionDate'] : null,
+					'tuitionAcknowledged' => !empty($application['tuitionAcknowledged']),
+					'offerTermsAcknowledged' => !empty($application['offerTermsAcknowledged']),
+					'gdprAcknowledged' => !empty($application['gdprAcknowledged']),
 					'reviewSummary' => !empty($application['reviewSummary']) ? $application['reviewSummary'] : null,
 					'reviewerDecision' => $application['reviewerDecision'],
 					'decisionDueDate' => !empty($application['decisionDueDate']) ? $application['decisionDueDate'] : null,
@@ -2524,6 +2544,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			try {
 				if ($record_id) {
+					if (!$this->can_edit_application_data($user)) {
+						throw new Exception('You do not have permission to edit application data.');
+					}
+
 					$this->get_authorized_application_base($record_id, $user);
 
 					$update_sql = "
@@ -2541,15 +2565,17 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							gender = %s,
 							semester = %s,
 							year = %s,
+							applicationRoute = %s,
 							programmeCode = %s,
 							programmeLabel = %s,
 							agencyName = %s,
 							consultantName = %s,
+							consultantEmail = %s,
+							consultantPhone = %s,
+							submissionDate = %s,
 							tuitionAcknowledged = %d,
 							offerTermsAcknowledged = %d,
 							gdprAcknowledged = %d,
-							status = %s,
-							workflowNote = %s,
 							lastUpdatedByName = %s,
 							updatedAt = CURRENT_TIMESTAMP(3)
 						WHERE id = %s
@@ -2568,15 +2594,17 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						$this->trim_to_empty(isset($draft['gender']) ? $draft['gender'] : ''),
 						$this->trim_to_empty(isset($draft['semester']) ? $draft['semester'] : ''),
 						$this->trim_to_empty(isset($draft['year']) ? $draft['year'] : ''),
+						isset($draft['applicationRoute']) && 'postgraduate' === $draft['applicationRoute'] ? 'postgraduate' : 'standard',
 						$this->trim_to_empty(isset($draft['programme']) ? $draft['programme'] : ''),
 						$this->programme_label_from_code(isset($draft['programme']) ? $draft['programme'] : ''),
 						$this->trim_to_empty(isset($draft['agencyName']) ? $draft['agencyName'] : ''),
 						$this->trim_to_empty(isset($draft['consultantName']) ? $draft['consultantName'] : ''),
+						$this->trim_to_null(isset($draft['consultantEmail']) ? $draft['consultantEmail'] : null),
+						$this->trim_to_null(isset($draft['consultantPhone']) ? $draft['consultantPhone'] : null),
+						$this->trim_to_null(isset($draft['submissionDate']) ? $draft['submissionDate'] : null),
 						!empty($draft['tuitionAcknowledged']) ? 1 : 0,
 						!empty($draft['offerTermsAcknowledged']) ? 1 : 0,
 						!empty($draft['gdprAcknowledged']) ? 1 : 0,
-						$status,
-						$this->workflow_note_for_status($status),
 						$user['name'],
 						$record_id,
 					);
@@ -2597,11 +2625,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$this->create_activity(
 						$record_id,
 						$user,
-						'review' === $mode ? 'workflow' : 'application',
-						'review' === $mode ? 'Application staged for review' : 'Application saved',
-						'review' === $mode
-							? 'The case moved into review with the current applicant profile and document checklist.'
-							: 'Application details were updated from the admissions workspace.'
+						'application',
+						'Application details corrected',
+						'Application data was updated without changing the current workflow stage.'
 					);
 				} else {
 					$record_id = wp_generate_uuid4();
@@ -2626,10 +2652,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'gender' => $this->trim_to_empty(isset($draft['gender']) ? $draft['gender'] : ''),
 							'semester' => $this->trim_to_empty(isset($draft['semester']) ? $draft['semester'] : ''),
 							'year' => $this->trim_to_empty(isset($draft['year']) ? $draft['year'] : ''),
+							'applicationRoute' => isset($draft['applicationRoute']) && 'postgraduate' === $draft['applicationRoute'] ? 'postgraduate' : 'standard',
 							'programmeCode' => $this->trim_to_empty(isset($draft['programme']) ? $draft['programme'] : ''),
 							'programmeLabel' => $this->programme_label_from_code(isset($draft['programme']) ? $draft['programme'] : ''),
 							'agencyName' => $this->trim_to_empty(isset($draft['agencyName']) ? $draft['agencyName'] : ''),
 							'consultantName' => $this->trim_to_empty(isset($draft['consultantName']) ? $draft['consultantName'] : ''),
+							'consultantEmail' => $this->trim_to_null(isset($draft['consultantEmail']) ? $draft['consultantEmail'] : null),
+							'consultantPhone' => $this->trim_to_null(isset($draft['consultantPhone']) ? $draft['consultantPhone'] : null),
+							'submissionDate' => $this->trim_to_null(isset($draft['submissionDate']) ? $draft['submissionDate'] : null),
 							'tuitionAcknowledged' => !empty($draft['tuitionAcknowledged']) ? 1 : 0,
 							'offerTermsAcknowledged' => !empty($draft['offerTermsAcknowledged']) ? 1 : 0,
 							'gdprAcknowledged' => !empty($draft['gdprAcknowledged']) ? 1 : 0,
