@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.19
+ * Version: 0.2.20
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -1899,6 +1899,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return !empty($user['roles']) && count(array_intersect($agent_roles, (array) $user['roles'])) > 0;
 		}
 
+		private function is_agent_user($user) {
+			$agent_roles = array('mc_agent', 'mc-agent', 'agency', 'agent', 'consultant', 'admissions-agent', 'subscriber');
+			return !empty($user['roles']) && count(array_intersect($agent_roles, (array) $user['roles'])) > 0;
+		}
+
 		private function can_edit_application_data($user) {
 			if ($this->is_admin_user($user)) {
 				return true;
@@ -2548,7 +2553,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						throw new Exception('You do not have permission to edit application data.');
 					}
 
-					$this->get_authorized_application_base($record_id, $user);
+					$existing_application = $this->get_authorized_application_base($record_id, $user);
+					$existing_status = strtolower(trim((string) $existing_application['status']));
+					$is_preparation_status = in_array($existing_status, array('application in progress', 'profile-preparation', 'profile preparation'), true);
+					$is_submitting_prepared_application = 'review' === $mode && $this->is_agent_user($user) && $is_preparation_status;
+
+					if ('review' === $mode && !$is_submitting_prepared_application) {
+						throw new Exception('Only an agent can submit an application that is still in preparation.');
+					}
 
 					$update_sql = "
 						UPDATE {$this->applications_table}
@@ -2620,14 +2632,27 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						throw new Exception(self::STALE_APPLICATION_ERROR);
 					}
 
+					if ($is_submitting_prepared_application) {
+						$wpdb->update(
+							$this->applications_table,
+							array(
+								'status' => 'Under review',
+								'workflowNote' => $this->workflow_note_for_status('Under review'),
+							),
+							array('id' => $record_id)
+						);
+					}
+
 					$this->sync_document_checklist($record_id, isset($draft['documents']) ? (array) $draft['documents'] : array());
 
 					$this->create_activity(
 						$record_id,
 						$user,
-						'application',
-						'Application details corrected',
-						'Application data was updated without changing the current workflow stage.'
+						$is_submitting_prepared_application ? 'workflow' : 'application',
+						$is_submitting_prepared_application ? 'Application submitted for review' : 'Application details corrected',
+						$is_submitting_prepared_application
+							? 'The completed application was submitted into the admissions review queue.'
+							: 'Application data was updated without changing the current workflow stage.'
 					);
 				} else {
 					$record_id = wp_generate_uuid4();
