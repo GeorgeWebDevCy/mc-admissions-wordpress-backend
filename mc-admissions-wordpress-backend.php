@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.22
+ * Version: 0.2.23
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -2682,10 +2682,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$existing_application = $this->get_authorized_application_base($record_id, $user);
 					$existing_status = strtolower(trim((string) $existing_application['status']));
 					$is_preparation_status = in_array($existing_status, array('application in progress', 'profile-preparation', 'profile preparation'), true);
-					$is_submitting_prepared_application = 'review' === $mode && $this->is_agent_user($user) && $is_preparation_status;
+					$is_submitting_prepared_application = 'review' === $mode && ($this->is_agent_user($user) || $this->is_admin_user($user)) && $is_preparation_status;
 
 					if ('review' === $mode && !$is_submitting_prepared_application) {
-						throw new Exception('Only an agent can submit an application that is still in preparation.');
+						throw new Exception('Only an agent or administrator can submit an application that is still in preparation.');
 					}
 
 					$update_sql = "
