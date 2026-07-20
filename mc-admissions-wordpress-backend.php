@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.20
+ * Version: 0.2.21
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -849,6 +849,23 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			register_rest_route(
 				self::API_NAMESPACE,
+				'/agents',
+				array(
+					array(
+						'methods' => WP_REST_Server::READABLE,
+						'callback' => array($this, 'rest_list_agents'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
+					array(
+						'methods' => WP_REST_Server::CREATABLE,
+						'callback' => array($this, 'rest_create_agent'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
 				'/profile',
 				array(
 					array(
@@ -1642,6 +1659,105 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
+		private function agent_summary($agent, $profile = null) {
+			return array(
+				'id' => (int) $agent->ID,
+				'username' => (string) $agent->user_login,
+				'name' => (string) $agent->display_name,
+				'email' => (string) $agent->user_email,
+				'agencyName' => $profile && !empty($profile['agencyName']) ? (string) $profile['agencyName'] : (string) $agent->display_name,
+				'consultantName' => $profile && !empty($profile['consultantName']) ? (string) $profile['consultantName'] : (string) $agent->display_name,
+				'consultantEmail' => $profile && !empty($profile['consultantEmail']) ? (string) $profile['consultantEmail'] : (string) $agent->user_email,
+				'consultantPhone' => $profile && !empty($profile['consultantPhone']) ? (string) $profile['consultantPhone'] : '',
+				'defaultApplicationRoute' => $profile && isset($profile['defaultApplicationRoute']) && 'postgraduate' === $profile['defaultApplicationRoute'] ? 'postgraduate' : 'standard',
+			);
+		}
+
+		public function rest_list_agents() {
+			global $wpdb;
+			$user = $this->current_session_user();
+			if (!$this->is_admin_user($user)) {
+				return $this->json_error_response('Administrator access required.', 403);
+			}
+
+			$agents = get_users(array('role__in' => array('mc_agent'), 'orderby' => 'display_name', 'order' => 'ASC'));
+			$profiles_by_user = array();
+			if (!empty($agents)) {
+				$agent_ids = array_map('absint', wp_list_pluck($agents, 'ID'));
+				$id_list = implode(',', $agent_ids);
+				// IDs come only from WP_User objects and are normalized with absint above.
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$profiles = $wpdb->get_results("SELECT * FROM {$this->agency_profiles_table} WHERE wordpressUserId IN ({$id_list})", ARRAY_A);
+				foreach ($profiles as $profile) {
+					$profiles_by_user[(int) $profile['wordpressUserId']] = $profile;
+				}
+			}
+
+			return new WP_REST_Response(array(
+				'ok' => true,
+				'agents' => array_values(array_map(function ($agent) use ($profiles_by_user) {
+					return $this->agent_summary($agent, isset($profiles_by_user[(int) $agent->ID]) ? $profiles_by_user[(int) $agent->ID] : null);
+				}, $agents)),
+			), 200);
+		}
+
+		public function rest_create_agent(WP_REST_Request $request) {
+			global $wpdb;
+			$user = $this->current_session_user();
+			if (!$this->is_admin_user($user)) {
+				return $this->json_error_response('Administrator access required.', 403);
+			}
+
+			$params = $request->get_json_params();
+			$draft = isset($params['draft']) ? (array) $params['draft'] : array();
+			$username = sanitize_user(isset($draft['username']) ? $draft['username'] : '', true);
+			$email = sanitize_email(isset($draft['email']) ? $draft['email'] : '');
+			$name = sanitize_text_field(isset($draft['name']) ? $draft['name'] : '');
+			$agency_name = sanitize_text_field(isset($draft['agencyName']) ? $draft['agencyName'] : '');
+			$consultant_name = sanitize_text_field(isset($draft['consultantName']) ? $draft['consultantName'] : '');
+			$phone = sanitize_text_field(isset($draft['consultantPhone']) ? $draft['consultantPhone'] : '');
+			$password = isset($draft['password']) ? (string) $draft['password'] : '';
+
+			if (!$username || !validate_username($username)) return $this->json_error_response('A valid WordPress username is required.', 400);
+			if (username_exists($username)) return $this->json_error_response('That username already exists.', 409);
+			if (!$email || !is_email($email)) return $this->json_error_response('A valid email address is required.', 400);
+			if (email_exists($email)) return $this->json_error_response('That email address already exists.', 409);
+			if (!$name || !$agency_name || !$consultant_name) return $this->json_error_response('Display name, agency name, and consultant name are required.', 400);
+			if (strlen($password) < 12) return $this->json_error_response('The temporary password must contain at least 12 characters.', 400);
+
+			$agent_id = wp_insert_user(array(
+				'user_login' => $username,
+				'user_email' => $email,
+				'display_name' => $name,
+				'user_pass' => $password,
+				'role' => 'mc_agent',
+			));
+			if (is_wp_error($agent_id)) return $this->json_error_response($agent_id->get_error_message(), 400);
+
+			$profile = array(
+				'id' => wp_generate_uuid4(),
+				'wordpressUserId' => (int) $agent_id,
+				'wordpressUsername' => $username,
+				'wordpressEmail' => $email,
+				'agencyName' => $agency_name,
+				'consultantName' => $consultant_name,
+				'consultantEmail' => $email,
+				'consultantPhone' => $phone,
+				'defaultApplicationRoute' => 'standard',
+				'agreementOnFile' => 0,
+				'authorizationOnFile' => 0,
+				'notes' => null,
+				'createdAt' => current_time('mysql', true),
+				'updatedAt' => current_time('mysql', true),
+			);
+			$wpdb->insert($this->agency_profiles_table, $profile);
+
+			return new WP_REST_Response(array(
+				'ok' => true,
+				'agent' => $this->agent_summary(get_userdata($agent_id), $profile),
+			), 201);
+		}
+
 		public function rest_get_application(WP_REST_Request $request) {
 			try {
 				$user = $this->current_session_user();
@@ -1675,6 +1791,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						'mode' => (string) $params['mode'],
 						'draft' => (array) $params['draft'],
 						'user' => $user,
+						'assignedAgentId' => isset($params['assignedAgentId']) ? absint($params['assignedAgentId']) : 0,
 					)
 				);
 
@@ -2544,6 +2661,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$status = 'review' === $mode ? 'Under review' : self::INITIAL_APPLICATION_STATUS;
 			$expected_version = $this->iso_to_mysql_datetime($params['expectedUpdatedAt']);
 			$record_id = !empty($params['applicationId']) ? $params['applicationId'] : null;
+			$assigned_agent_id = !empty($params['assignedAgentId']) ? absint($params['assignedAgentId']) : 0;
 
 			$wpdb->query('START TRANSACTION');
 
@@ -2655,6 +2773,26 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							: 'Application data was updated without changing the current workflow stage.'
 					);
 				} else {
+					$owner = $user;
+					if ($this->is_admin_user($user)) {
+						if (!$assigned_agent_id) {
+							throw new Exception('Select an agent before creating the application.');
+						}
+						$agent = get_userdata($assigned_agent_id);
+						if (!$agent || !$this->is_agent_user(array('roles' => array_values((array) $agent->roles)))) {
+							throw new Exception('The selected application owner is not a valid agent.');
+						}
+						$owner = array(
+							'id' => (int) $agent->ID,
+							'username' => (string) $agent->user_login,
+							'name' => (string) $agent->display_name,
+							'email' => (string) $agent->user_email,
+							'roles' => array_values((array) $agent->roles),
+						);
+					} elseif ($assigned_agent_id) {
+						throw new Exception('Only an administrator can assign an application to another agent.');
+					}
+
 					$record_id = wp_generate_uuid4();
 
 					$wpdb->insert(
@@ -2662,9 +2800,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						array(
 							'id' => $record_id,
 							'referenceCode' => $this->generate_reference_code(),
-							'wordpressUserId' => (int) $user['id'],
-							'wordpressUsername' => $user['username'],
-							'wordpressEmail' => $user['email'],
+							'wordpressUserId' => (int) $owner['id'],
+							'wordpressUsername' => $owner['username'],
+							'wordpressEmail' => $owner['email'],
 							'fullName' => $this->trim_to_empty(isset($draft['fullName']) ? $draft['fullName'] : ''),
 							'passportNumber' => $this->trim_to_empty(isset($draft['passportNumber']) ? $draft['passportNumber'] : ''),
 							'email' => $this->trim_to_empty(isset($draft['email']) ? $draft['email'] : ''),
