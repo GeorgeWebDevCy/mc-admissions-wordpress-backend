@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.21
+ * Version: 0.2.22
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -1725,13 +1725,21 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if (!$name || !$agency_name || !$consultant_name) return $this->json_error_response('Display name, agency name, and consultant name are required.', 400);
 			if (strlen($password) < 12) return $this->json_error_response('The temporary password must contain at least 12 characters.', 400);
 
-			$agent_id = wp_insert_user(array(
-				'user_login' => $username,
-				'user_email' => $email,
-				'display_name' => $name,
-				'user_pass' => $password,
-				'role' => 'mc_agent',
-			));
+			$suppress_new_user_email = function () { return false; };
+			add_filter('wp_send_new_user_notification_to_user', $suppress_new_user_email);
+			add_filter('wp_send_new_user_notification_to_admin', $suppress_new_user_email);
+			try {
+				$agent_id = wp_insert_user(array(
+					'user_login' => $username,
+					'user_email' => $email,
+					'display_name' => $name,
+					'user_pass' => $password,
+					'role' => 'mc_agent',
+				));
+			} finally {
+				remove_filter('wp_send_new_user_notification_to_user', $suppress_new_user_email);
+				remove_filter('wp_send_new_user_notification_to_admin', $suppress_new_user_email);
+			}
 			if (is_wp_error($agent_id)) return $this->json_error_response($agent_id->get_error_message(), 400);
 
 			$profile = array(
