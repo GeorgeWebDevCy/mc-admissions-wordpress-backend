@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.23
+ * Version: 0.2.24
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -1242,7 +1242,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if ($this->can_view_all_applications($user)) {
 				return (int) $wpdb->get_var(
 					$wpdb->prepare(
-						"SELECT COUNT(*) FROM {$letters_table} WHERE templateId = %s",
+						"SELECT COUNT(DISTINCT letter.applicationId) FROM {$letters_table} letter
+						INNER JOIN {$this->applications_table} app ON app.id = letter.applicationId
+						WHERE letter.templateId = %s AND app.status <> 'trashed'",
 						$template_id
 					)
 				);
@@ -1250,9 +1252,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			return (int) $wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT COUNT(*) FROM {$letters_table} letter
+					"SELECT COUNT(DISTINCT letter.applicationId) FROM {$letters_table} letter
 					INNER JOIN {$this->applications_table} app ON app.id = letter.applicationId
-					WHERE letter.templateId = %s AND app.wordpressUserId = %d",
+					WHERE letter.templateId = %s AND app.wordpressUserId = %d AND app.status <> 'trashed'",
 					$template_id,
 					(int) $user['id']
 				)
