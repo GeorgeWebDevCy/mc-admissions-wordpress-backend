@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.28
+ * Version: 0.2.29
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -2636,6 +2636,27 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				array($this, 'map_activity_entry'),
 				$application['activities']
 			);
+			$latest_payment = !empty($application['paymentTransactions'][0])
+				? $application['paymentTransactions'][0]
+				: null;
+			$effective_payment_status = $application['paymentStatus'];
+			if ($latest_payment && !in_array($effective_payment_status, array('receipt-received', 'cleared'), true)) {
+				$effective_payment_status = 'cleared';
+			}
+			$effective_payment_amount = !empty($application['paymentAmount'])
+				? $application['paymentAmount']
+				: ($latest_payment && !empty($latest_payment['amount']) ? $latest_payment['amount'] : null);
+			$effective_payment_currency = !empty($application['paymentCurrency'])
+				? $application['paymentCurrency']
+				: ($latest_payment && !empty($latest_payment['currency']) ? $latest_payment['currency'] : 'EUR');
+			$effective_payment_reference = !empty($application['paymentReference'])
+				? $application['paymentReference']
+				: ($latest_payment && !empty($latest_payment['reference'])
+					? $latest_payment['reference']
+					: ($latest_payment && !empty($latest_payment['swiftReference']) ? $latest_payment['swiftReference'] : null));
+			$effective_payment_confirmed_date = !empty($application['paymentConfirmedDate'])
+				? $application['paymentConfirmedDate']
+				: ($latest_payment && !empty($latest_payment['confirmedDate']) ? $latest_payment['confirmedDate'] : null);
 
 			return array_merge(
 				$board,
@@ -2667,11 +2688,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'offerIssuedDate' => !empty($application['offerIssuedDate']) ? $application['offerIssuedDate'] : null,
 					'offerExpiryDate' => !empty($application['offerExpiryDate']) ? $application['offerExpiryDate'] : null,
 					'offerConditionNote' => !empty($application['offerConditionNote']) ? $application['offerConditionNote'] : null,
-					'paymentStatus' => $application['paymentStatus'],
-					'paymentAmount' => !empty($application['paymentAmount']) ? $application['paymentAmount'] : null,
-					'paymentCurrency' => $application['paymentCurrency'],
-					'paymentReference' => !empty($application['paymentReference']) ? $application['paymentReference'] : null,
-					'paymentConfirmedDate' => !empty($application['paymentConfirmedDate']) ? $application['paymentConfirmedDate'] : null,
+					'paymentStatus' => $effective_payment_status,
+					'paymentAmount' => $effective_payment_amount,
+					'paymentCurrency' => $effective_payment_currency,
+					'paymentReference' => $effective_payment_reference,
+					'paymentConfirmedDate' => $effective_payment_confirmed_date,
 					'financeNote' => !empty($application['financeNote']) ? $application['financeNote'] : null,
 					'permitStatus' => $application['permitStatus'],
 					'permitReference' => !empty($application['permitReference']) ? $application['permitReference'] : null,
