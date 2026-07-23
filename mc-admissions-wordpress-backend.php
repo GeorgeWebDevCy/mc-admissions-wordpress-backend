@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.27
+ * Version: 0.2.28
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -2515,7 +2515,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$application = $wpdb->get_row(
 				$wpdb->prepare(
-					"SELECT id, wordpressUserId FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+					"SELECT id, wordpressUserId, status FROM {$this->applications_table} WHERE id = %s LIMIT 1",
 					$application_id
 				),
 				ARRAY_A
@@ -3607,22 +3607,55 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 			try {
 				$user = $this->current_session_user();
+				if (!$this->is_admin_user($user) && !in_array('finance-officer', $user['roles'], true)) {
+					throw new Exception('You do not have permission to record payment transactions.');
+				}
 				$application_id = sanitize_text_field($request['application_id']);
+				$this->get_authorized_application_base($application_id, $user);
 				$id = wp_generate_uuid4();
+				$amount = sanitize_text_field($draft['amount']);
+				$currency = sanitize_text_field($draft['currency'] ?? 'EUR');
+				$reference = isset($draft['reference']) && '' !== trim((string) $draft['reference'])
+					? sanitize_text_field($draft['reference'])
+					: (isset($draft['swiftReference']) ? sanitize_text_field($draft['swiftReference']) : null);
+				$confirmed_date = isset($draft['confirmedDate']) && '' !== trim((string) $draft['confirmedDate'])
+					? sanitize_text_field($draft['confirmedDate'])
+					: wp_date('Y-m-d');
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery
 				$wpdb->insert($this->payments_table, array(
 					'id' => $id, 'applicationId' => $application_id,
-					'amount' => sanitize_text_field($draft['amount']),
-					'currency' => sanitize_text_field($draft['currency'] ?? 'EUR'),
+					'amount' => $amount,
+					'currency' => $currency,
 					'reference' => isset($draft['reference']) ? sanitize_text_field($draft['reference']) : null,
 					'swiftReference' => isset($draft['swiftReference']) ? sanitize_text_field($draft['swiftReference']) : null,
-					'confirmedDate' => isset($draft['confirmedDate']) ? sanitize_text_field($draft['confirmedDate']) : null,
+					'confirmedDate' => $confirmed_date,
 					'recordedByName' => $user['name'],
 					'note' => isset($draft['note']) ? sanitize_textarea_field($draft['note']) : null,
 				));
+				// Keep the application-level finance state in sync because acceptance-letter
+				// availability is evaluated from these fields for every staff role.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				$wpdb->update(
+					$this->applications_table,
+					array(
+						'paymentStatus' => 'cleared',
+						'paymentAmount' => $amount,
+						'paymentCurrency' => $currency,
+						'paymentReference' => $reference,
+						'paymentConfirmedDate' => $confirmed_date,
+						'lastUpdatedByName' => $user['name'],
+						'updatedAt' => current_time('mysql'),
+					),
+					array('id' => $application_id)
+				);
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$rows = $wpdb->get_results($wpdb->prepare("SELECT id, amount, currency, reference, swiftReference, confirmedDate, recordedByName, note, createdAt FROM {$this->payments_table} WHERE applicationId = %s ORDER BY createdAt DESC LIMIT 24", $application_id), ARRAY_A);
-				return new WP_REST_Response(array('ok' => true, 'transactions' => $rows ?: array()), 201);
+				$application = $this->to_admission_case($this->get_detailed_application_record($application_id));
+				return new WP_REST_Response(array(
+					'ok' => true,
+					'transactions' => $rows ?: array(),
+					'application' => $application,
+				), 201);
 			} catch (Exception $error) {
 				return $this->json_error_response($error->getMessage(), 400);
 			}
