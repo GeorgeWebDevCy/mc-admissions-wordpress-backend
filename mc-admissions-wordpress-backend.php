@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.31
+ * Version: 0.2.32
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -494,6 +494,21 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		public function normalize_update_package_paths($source, $remote_source = null, $upgrader = null, $hook_extra = null) {
+			// This filter is global. Never alter packages uploaded through
+			// Plugins > Add New or packages belonging to another plugin.
+			if (is_array($hook_extra)) {
+				if (isset($hook_extra['action']) && 'install' === $hook_extra['action']) {
+					return $source;
+				}
+
+				if (
+					isset($hook_extra['plugin'])
+					&& plugin_basename(__FILE__) !== $hook_extra['plugin']
+				) {
+					return $source;
+				}
+			}
+
 			if (!is_string($source) || !is_dir($source)) {
 				return $source;
 			}
