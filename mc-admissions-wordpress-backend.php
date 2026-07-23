@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.26
+ * Version: 0.2.27
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -533,7 +533,38 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$this->move_update_package_path($entry, $target);
 			}
 
-			return $source;
+			$package_root = file_exists($base . '/mc-admissions-wordpress-backend.php')
+				? $base
+				: $base . '/mc-admissions-wordpress-backend';
+			if (!file_exists($package_root . '/mc-admissions-wordpress-backend.php')) {
+				return $source;
+			}
+
+			$installed_directory = dirname(plugin_basename(__FILE__));
+			if ('.' === $installed_directory || '' === $installed_directory) {
+				return $package_root;
+			}
+
+			if (basename($package_root) === $installed_directory) {
+				return $package_root;
+			}
+
+			$target = dirname($package_root) . '/' . $installed_directory;
+			if (file_exists($target)) {
+				global $wp_filesystem;
+				if (!is_object($wp_filesystem) || !$wp_filesystem->delete($target, true)) {
+					return $package_root;
+				}
+			}
+
+			if (
+				$this->move_update_package_path($package_root, $target)
+				&& file_exists($target . '/mc-admissions-wordpress-backend.php')
+			) {
+				return $target;
+			}
+
+			return $package_root;
 		}
 
 		private function move_update_package_path($source, $target) {
