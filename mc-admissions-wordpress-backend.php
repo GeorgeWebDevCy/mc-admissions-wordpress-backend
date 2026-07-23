@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.25
+ * Version: 0.2.26
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -130,11 +130,40 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$this->ensure_roles();
 			$this->ensure_immigration_insurance_columns();
 			$this->ensure_resource_indexes();
+			$this->ensure_notification_activity_schema();
 			$this->boot_update_checker();
 			add_filter('upgrader_source_selection', array($this, 'normalize_update_package_paths'), 10, 4);
 			add_action('admin_menu', array($this, 'register_admin_menu'));
 			add_action('rest_api_init', array($this, 'register_rest_routes'));
 			add_filter('rest_pre_serve_request', array($this, 'send_rest_cors_headers'), 10, 4);
+		}
+
+		private function ensure_notification_activity_schema() {
+			global $wpdb;
+
+			if ('1' === get_option('mc_admissions_notification_activity_schema_version')) {
+				return;
+			}
+
+			if ($this->activities_table !== $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->activities_table))) {
+				return;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$actor_role_column = $wpdb->get_var("SHOW COLUMNS FROM {$this->activities_table} LIKE 'actorRole'");
+			if (!$actor_role_column) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$wpdb->query("ALTER TABLE {$this->activities_table} ADD COLUMN actorRole VARCHAR(32) NOT NULL DEFAULT 'unknown' AFTER actorName");
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$event_index = $wpdb->get_var($wpdb->prepare("SHOW INDEX FROM {$this->activities_table} WHERE Key_name = %s", 'mc_admission_activities_actorRole_createdAt_idx'));
+			if (!$event_index) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$wpdb->query("ALTER TABLE {$this->activities_table} ADD INDEX mc_admission_activities_actorRole_createdAt_idx (actorRole, createdAt)");
+			}
+
+			update_option('mc_admissions_notification_activity_schema_version', '1', false);
 		}
 
 		private function ensure_resource_indexes() {
@@ -314,9 +343,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					title VARCHAR(191) NOT NULL,
 					detail TEXT NULL,
 					actorName VARCHAR(191) NOT NULL,
+					actorRole VARCHAR(32) NOT NULL DEFAULT 'unknown',
 					createdAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 					PRIMARY KEY (id),
-					KEY mc_admission_activities_applicationId_createdAt_idx (applicationId, createdAt)
+					KEY mc_admission_activities_applicationId_createdAt_idx (applicationId, createdAt),
+					KEY mc_admission_activities_actorRole_createdAt_idx (actorRole, createdAt)
 				) {$charset}
 				",
 				"
@@ -717,6 +748,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						'callback' => array($this, 'rest_update_workflow'),
 						'permission_callback' => array($this, 'permission_authenticated'),
 					),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
+				'/notification-events',
+				array(
+					'methods' => WP_REST_Server::READABLE,
+					'callback' => array($this, 'rest_notification_events'),
+					'permission_callback' => array($this, 'permission_authenticated'),
 				)
 			);
 
@@ -1464,6 +1505,73 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					),
 					200
 				);
+			} catch (Exception $error) {
+				return $this->json_error_response($error->getMessage(), 400);
+			}
+		}
+
+		public function rest_notification_events(WP_REST_Request $request) {
+			global $wpdb;
+
+			try {
+				$user = $this->current_session_user();
+				$cursor_mysql = current_time('mysql', true);
+				$cursor = gmdate('c', strtotime($cursor_mysql . ' UTC'));
+
+				if ($this->is_agent_user($user) || !$this->can_view_all_applications($user)) {
+					return new WP_REST_Response(array('ok' => true, 'cursor' => $cursor, 'events' => array()), 200);
+				}
+
+				$since_value = sanitize_text_field((string) $request->get_param('since'));
+				$since_timestamp = $since_value ? strtotime($since_value) : false;
+				if (false === $since_timestamp) {
+					$since_timestamp = strtotime($cursor_mysql . ' UTC');
+				}
+				$since_mysql = gmdate('Y-m-d H:i:s', $since_timestamp);
+
+				// Lightweight indexed query: only agent-created submission/document events
+				// inside the requested cursor window are returned.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$rows = $wpdb->get_results(
+					$wpdb->prepare(
+						"SELECT activity.id, activity.applicationId, activity.kind, activity.title,
+						activity.actorName, activity.createdAt, app.referenceCode, app.fullName
+						FROM {$this->activities_table} activity
+						INNER JOIN {$this->applications_table} app ON app.id = activity.applicationId
+						WHERE activity.actorRole = 'agent'
+						AND activity.createdAt >= %s AND activity.createdAt <= %s
+						AND (
+							activity.title = 'Application submitted for review'
+							OR (
+								activity.kind = 'document'
+								AND LOWER(TRIM(app.status)) NOT IN ('application in progress', 'profile-preparation', 'profile preparation')
+							)
+						)
+						ORDER BY activity.createdAt ASC
+						LIMIT 50",
+						$since_mysql,
+						$cursor_mysql
+					),
+					ARRAY_A
+				);
+
+				$events = array_map(
+					function ($row) {
+						return array(
+							'id' => $row['id'],
+							'type' => 'document' === $row['kind'] ? 'document-uploaded' : 'application-submitted',
+							'applicationId' => $row['applicationId'],
+							'referenceCode' => $row['referenceCode'],
+							'applicantName' => $row['fullName'],
+							'title' => $row['title'],
+							'actorName' => $row['actorName'],
+							'createdAt' => $this->mysql_datetime_to_iso($row['createdAt']),
+						);
+					},
+					is_array($rows) ? $rows : array()
+				);
+
+				return new WP_REST_Response(array('ok' => true, 'cursor' => $cursor, 'events' => $events), 200);
 			} catch (Exception $error) {
 				return $this->json_error_response($error->getMessage(), 400);
 			}
@@ -2575,9 +2683,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'title' => $title,
 					'detail' => $this->trim_to_null($detail),
 					'actorName' => $user['name'],
+					'actorRole' => $this->is_agent_user($user) ? 'agent' : 'internal',
 					'createdAt' => current_time('mysql', true),
 				),
-				array('%s', '%s', '%s', '%s', '%s', '%s', '%s')
+				array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
 			);
 		}
 
