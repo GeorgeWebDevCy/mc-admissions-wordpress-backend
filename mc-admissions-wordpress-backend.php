@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.32
+ * Version: 0.2.33
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -39,6 +39,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		/** @var string */
 		private $payments_table = 'mc_admission_payments';
+
+		/** @var string */
+		private $commission_records_table = 'mc_commission_records';
+
+		/** @var string */
+		private $refund_records_table = 'mc_refund_records';
 
 		/** @var string */
 		private $migration_cases_table = 'mc_admission_migration_cases';
@@ -2390,23 +2396,44 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function get_lane_for_status($status) {
 			switch ($status) {
+				case 'profile-preparation':
+				case 'review-pending':
+				case 'offer-issued':
+				case 'prepayment-pending':
 				case 'Application in progress':
-					return 'incoming';
 				case 'Under review':
 				case 'Offer letter issued':
-					return 'review';
+					return 'applications';
+				case 'acceptance-issued':
+				case 'migration-documents':
+				case 'entry-permit-processing':
 				case 'Payment pending':
 				case 'Acceptance confirmed':
 				case 'Entry permit processing':
+					return 'migration';
+				case 'arrival-immigration':
+					return 'immigration';
+				case 'enrollment-complete':
+				case 'rejected':
+				case 'trashed':
 				case 'Ready to enroll':
-					return 'arrival';
+					return 'closed';
 				default:
-					return 'incoming';
+					return 'applications';
 			}
 		}
 
 		private function get_progress_for_status($status, $ready_documents) {
 			$by_status = array(
+				'profile-preparation' => 18,
+				'review-pending' => 50,
+				'offer-issued' => 66,
+				'prepayment-pending' => 78,
+				'acceptance-issued' => 86,
+				'migration-documents' => 88,
+				'entry-permit-processing' => 94,
+				'arrival-immigration' => 96,
+				'enrollment-complete' => 100,
 				'Application in progress' => 18,
 				'Under review' => 50,
 				'Offer letter issued' => 66,
@@ -2460,6 +2487,22 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$where_sql = '';
 			$query_args = array();
+			$commission_status_sql = "'not-applicable'";
+			$refund_status_sql = "'none'";
+
+			if (
+				$this->commission_records_table ===
+				$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->commission_records_table))
+			) {
+				$commission_status_sql = "COALESCE((SELECT commission.status FROM {$this->commission_records_table} commission WHERE commission.applicationId = app.id ORDER BY commission.updatedAt DESC, commission.createdAt DESC LIMIT 1), 'not-applicable')";
+			}
+
+			if (
+				$this->refund_records_table ===
+				$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->refund_records_table))
+			) {
+				$refund_status_sql = "COALESCE((SELECT refund.status FROM {$this->refund_records_table} refund WHERE refund.applicationId = app.id ORDER BY refund.updatedAt DESC, refund.createdAt DESC LIMIT 1), 'none')";
+			}
 
 			if (!$this->can_view_all_applications($user)) {
 				$where_sql = 'WHERE app.wordpressUserId = %d';
@@ -2477,11 +2520,27 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					migration.paymentDate AS permitPaymentDate,
 					migration.decisionDate AS permitDecisionDate,
 					migration.permitReference AS permitReference,
-					(SELECT COUNT(*) FROM {$this->documents_table} doc WHERE doc.applicationId = app.id) AS documentCount,
-					(SELECT COUNT(*) FROM {$this->documents_table} ready_doc WHERE ready_doc.applicationId = app.id AND ready_doc.isReady = 1) AS readyDocumentCount
+					{$commission_status_sql} AS commissionStatus,
+					{$refund_status_sql} AS refundStatus,
+					COALESCE(document_stats.documentCount, 0) AS documentCount,
+					COALESCE(document_stats.readyDocumentCount, 0) AS readyDocumentCount,
+					COALESCE(document_stats.readyIntakeDocumentCount, 0) AS readyIntakeDocumentCount,
+					COALESCE(document_stats.readyMigrationDocumentCount, 0) AS readyMigrationDocumentCount,
+					COALESCE(document_stats.readyImmigrationDocumentCount, 0) AS readyImmigrationDocumentCount
 				FROM {$this->applications_table} app
 				LEFT JOIN {$this->migration_cases_table} migration
 					ON migration.applicationId = app.id
+				LEFT JOIN (
+					SELECT
+						doc.applicationId,
+						COUNT(*) AS documentCount,
+						SUM(CASE WHEN doc.isReady = 1 THEN 1 ELSE 0 END) AS readyDocumentCount,
+						SUM(CASE WHEN doc.isReady = 1 AND doc.type IN ('passport', 'secondaryMarksheet', 'higherSecondaryMarksheet', 'englishCertificate', 'studentSignature', 'consultantSignature', 'bachelorDiploma', 'bachelorTranscript') THEN 1 ELSE 0 END) AS readyIntakeDocumentCount,
+						SUM(CASE WHEN doc.isReady = 1 AND doc.type IN ('migrationSupportingDocuments', 'entryPermitPaymentReceipt', 'entryPermitRecord', 'courierReceipt') THEN 1 ELSE 0 END) AS readyMigrationDocumentCount,
+						SUM(CASE WHEN doc.isReady = 1 AND doc.type IN ('afterArrivalPaymentReceipt', 'enrollmentAgreement', 'bankStatement', 'rentalAgreement', 'medicalCertificate', 'xRayRecord', 'immigrationAppointmentRecord', 'immigrationPaymentReceipt', 'pinkCardRecord', 'insuranceCopy') THEN 1 ELSE 0 END) AS readyImmigrationDocumentCount
+					FROM {$this->documents_table} doc
+					GROUP BY doc.applicationId
+				) document_stats ON document_stats.applicationId = app.id
 				{$where_sql}
 				ORDER BY app.updatedAt DESC
 				LIMIT %d
@@ -2494,9 +2553,25 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		private function to_board_application($application) {
-			$ready_documents = isset($application['readyDocumentCount']) ? (int) $application['readyDocumentCount'] : 0;
-			$total_documents = isset($application['documentCount']) ? (int) $application['documentCount'] : 0;
 			$status = $this->normalize_status($application['status']);
+			$intake_total = isset($application['applicationRoute']) && 'postgraduate' === $application['applicationRoute'] ? 8 : 6;
+			$migration_total = 4;
+			$immigration_total = 10;
+			$intake_ready = isset($application['readyIntakeDocumentCount']) ? (int) $application['readyIntakeDocumentCount'] : 0;
+			$migration_ready = isset($application['readyMigrationDocumentCount']) ? (int) $application['readyMigrationDocumentCount'] : 0;
+			$immigration_ready = isset($application['readyImmigrationDocumentCount']) ? (int) $application['readyImmigrationDocumentCount'] : 0;
+			$lane = $this->get_lane_for_status($status);
+			$ready_documents = $intake_ready;
+			$total_documents = $intake_total;
+
+			if ('migration' === $lane) {
+				$ready_documents = $migration_ready;
+				$total_documents = $migration_total;
+			} elseif ('immigration' === $lane) {
+				$ready_documents = $immigration_ready;
+				$total_documents = $immigration_total;
+			}
+
 			$missing_docs = max(0, $total_documents - $ready_documents);
 
 			return array(
@@ -2516,10 +2591,21 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'permitReference' => !empty($application['permitReference']) ? $application['permitReference'] : null,
 				'arrivalStatus' => isset($application['arrivalStatus']) ? $application['arrivalStatus'] : 'planning',
 				'enrollmentStatus' => isset($application['enrollmentStatus']) ? $application['enrollmentStatus'] : 'pending',
-				'lane' => $this->get_lane_for_status($status),
+				'lane' => $lane,
 				'progress' => $this->get_progress_for_status($status, $ready_documents),
 				'missingDocs' => $missing_docs,
 				'readyDocuments' => $ready_documents,
+				'totalIntakeDocuments' => $intake_total,
+				'intakeMissingDocs' => max(0, $intake_total - $intake_ready),
+				'intakeReadyDocuments' => $intake_ready,
+				'totalMigrationDocuments' => $migration_total,
+				'migrationMissingDocs' => max(0, $migration_total - $migration_ready),
+				'migrationReadyDocuments' => $migration_ready,
+				'totalImmigrationDocuments' => $immigration_total,
+				'immigrationMissingDocs' => max(0, $immigration_total - $immigration_ready),
+				'immigrationReadyDocuments' => $immigration_ready,
+				'commissionStatus' => isset($application['commissionStatus']) ? $application['commissionStatus'] : 'not-applicable',
+				'refundStatus' => isset($application['refundStatus']) ? $application['refundStatus'] : 'none',
 				'nextAction' => $this->next_action_for_status($application, $ready_documents, $total_documents),
 				'workflowNote' => !empty($application['workflowNote']) ? $application['workflowNote'] : null,
 				'updatedByName' => !empty($application['lastUpdatedByName']) ? $application['lastUpdatedByName'] : null,
