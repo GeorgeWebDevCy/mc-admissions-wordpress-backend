@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.37
+ * Version: 0.2.38
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -135,6 +135,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function boot() {
 			$this->ensure_roles();
 			$this->ensure_immigration_insurance_columns();
+			$this->ensure_offer_detail_columns();
 			$this->ensure_resource_indexes();
 			$this->ensure_notification_activity_schema();
 			$this->boot_update_checker();
@@ -245,6 +246,38 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		private function ensure_offer_detail_columns() {
+			global $wpdb;
+
+			if ('0.2.38' === get_option('mc_admissions_offer_detail_schema_version')) {
+				return;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			if ($this->applications_table !== $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->applications_table))) {
+				return;
+			}
+
+			$columns = array(
+				'classesStartDate' => "VARCHAR(191) NULL AFTER offerConditionNote",
+				'tuitionFeeFirstYear' => "VARCHAR(191) NULL AFTER classesStartDate",
+				'tuitionFeeFollowingYears' => "VARCHAR(191) NULL AFTER tuitionFeeFirstYear",
+				'termBalanceApplies' => "BOOLEAN NOT NULL DEFAULT 0 AFTER tuitionFeeFollowingYears",
+			);
+
+			foreach ($columns as $column => $definition) {
+				// Column names and definitions are internal constants.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$present = $wpdb->get_var("SHOW COLUMNS FROM {$this->applications_table} LIKE '{$column}'");
+				if (!$present) {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					$wpdb->query("ALTER TABLE {$this->applications_table} ADD COLUMN {$column} {$definition}");
+				}
+			}
+
+			update_option('mc_admissions_offer_detail_schema_version', '0.2.38', false);
+		}
+
 		public function activate() {
 			$this->ensure_roles();
 			global $wpdb;
@@ -291,6 +324,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					offerIssuedDate VARCHAR(191) NULL,
 					offerExpiryDate VARCHAR(191) NULL,
 					offerConditionNote TEXT NULL,
+					classesStartDate VARCHAR(191) NULL,
+					tuitionFeeFirstYear VARCHAR(191) NULL,
+					tuitionFeeFollowingYears VARCHAR(191) NULL,
+					termBalanceApplies BOOLEAN NOT NULL DEFAULT 0,
 					paymentStatus VARCHAR(191) NOT NULL DEFAULT 'awaiting-invoice',
 					paymentAmount VARCHAR(191) NULL,
 					paymentCurrency VARCHAR(191) NOT NULL DEFAULT 'EUR',
@@ -2830,6 +2867,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'offerIssuedDate' => !empty($application['offerIssuedDate']) ? $application['offerIssuedDate'] : null,
 					'offerExpiryDate' => !empty($application['offerExpiryDate']) ? $application['offerExpiryDate'] : null,
 					'offerConditionNote' => !empty($application['offerConditionNote']) ? $application['offerConditionNote'] : null,
+					'classesStartDate' => !empty($application['classesStartDate']) ? $application['classesStartDate'] : null,
+					'tuitionFeeFirstYear' => !empty($application['tuitionFeeFirstYear']) ? $application['tuitionFeeFirstYear'] : null,
+					'tuitionFeeFollowingYears' => !empty($application['tuitionFeeFollowingYears']) ? $application['tuitionFeeFollowingYears'] : null,
+					'termBalanceApplies' => !empty($application['termBalanceApplies']),
 					'paymentStatus' => $effective_payment_status,
 					'paymentAmount' => $effective_payment_amount,
 					'paymentCurrency' => $effective_payment_currency,
@@ -2921,6 +2962,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'offerIssuedDate' => $this->trim_to_null(isset($draft['offerIssuedDate']) ? $draft['offerIssuedDate'] : null),
 				'offerExpiryDate' => $this->trim_to_null(isset($draft['offerExpiryDate']) ? $draft['offerExpiryDate'] : null),
 				'offerConditionNote' => $this->trim_to_null(isset($draft['offerConditionNote']) ? $draft['offerConditionNote'] : null),
+				'classesStartDate' => $this->trim_to_null(isset($draft['classesStartDate']) ? $draft['classesStartDate'] : null),
+				'tuitionFeeFirstYear' => $this->trim_to_null(isset($draft['tuitionFeeFirstYear']) ? $draft['tuitionFeeFirstYear'] : null),
+				'tuitionFeeFollowingYears' => $this->trim_to_null(isset($draft['tuitionFeeFollowingYears']) ? $draft['tuitionFeeFollowingYears'] : null),
+				'termBalanceApplies' => !empty($draft['termBalanceApplies']) ? 1 : 0,
 				'paymentStatus' => $this->normalize_select_value(isset($draft['paymentStatus']) ? $draft['paymentStatus'] : '', $this->payment_statuses, 'awaiting-invoice'),
 				'paymentAmount' => $this->trim_to_null(isset($draft['paymentAmount']) ? $draft['paymentAmount'] : null),
 				'paymentCurrency' => $this->trim_to_null(isset($draft['paymentCurrency']) ? $draft['paymentCurrency'] : null) ?: 'EUR',
@@ -3326,6 +3371,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					offerIssuedDate = %s,
 					offerExpiryDate = %s,
 					offerConditionNote = %s,
+					classesStartDate = %s,
+					tuitionFeeFirstYear = %s,
+					tuitionFeeFollowingYears = %s,
+					termBalanceApplies = %d,
 					paymentStatus = %s,
 					paymentAmount = %s,
 					paymentCurrency = %s,
@@ -3356,6 +3405,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$normalized['offerIssuedDate'],
 				$normalized['offerExpiryDate'],
 				$normalized['offerConditionNote'],
+				$normalized['classesStartDate'],
+				$normalized['tuitionFeeFirstYear'],
+				$normalized['tuitionFeeFollowingYears'],
+				$normalized['termBalanceApplies'],
 				$normalized['paymentStatus'],
 				$normalized['paymentAmount'],
 				$normalized['paymentCurrency'],
