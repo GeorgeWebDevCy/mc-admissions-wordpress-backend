@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.38
+ * Version: 0.2.39
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -62,6 +62,25 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			'higherSecondaryMarksheet' => 'Copy of Higher Secondary School (12th grade) marksheet',
 			'englishCertificate' => 'English proficiency certificate',
 			'studentSignature' => 'Student signature',
+			'consultantSignature' => 'Agent / consultant signature',
+			'agencyAgreement' => 'Agency agreement',
+			'authorizationCertificate' => 'Authorization certificate',
+			'bachelorDiploma' => 'Bachelor diploma',
+			'bachelorTranscript' => 'Bachelor transcripts',
+			'bankTransactionConfirmation' => 'Bank transaction confirmation',
+			'migrationSupportingDocuments' => 'Migration supporting documents',
+			'entryPermitPaymentReceipt' => 'Entry permit payment receipt',
+			'entryPermitRecord' => 'Issued entry permit record',
+			'courierReceipt' => 'Courier or dispatch receipt',
+			'afterArrivalPaymentReceipt' => 'After-arrival payment receipt',
+			'enrollmentAgreement' => 'Enrollment agreement',
+			'bankStatement' => 'Bank statement',
+			'rentalAgreement' => 'Rental agreement',
+			'medicalCertificate' => 'Medical certificate',
+			'xRayRecord' => 'X-ray record',
+			'immigrationAppointmentRecord' => 'Immigration appointment record',
+			'immigrationPaymentReceipt' => 'Immigration payment receipt',
+			'pinkCardRecord' => 'Pink card record',
 			'insuranceCopy' => 'Copy of Insurance',
 		);
 
