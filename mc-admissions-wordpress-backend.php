@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.36
+ * Version: 0.2.37
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -2325,6 +2325,43 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return in_array($status, $this->pipeline_stages, true) ? $status : self::INITIAL_APPLICATION_STATUS;
 		}
 
+		private function canonical_status_key($status) {
+			$legacy_statuses = array(
+				'Draft' => 'profile-preparation',
+				'Application in progress' => 'profile-preparation',
+				'Under review' => 'review-pending',
+				'Offer letter issued' => 'offer-issued',
+				'Payment pending' => 'prepayment-pending',
+				'Acceptance confirmed' => 'acceptance-issued',
+				'Entry permit processing' => 'entry-permit-processing',
+				'Ready to enroll' => 'enrollment-complete',
+			);
+
+			if (isset($legacy_statuses[$status])) {
+				return $legacy_statuses[$status];
+			}
+
+			return in_array(
+				$status,
+				array(
+					'profile-preparation',
+					'review-pending',
+					'offer-issued',
+					'prepayment-pending',
+					'acceptance-issued',
+					'migration-documents',
+					'entry-permit-processing',
+					'arrival-immigration',
+					'enrollment-complete',
+					'rejected',
+					'trashed',
+				),
+				true
+			)
+				? $status
+				: 'profile-preparation';
+		}
+
 		private function workflow_note_for_status($status) {
 			switch ($status) {
 				case 'trashed':
@@ -2764,7 +2801,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					// The case UI needs the raw canonical workflow key. Never
 					// replace this with the human-readable stage label.
 					'stageKey' => isset($application['status'])
-						? (string) $application['status']
+						? $this->canonical_status_key((string) $application['status'])
 						: 'profile-preparation',
 					'fullName' => $application['fullName'],
 					'passportNumber' => $application['passportNumber'],
