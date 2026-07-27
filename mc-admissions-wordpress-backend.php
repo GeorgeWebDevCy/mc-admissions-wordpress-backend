@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.34
+ * Version: 0.2.35
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -1584,8 +1584,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				}
 				$since_mysql = gmdate('Y-m-d H:i:s', $since_timestamp);
 
-				// Lightweight indexed query: only agent-created submission/document events
-				// inside the requested cursor window are returned.
+				// Lightweight indexed query: notify internal users about agent-created
+				// application changes, workflow submissions, and document changes.
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$rows = $wpdb->get_results(
 					$wpdb->prepare(
@@ -1595,13 +1595,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						INNER JOIN {$this->applications_table} app ON app.id = activity.applicationId
 						WHERE activity.actorRole = 'agent'
 						AND activity.createdAt >= %s AND activity.createdAt <= %s
-						AND (
-							activity.title = 'Application submitted for review'
-							OR (
-								activity.kind = 'document'
-								AND LOWER(TRIM(app.status)) NOT IN ('application in progress', 'profile-preparation', 'profile preparation')
-							)
-						)
+						AND activity.kind IN ('application', 'workflow', 'document')
 						ORDER BY activity.createdAt ASC
 						LIMIT 50",
 						$since_mysql,
@@ -1614,7 +1608,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					function ($row) {
 						return array(
 							'id' => $row['id'],
-							'type' => 'document' === $row['kind'] ? 'document-uploaded' : 'application-submitted',
+							'type' => 'document' === $row['kind']
+								? 'document-uploaded'
+								: ('workflow' === $row['kind'] ? 'application-submitted' : 'application-updated'),
 							'applicationId' => $row['applicationId'],
 							'referenceCode' => $row['referenceCode'],
 							'applicantName' => $row['fullName'],
