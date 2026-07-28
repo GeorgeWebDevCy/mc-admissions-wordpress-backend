@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.42
+ * Version: 0.2.43
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -944,6 +944,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				array(
 					'methods' => WP_REST_Server::READABLE,
 					'callback' => array($this, 'rest_download_document_file'),
+					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
+				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/letters/(?P<letter_id>[A-Za-z0-9_-]+)/file',
+				array(
+					'methods' => WP_REST_Server::READABLE,
+					'callback' => array($this, 'rest_download_generated_letter_file'),
 					'permission_callback' => array($this, 'permission_authenticated'),
 				)
 			);
@@ -2169,6 +2179,42 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		public function rest_download_generated_letter_file(WP_REST_Request $request) {
+			global $wpdb;
+			try {
+				$user = $this->current_session_user();
+				$application_id = (string) $request['application_id'];
+				$this->get_authorized_application_base($application_id, $user);
+				$letter = $wpdb->get_row($wpdb->prepare(
+					'SELECT fileName, outputFormat, renderedHtml FROM mc_generated_letters WHERE id = %s AND applicationId = %s LIMIT 1',
+					(string) $request['letter_id'],
+					$application_id
+				), ARRAY_A);
+				if (!$letter) {
+					throw new Exception('Generated letter not found.');
+				}
+				$file_name = !empty($letter['fileName']) ? $letter['fileName'] : 'generated-letter';
+				$body = (string) $letter['renderedHtml'];
+				if ('pdf' === strtolower((string) $letter['outputFormat'])) {
+					$body = base64_decode($body, true);
+					if (false === $body || '' === $body) {
+						throw new Exception('Generated letter file is empty or invalid.');
+					}
+					$content_type = 'application/pdf';
+				} else {
+					$content_type = 'text/html; charset=utf-8';
+				}
+				status_header(200);
+				header('Content-Type: ' . $content_type);
+				header('Content-Disposition: inline; filename*=UTF-8\'\'' . rawurlencode($file_name));
+				header('Cache-Control: private, no-store');
+				echo $body; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+				exit;
+			} catch (Exception $error) {
+				return $this->json_error_response($error->getMessage(), 404);
+			}
+		}
+
 		private function posted_setting($key, $fallback = '') {
 			if (!isset($_POST[$key])) {
 				return $fallback;
@@ -2766,6 +2812,20 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				ARRAY_A
 			);
 
+			$generated_letters = array();
+			$letters_table = 'mc_generated_letters';
+			$has_letters =
+				$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $letters_table)) === $letters_table;
+			if ($has_letters) {
+				$generated_letters = $wpdb->get_results(
+					$wpdb->prepare(
+						'SELECT id, applicationId, templateId, templateLabel, templateVersion, stageKeySnapshot, fileName, outputFormat, generatedByName, createdAt FROM ' . $letters_table . ' WHERE applicationId = %s ORDER BY createdAt DESC LIMIT 24',
+						$application_id
+					),
+					ARRAY_A
+				);
+			}
+
 			// Case-detail sub-panels (payments / migration / immigration). These
 			// reuse the same queries as the dedicated REST endpoints so the web
 			// case detail renders them from this single fetch (it can't reach the
@@ -2794,6 +2854,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$application['documents'] = is_array($documents) ? $documents : array();
 			$application['activities'] = is_array($activities) ? $activities : array();
+			$application['generatedLetters'] = is_array($generated_letters) ? $generated_letters : array();
 			$application['paymentTransactions'] = is_array($payments) ? $payments : array();
 			$application['migrationCase'] = $migration_case ? $migration_case : null;
 			$application['immigrationCase'] = $immigration_case ? $immigration_case : null;
@@ -2816,6 +2877,24 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
+		private function map_generated_letter($letter) {
+			$application_id = (string) $letter['applicationId'];
+			$letter_id = (string) $letter['id'];
+
+			return array(
+				'id' => $letter_id,
+				'templateId' => (string) $letter['templateId'],
+				'templateLabel' => (string) $letter['templateLabel'],
+				'templateVersion' => (string) $letter['templateVersion'],
+				'stageKey' => $this->canonical_status_key((string) $letter['stageKeySnapshot']),
+				'fileName' => (string) $letter['fileName'],
+				'outputFormat' => 'pdf' === strtolower((string) $letter['outputFormat']) ? 'pdf' : 'html',
+				'outputUrl' => '/api/admissions/' . rawurlencode($application_id) . '/letters/' . rawurlencode($letter_id) . '/file',
+				'generatedAt' => $this->mysql_datetime_to_iso($letter['createdAt']),
+				'generatedByName' => (string) $letter['generatedByName'],
+			);
+		}
+
 		private function to_admission_case($application) {
 			$board = $this->to_board_application(
 				array_merge(
@@ -2835,6 +2914,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 
 			$documents = array_map(array($this, 'map_document'), $application['documents']);
+			$letters = array_map(
+				array($this, 'map_generated_letter'),
+				isset($application['generatedLetters']) && is_array($application['generatedLetters'])
+					? $application['generatedLetters']
+					: array()
+			);
 			$activity = array_map(
 				array($this, 'map_activity_entry'),
 				$application['activities']
@@ -2917,6 +3002,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'enrollmentStatus' => $application['enrollmentStatus'],
 					'orientationDate' => !empty($application['orientationDate']) ? $application['orientationDate'] : null,
 					'enrollmentNote' => !empty($application['enrollmentNote']) ? $application['enrollmentNote'] : null,
+					'letters' => $letters,
 					'documents' => $documents,
 					'activity' => $activity,
 					'createdAt' => $this->mysql_datetime_to_iso($application['createdAt']),
