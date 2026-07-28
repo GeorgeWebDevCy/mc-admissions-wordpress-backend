@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.40
+ * Version: 0.2.41
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -3294,6 +3294,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				WHERE id = %s
 			";
 			$args = array($status, $next_note, $user['name'], $application_id);
+			$unversioned_update_sql = $update_sql;
+			$unversioned_args = $args;
 
 			if ($expected_version) {
 				$update_sql .= " AND updatedAt = %s";
@@ -3307,7 +3309,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			if (0 === $updated && $expected_version) {
-				throw new Exception(self::STALE_APPLICATION_ERROR);
+				// A stage button is an explicit command, not a full-record save.
+				// Reapply its target to the current row so an older open screen
+				// cannot permanently block Move/Back/Trash/Restore actions.
+				$updated = $wpdb->query(
+					$wpdb->prepare($unversioned_update_sql, $unversioned_args)
+				);
+
+				if (false === $updated) {
+					throw new Exception('Unable to save the admissions workflow stage.');
+				}
 			}
 
 			$status_changed = $existing['status'] !== $status;
