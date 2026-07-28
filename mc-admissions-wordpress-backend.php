@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.41
+ * Version: 0.2.42
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -2424,20 +2424,30 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					return 'Application moved to Trash by an administrator.';
 				case 'review-pending':
 					return 'Application restored from Trash and returned to pending assessment.';
+				case 'profile-preparation':
 				case 'Application in progress':
 					return 'Application is being prepared. Complete the profile and document pack before review.';
 				case 'Under review':
 					return 'Application is queued for assessment and document verification.';
+				case 'offer-issued':
 				case 'Offer letter issued':
 					return 'Offer issued. Send payment and acceptance instructions to the applicant.';
+				case 'prepayment-pending':
 				case 'Payment pending':
 					return 'Waiting for tuition receipt or finance confirmation.';
+				case 'acceptance-issued':
 				case 'Acceptance confirmed':
 					return 'Offer accepted. Prepare the permit and pre-arrival file.';
+				case 'migration-documents':
 				case 'Entry permit processing':
 					return 'Permit pack submitted. Monitor approvals and travel readiness.';
+				case 'arrival-immigration':
+					return 'Arrival and immigration follow-up is in progress.';
+				case 'enrollment-complete':
 				case 'Ready to enroll':
 					return 'Admissions process complete. Hand over to enrollment and registrar.';
+				case 'rejected':
+					return 'Application rejected and closed after review.';
 				default:
 					return 'Application is being prepared. Complete the profile and document pack before review.';
 			}
