@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.43
+ * Version: 0.2.44
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -99,6 +99,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			'prepayment-pending',
 			'acceptance-issued',
 			'migration-documents',
+			'entry-permit-processing',
 			'arrival-immigration',
 			'enrollment-complete',
 			'rejected',
@@ -2070,6 +2071,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						'applicationId' => $saved['id'],
 						'application' => $saved['application'],
 						'caseRecord' => $saved['caseRecord'],
+						'stageChanged' => !empty($saved['stageChanged']),
+						'staleCommandIgnored' => !empty($saved['staleCommandIgnored']),
 					),
 					200
 				);
@@ -2464,6 +2467,59 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				: 'profile-preparation';
 		}
 
+		private function workflow_status_rank($status) {
+			$forward_stages = array(
+				'profile-preparation',
+				'review-pending',
+				'offer-issued',
+				'prepayment-pending',
+				'acceptance-issued',
+				'migration-documents',
+				'entry-permit-processing',
+				'arrival-immigration',
+				'enrollment-complete',
+			);
+			$rank = array_search($this->canonical_status_key($status), $forward_stages, true);
+
+			return false === $rank ? -1 : (int) $rank;
+		}
+
+		private function is_terminal_workflow_status($status) {
+			return in_array($this->canonical_status_key($status), array('rejected', 'trashed'), true);
+		}
+
+		private function should_apply_stale_workflow_target($current_status, $target_status) {
+			$current_key = $this->canonical_status_key($current_status);
+			$target_key = $this->canonical_status_key($target_status);
+
+			if (
+				$current_key === $target_key
+				|| $this->is_terminal_workflow_status($current_key)
+				|| $this->is_terminal_workflow_status($target_key)
+			) {
+				return false;
+			}
+
+			$current_rank = $this->workflow_status_rank($current_key);
+			$target_rank = $this->workflow_status_rank($target_key);
+
+			return $current_rank >= 0 && $target_rank === $current_rank + 1;
+		}
+
+		private function active_document_pack_for_status($status) {
+			switch ($this->canonical_status_key($status)) {
+				case 'acceptance-issued':
+				case 'migration-documents':
+				case 'entry-permit-processing':
+					return 'migration';
+				case 'arrival-immigration':
+				case 'enrollment-complete':
+					return 'immigration';
+				default:
+					return 'intake';
+			}
+		}
+
 		private function workflow_note_for_status($status) {
 			switch ($status) {
 				case 'trashed':
@@ -2483,10 +2539,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					return 'Waiting for tuition receipt or finance confirmation.';
 				case 'acceptance-issued':
 				case 'Acceptance confirmed':
-					return 'Offer accepted. Prepare the permit and pre-arrival file.';
+					return 'Acceptance package has been issued. Hand the case over to migration document collection.';
 				case 'migration-documents':
+					return 'Migration documents are being recorded and checked before the entry permit submission.';
+				case 'entry-permit-processing':
 				case 'Entry permit processing':
-					return 'Permit pack submitted. Monitor approvals and travel readiness.';
+					return 'Entry permit application is in progress. Monitor submission, payment, and decision updates.';
 				case 'arrival-immigration':
 					return 'Arrival and immigration follow-up is in progress.';
 				case 'enrollment-complete':
@@ -2501,39 +2559,52 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function next_action_for_status($application, $ready_documents, $total_documents) {
 			$missing_docs = max(0, $total_documents - $ready_documents);
-			$status = $this->normalize_status($application['status']);
+			$status = $this->canonical_status_key($application['status']);
 
 			switch ($status) {
+				case 'profile-preparation':
 				case 'Application in progress':
 					return $missing_docs > 0
 						? 'Complete the applicant profile and clear the missing document slots.'
 						: 'Submit the case into review.';
+				case 'review-pending':
 				case 'Under review':
 					return $missing_docs > 0
 						? 'Request the outstanding documents before confirming the review outcome.'
 						: ('pending' === $application['reviewerDecision']
 							? 'Record the academic decision and issue the offer.'
 							: 'Issue the offer letter and set the payment instructions.');
+				case 'offer-issued':
 				case 'Offer letter issued':
 					return 'cleared' === $application['paymentStatus']
 						? 'Move the cleared case into acceptance confirmation.'
 						: 'Collect tuition payment evidence and signed acceptance.';
+				case 'prepayment-pending':
 				case 'Payment pending':
 					return 'cleared' === $application['paymentStatus']
 						? 'Confirm acceptance and begin permit processing.'
 						: 'Wait for finance clearance or receipt verification.';
+				case 'acceptance-issued':
 				case 'Acceptance confirmed':
-					return 'submitted' === $application['permitStatus']
-						? 'Track the permit outcome and prepare arrival planning.'
-						: 'Prepare and submit the entry permit pack.';
+					return 'Collect and verify the migration document pack.';
+				case 'migration-documents':
+					return 'Prepare and submit the entry permit pack.';
+				case 'entry-permit-processing':
 				case 'Entry permit processing':
 					return 'approved' === $application['permitStatus']
 						? 'Capture travel and orientation details, then hand off to enrollment.'
 						: 'Monitor permit status and keep the applicant updated.';
+				case 'arrival-immigration':
+					return 'Complete the after-arrival immigration and registrar tasks.';
+				case 'enrollment-complete':
 				case 'Ready to enroll':
 					return 'enrolled' === $application['enrollmentStatus']
 						? 'Case completed. Keep the record for audit and reporting.'
 						: 'Finalize registrar handoff and orientation scheduling.';
+				case 'rejected':
+					return 'Case rejected. Keep the record for audit and reporting.';
+				case 'trashed':
+					return 'Application is in Trash and can be restored only by an administrator.';
 				default:
 					return 'Complete the applicant profile and clear the missing document slots.';
 			}
@@ -2895,6 +2966,61 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
+		private function map_payment_transaction($payment) {
+			return array(
+				'id' => (string) $payment['id'],
+				'amount' => (string) $payment['amount'],
+				'currency' => (string) $payment['currency'],
+				'reference' => !empty($payment['reference']) ? (string) $payment['reference'] : null,
+				'swiftReference' => !empty($payment['swiftReference']) ? (string) $payment['swiftReference'] : null,
+				'confirmedDate' => !empty($payment['confirmedDate']) ? (string) $payment['confirmedDate'] : null,
+				'recordedByName' => (string) $payment['recordedByName'],
+				'note' => !empty($payment['note']) ? (string) $payment['note'] : null,
+				'createdAt' => $this->mysql_datetime_to_iso($payment['createdAt']),
+			);
+		}
+
+		private function map_migration_case($migration_case) {
+			if (!$migration_case) {
+				return null;
+			}
+
+			return array(
+				'id' => (string) $migration_case['id'],
+				'packPreparedDate' => !empty($migration_case['packPreparedDate']) ? (string) $migration_case['packPreparedDate'] : null,
+				'packSubmittedDate' => !empty($migration_case['packSubmittedDate']) ? (string) $migration_case['packSubmittedDate'] : null,
+				'paymentReference' => !empty($migration_case['paymentReference']) ? (string) $migration_case['paymentReference'] : null,
+				'paymentDate' => !empty($migration_case['paymentDate']) ? (string) $migration_case['paymentDate'] : null,
+				'decisionDate' => !empty($migration_case['decisionDate']) ? (string) $migration_case['decisionDate'] : null,
+				'permitReference' => !empty($migration_case['permitReference']) ? (string) $migration_case['permitReference'] : null,
+				'note' => !empty($migration_case['note']) ? (string) $migration_case['note'] : null,
+				'recordedByName' => (string) $migration_case['recordedByName'],
+				'updatedAt' => $this->mysql_datetime_to_iso($migration_case['updatedAt']),
+			);
+		}
+
+		private function map_immigration_case($immigration_case) {
+			if (!$immigration_case) {
+				return null;
+			}
+
+			return array(
+				'id' => (string) $immigration_case['id'],
+				'arrivalDate' => !empty($immigration_case['arrivalDate']) ? (string) $immigration_case['arrivalDate'] : null,
+				'medicalCertDate' => !empty($immigration_case['medicalCertDate']) ? (string) $immigration_case['medicalCertDate'] : null,
+				'xRayDate' => !empty($immigration_case['xRayDate']) ? (string) $immigration_case['xRayDate'] : null,
+				'appointmentDate' => !empty($immigration_case['appointmentDate']) ? (string) $immigration_case['appointmentDate'] : null,
+				'paymentReference' => !empty($immigration_case['paymentReference']) ? (string) $immigration_case['paymentReference'] : null,
+				'insurancePolicyNumber' => !empty($immigration_case['insurancePolicyNumber']) ? (string) $immigration_case['insurancePolicyNumber'] : null,
+				'insuranceExpirationDate' => !empty($immigration_case['insuranceExpirationDate']) ? (string) $immigration_case['insuranceExpirationDate'] : null,
+				'pinkCardDate' => !empty($immigration_case['pinkCardDate']) ? (string) $immigration_case['pinkCardDate'] : null,
+				'enrollmentAgreementDate' => !empty($immigration_case['enrollmentAgreementDate']) ? (string) $immigration_case['enrollmentAgreementDate'] : null,
+				'note' => !empty($immigration_case['note']) ? (string) $immigration_case['note'] : null,
+				'recordedByName' => (string) $immigration_case['recordedByName'],
+				'updatedAt' => $this->mysql_datetime_to_iso($immigration_case['updatedAt']),
+			);
+		}
+
 		private function to_admission_case($application) {
 			$board = $this->to_board_application(
 				array_merge(
@@ -2923,6 +3049,18 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$activity = array_map(
 				array($this, 'map_activity_entry'),
 				$application['activities']
+			);
+			$payment_transactions = array_map(
+				array($this, 'map_payment_transaction'),
+				isset($application['paymentTransactions']) && is_array($application['paymentTransactions'])
+					? $application['paymentTransactions']
+					: array()
+			);
+			$migration_case = $this->map_migration_case(
+				isset($application['migrationCase']) ? $application['migrationCase'] : null
+			);
+			$immigration_case = $this->map_immigration_case(
+				isset($application['immigrationCase']) ? $application['immigrationCase'] : null
 			);
 			$latest_payment = !empty($application['paymentTransactions'][0])
 				? $application['paymentTransactions'][0]
@@ -2954,6 +3092,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'stageKey' => isset($application['status'])
 						? $this->canonical_status_key((string) $application['status'])
 						: 'profile-preparation',
+					'activeDocumentPack' => $this->active_document_pack_for_status(
+						isset($application['status']) ? (string) $application['status'] : 'profile-preparation'
+					),
 					'fullName' => $application['fullName'],
 					'passportNumber' => $application['passportNumber'],
 					'email' => $application['email'],
@@ -3005,6 +3146,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'letters' => $letters,
 					'documents' => $documents,
 					'activity' => $activity,
+					'paymentTransactions' => $payment_transactions,
+					'migrationCase' => $migration_case,
+					'immigrationCase' => $immigration_case,
 					'createdAt' => $this->mysql_datetime_to_iso($application['createdAt']),
 				)
 			);
@@ -3024,7 +3168,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private function create_activity($application_id, $user, $kind, $title, $detail = null) {
 			global $wpdb;
 
-			$wpdb->insert(
+			return $wpdb->insert(
 				$this->activities_table,
 				array(
 					'id' => wp_generate_uuid4(),
@@ -3360,7 +3504,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$status = $this->normalize_status($params['status']);
 			$existing = $wpdb->get_row(
 				$wpdb->prepare(
-					"SELECT id, wordpressUserId, status, workflowNote FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+					"SELECT id, wordpressUserId, status, workflowNote, updatedAt FROM {$this->applications_table} WHERE id = %s LIMIT 1",
 					$application_id
 				),
 				ARRAY_A
@@ -3390,8 +3534,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				WHERE id = %s
 			";
 			$args = array($status, $next_note, $user['name'], $application_id);
-			$unversioned_update_sql = $update_sql;
-			$unversioned_args = $args;
+			$activity_source = $existing;
+			$stale_command_ignored = false;
+			$target_applied = false;
 
 			if ($expected_version) {
 				$update_sql .= " AND updatedAt = %s";
@@ -3405,20 +3550,65 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			if (0 === $updated && $expected_version) {
-				// A stage button is an explicit command, not a full-record save.
-				// Reapply its target to the current row so an older open screen
-				// cannot permanently block Move/Back/Trash/Restore actions.
-				$updated = $wpdb->query(
-					$wpdb->prepare($unversioned_update_sql, $unversioned_args)
+				$fresh = $wpdb->get_row(
+					$wpdb->prepare(
+						"SELECT id, wordpressUserId, status, workflowNote, updatedAt FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+						$application_id
+					),
+					ARRAY_A
 				);
 
-				if (false === $updated) {
-					throw new Exception('Unable to save the admissions workflow stage.');
+				if (!$fresh) {
+					throw new Exception('Application not found.');
 				}
+
+				$activity_source = $fresh;
+
+				if (!$this->should_apply_stale_workflow_target($fresh['status'], $status)) {
+					// A stale command may never move a case backwards, replay the
+					// current stage, skip a forward stage, or apply a terminal action.
+					// Return the fresh case as a no-op so the caller can refresh safely.
+					$stale_command_ignored = true;
+				} else {
+					$cas_sql = "
+						UPDATE {$this->applications_table}
+						SET
+							status = %s,
+							workflowNote = %s,
+							lastUpdatedByName = %s,
+							updatedAt = CURRENT_TIMESTAMP(3)
+						WHERE id = %s AND status = %s AND updatedAt = %s
+					";
+					$cas_updated = $wpdb->query(
+						$wpdb->prepare(
+							$cas_sql,
+							$status,
+							$next_note,
+							$user['name'],
+							$application_id,
+							$fresh['status'],
+							$fresh['updatedAt']
+						)
+					);
+
+					if (false === $cas_updated) {
+						throw new Exception('Unable to save the admissions workflow stage.');
+					}
+
+					if (0 === $cas_updated) {
+						// Another writer won the race after the fresh read. Never replay
+						// again; return the newest case and let the user decide from it.
+						$stale_command_ignored = true;
+					} else {
+						$target_applied = true;
+					}
+				}
+			} else {
+				$target_applied = $updated > 0;
 			}
 
-			$status_changed = $existing['status'] !== $status;
-			$note_changed = (string) $existing['workflowNote'] !== (string) $next_note;
+			$status_changed = $target_applied && (string) $activity_source['status'] !== (string) $status;
+			$note_changed = $target_applied && (string) $activity_source['workflowNote'] !== (string) $next_note;
 
 			if ($status_changed || $note_changed) {
 				$this->create_activity(
@@ -3432,7 +3622,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$application = $this->get_detailed_application_record($application_id);
 
-			if (!$application || !isset($application['status']) || $status !== (string) $application['status']) {
+			if (
+				!$stale_command_ignored
+				&& (!$application || !isset($application['status']) || $status !== (string) $application['status'])
+			) {
 				throw new Exception('The admissions workflow stage was not saved. Refresh and try again.');
 			}
 
@@ -3455,6 +3648,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					)
 				),
 				'caseRecord' => $this->to_admission_case($application),
+				'stageChanged' => $status_changed,
+				'staleCommandIgnored' => $stale_command_ignored,
 			);
 		}
 
@@ -3638,10 +3833,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$uploaded_url = $this->build_document_file_url($application_id, $document_id);
 			$uploaded_at = gmdate('c');
 
-			$wpdb->query('START TRANSACTION');
+			if (false === $wpdb->query('START TRANSACTION')) {
+				$this->delete_document_file($stored_file['storageDriveId'], $stored_file['storageItemId']);
+				throw new Exception('Unable to start the document upload transaction.');
+			}
 
 			try {
-				$wpdb->query(
+				$document_written = $wpdb->query(
 					$wpdb->prepare(
 						"
 						INSERT INTO {$this->documents_table}
@@ -3682,8 +3880,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						$user['name']
 					)
 				);
+				if (false === $document_written) {
+					throw new Exception('Unable to save the uploaded document record.');
+				}
 
-				$wpdb->query(
+				$application_written = $wpdb->query(
 					$wpdb->prepare(
 						"
 						UPDATE {$this->applications_table}
@@ -3694,16 +3895,41 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						$application_id
 					)
 				);
+				if (false === $application_written || 0 === $application_written) {
+					throw new Exception('Unable to update the application after the document upload.');
+				}
 
-				$this->create_activity(
+				$activity_written = $this->create_activity(
 					$application_id,
 					$user,
 					'document',
 					$this->document_requirements[$document_type] . ' uploaded',
 					$file_name . ' attached to the case file.'
 				);
+				if (false === $activity_written || 0 === $activity_written) {
+					throw new Exception('Unable to record the document upload activity.');
+				}
 
-				$wpdb->query('COMMIT');
+				$saved_document = $wpdb->get_row(
+					$wpdb->prepare(
+						"SELECT id, isReady, storageDriveId, storageItemId FROM {$this->documents_table} WHERE applicationId = %s AND type = %s LIMIT 1",
+						$application_id,
+						$document_type
+					),
+					ARRAY_A
+				);
+				if (
+					!$saved_document
+					|| empty($saved_document['isReady'])
+					|| (string) $saved_document['storageDriveId'] !== (string) $stored_file['storageDriveId']
+					|| (string) $saved_document['storageItemId'] !== (string) $stored_file['storageItemId']
+				) {
+					throw new Exception('The uploaded document record could not be verified.');
+				}
+
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit the document upload transaction.');
+				}
 			} catch (Exception $error) {
 				$wpdb->query('ROLLBACK');
 				$this->delete_document_file($stored_file['storageDriveId'], $stored_file['storageItemId']);
@@ -3976,33 +4202,67 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$confirmed_date = isset($draft['confirmedDate']) && '' !== trim((string) $draft['confirmedDate'])
 					? sanitize_text_field($draft['confirmedDate'])
 					: wp_date('Y-m-d');
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-				$wpdb->insert($this->payments_table, array(
-					'id' => $id, 'applicationId' => $application_id,
-					'amount' => $amount,
-					'currency' => $currency,
-					'reference' => isset($draft['reference']) ? sanitize_text_field($draft['reference']) : null,
-					'swiftReference' => isset($draft['swiftReference']) ? sanitize_text_field($draft['swiftReference']) : null,
-					'confirmedDate' => $confirmed_date,
-					'recordedByName' => $user['name'],
-					'note' => isset($draft['note']) ? sanitize_textarea_field($draft['note']) : null,
-				));
-				// Keep the application-level finance state in sync because acceptance-letter
-				// availability is evaluated from these fields for every staff role.
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-				$wpdb->update(
-					$this->applications_table,
-					array(
-						'paymentStatus' => 'cleared',
-						'paymentAmount' => $amount,
-						'paymentCurrency' => $currency,
-						'paymentReference' => $reference,
-						'paymentConfirmedDate' => $confirmed_date,
-						'lastUpdatedByName' => $user['name'],
-						'updatedAt' => current_time('mysql'),
-					),
-					array('id' => $application_id)
-				);
+				if (false === $wpdb->query('START TRANSACTION')) {
+					throw new Exception('Unable to start the payment transaction.');
+				}
+
+				try {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+					$payment_written = $wpdb->insert($this->payments_table, array(
+						'id' => $id, 'applicationId' => $application_id,
+						'amount' => $amount,
+						'currency' => $currency,
+						'reference' => isset($draft['reference']) ? sanitize_text_field($draft['reference']) : null,
+						'swiftReference' => isset($draft['swiftReference']) ? sanitize_text_field($draft['swiftReference']) : null,
+						'confirmedDate' => $confirmed_date,
+						'recordedByName' => $user['name'],
+						'note' => isset($draft['note']) ? sanitize_textarea_field($draft['note']) : null,
+					));
+					if (false === $payment_written || 0 === $payment_written) {
+						throw new Exception('Unable to save the payment transaction.');
+					}
+
+					// Keep the application-level finance state in sync because acceptance-letter
+					// availability is evaluated from these fields for every staff role.
+					$application_written = $wpdb->query(
+						$wpdb->prepare(
+							"
+							UPDATE {$this->applications_table}
+							SET paymentStatus = 'cleared', paymentAmount = %s, paymentCurrency = %s,
+								paymentReference = %s, paymentConfirmedDate = %s,
+								lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3)
+							WHERE id = %s
+							",
+							$amount,
+							$currency,
+							$reference,
+							$confirmed_date,
+							$user['name'],
+							$application_id
+						)
+					);
+					if (false === $application_written || 0 === $application_written) {
+						throw new Exception('Unable to update the application payment status.');
+					}
+
+					$saved_payment_id = $wpdb->get_var(
+						$wpdb->prepare(
+							"SELECT id FROM {$this->payments_table} WHERE id = %s AND applicationId = %s LIMIT 1",
+							$id,
+							$application_id
+						)
+					);
+					if ((string) $saved_payment_id !== (string) $id) {
+						throw new Exception('The payment transaction could not be verified.');
+					}
+
+					if (false === $wpdb->query('COMMIT')) {
+						throw new Exception('Unable to commit the payment transaction.');
+					}
+				} catch (Exception $write_error) {
+					$wpdb->query('ROLLBACK');
+					throw $write_error;
+				}
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$rows = $wpdb->get_results($wpdb->prepare("SELECT id, amount, currency, reference, swiftReference, confirmedDate, recordedByName, note, createdAt FROM {$this->payments_table} WHERE applicationId = %s ORDER BY createdAt DESC LIMIT 24", $application_id), ARRAY_A);
 				$application = $this->to_admission_case($this->get_detailed_application_record($application_id));
