@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.44
+ * Version: 0.2.45
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -33,6 +33,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		/** @var string */
 		private $activities_table = 'mc_admission_activities';
+
+		/** @var string */
+		private $communications_table = 'mc_admission_communications';
+
+		/** @var string */
+		private $letter_drafts_table = 'mc_admission_letter_drafts';
 
 		/** @var string */
 		private $settings_table = 'mc_admission_settings';
@@ -119,6 +125,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			'academically-cleared',
 			'conditional-offer',
 			'hold',
+			'rejected',
 		);
 
 		/** @var string[] */
@@ -152,10 +159,32 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			'enrolled',
 		);
 
+		/** @var string[] */
+		private $commission_statuses = array(
+			'not-applicable',
+			'pending-approval',
+			'ready-to-invoice',
+			'invoiced',
+			'paid',
+			'withheld',
+		);
+
+		/** @var string[] */
+		private $refund_statuses = array(
+			'none',
+			'requested',
+			'under-review',
+			'approved',
+			'paid',
+			'declined',
+		);
+
 		public function boot() {
 			$this->ensure_roles();
 			$this->ensure_immigration_insurance_columns();
 			$this->ensure_offer_detail_columns();
+			$this->ensure_case_detail_columns();
+			$this->ensure_document_assessment_columns();
 			$this->ensure_resource_indexes();
 			$this->ensure_notification_activity_schema();
 			$this->boot_update_checker();
@@ -298,6 +327,67 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			update_option('mc_admissions_offer_detail_schema_version', '0.2.38', false);
 		}
 
+		private function ensure_case_detail_columns() {
+			global $wpdb;
+
+			if ('0.2.45' === get_option('mc_admissions_case_detail_schema_version')) {
+				return;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			if ($this->applications_table !== $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->applications_table))) {
+				return;
+			}
+
+			// Column names and definitions are internal constants.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$present = $wpdb->get_var("SHOW COLUMNS FROM {$this->applications_table} LIKE 'lateArrivalReason'");
+			if (!$present) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$added = $wpdb->query("ALTER TABLE {$this->applications_table} ADD COLUMN lateArrivalReason TEXT NULL AFTER enrollmentNote");
+				if (false === $added) {
+					return;
+				}
+			}
+
+			update_option('mc_admissions_case_detail_schema_version', '0.2.45', false);
+		}
+
+		private function ensure_document_assessment_columns() {
+			global $wpdb;
+
+			if ('1' === get_option('mc_admissions_document_assessment_schema_version')) {
+				return;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			if ($this->documents_table !== $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->documents_table))) {
+				return;
+			}
+
+			$columns = array(
+				'assessmentStatus' => "VARCHAR(32) NOT NULL DEFAULT 'pending' AFTER isReady",
+				'assessmentRemark' => 'TEXT NULL AFTER assessmentStatus',
+				'assessedAt' => 'DATETIME(3) NULL AFTER assessmentRemark',
+				'assessedByName' => 'VARCHAR(191) NULL AFTER assessedAt',
+			);
+
+			foreach ($columns as $column => $definition) {
+				// Column names and definitions are internal constants.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$present = $wpdb->get_var("SHOW COLUMNS FROM {$this->documents_table} LIKE '{$column}'");
+				if (!$present) {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					$added = $wpdb->query("ALTER TABLE {$this->documents_table} ADD COLUMN {$column} {$definition}");
+					if (false === $added) {
+						return;
+					}
+				}
+			}
+
+			update_option('mc_admissions_document_assessment_schema_version', '1', false);
+		}
+
 		public function activate() {
 			$this->ensure_roles();
 			global $wpdb;
@@ -365,6 +455,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					enrollmentStatus VARCHAR(191) NOT NULL DEFAULT 'pending',
 					orientationDate VARCHAR(191) NULL,
 					enrollmentNote TEXT NULL,
+					lateArrivalReason TEXT NULL,
 					source VARCHAR(191) NOT NULL DEFAULT 'mc-admissions-wordpress',
 					createdAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 					updatedAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -381,6 +472,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					type VARCHAR(191) NOT NULL,
 					label VARCHAR(191) NOT NULL,
 					isReady BOOLEAN NOT NULL DEFAULT FALSE,
+					assessmentStatus VARCHAR(32) NOT NULL DEFAULT 'pending',
+					assessmentRemark TEXT NULL,
+					assessedAt DATETIME(3) NULL,
+					assessedByName VARCHAR(191) NULL,
 					uploadedUrl TEXT NULL,
 					storedFilename VARCHAR(255) NULL,
 					storageProvider VARCHAR(191) NULL DEFAULT 'microsoft-365',
@@ -933,9 +1028,21 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				self::API_NAMESPACE,
 				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/documents',
 				array(
-					'methods' => WP_REST_Server::CREATABLE,
-					'callback' => array($this, 'rest_upload_document'),
-					'permission_callback' => array($this, 'permission_authenticated'),
+					array(
+						'methods' => WP_REST_Server::CREATABLE,
+						'callback' => array($this, 'rest_upload_document'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
+					array(
+						'methods' => 'PATCH',
+						'callback' => array($this, 'rest_update_document_assessments'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
+					array(
+						'methods' => 'DELETE',
+						'callback' => array($this, 'rest_delete_document'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
 				)
 			);
 
@@ -2116,6 +2223,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function rest_upload_document(WP_REST_Request $request) {
 			$file_params = $request->get_file_params();
 			$document_type = $request->get_param('documentType');
+			$expected_updated_at = $request->get_param('expectedUpdatedAt');
 			$file = isset($file_params['file']) ? $file_params['file'] : null;
 
 			if (empty($document_type) || empty($file) || empty($file['tmp_name'])) {
@@ -2132,6 +2240,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						'mimeType' => !empty($file['type']) ? (string) $file['type'] : 'application/octet-stream',
 						'filePath' => (string) $file['tmp_name'],
 						'fileSize' => isset($file['size']) ? (int) $file['size'] : 0,
+						'expectedUpdatedAt' => null !== $expected_updated_at ? (string) $expected_updated_at : null,
 						'user' => $user,
 					)
 				);
@@ -2144,7 +2253,73 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					200
 				);
 			} catch (Exception $error) {
-				return $this->json_error_response($error->getMessage(), 400);
+				return $this->json_error_response($error->getMessage(), $this->document_mutation_error_status($error));
+			}
+		}
+
+		public function rest_update_document_assessments(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+
+			if (!is_array($params) || empty($params['assessments']) || !is_array($params['assessments'])) {
+				return $this->json_error_response('Document assessments are required.', 400);
+			}
+			if (!isset($params['expectedUpdatedAt']) || '' === trim((string) $params['expectedUpdatedAt'])) {
+				return $this->json_error_response('Application version is required.', 400);
+			}
+
+			try {
+				$user = $this->current_session_user();
+				$application = $this->update_admission_document_assessments(
+					array(
+						'applicationId' => (string) $request['application_id'],
+						'assessments' => $params['assessments'],
+						'expectedUpdatedAt' => (string) $params['expectedUpdatedAt'],
+						'user' => $user,
+					)
+				);
+
+				return new WP_REST_Response(
+					array(
+						'ok' => true,
+						'application' => $application,
+					),
+					200
+				);
+			} catch (Exception $error) {
+				return $this->json_error_response($error->getMessage(), $this->document_mutation_error_status($error));
+			}
+		}
+
+		public function rest_delete_document(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+
+			if (!is_array($params) || !isset($params['documentType']) || '' === trim((string) $params['documentType'])) {
+				return $this->json_error_response('Document type is required.', 400);
+			}
+			if (!isset($params['expectedUpdatedAt']) || '' === trim((string) $params['expectedUpdatedAt'])) {
+				return $this->json_error_response('Application version is required.', 400);
+			}
+
+			try {
+				$user = $this->current_session_user();
+				$application = $this->delete_admission_document(
+					array(
+						'applicationId' => (string) $request['application_id'],
+						'documentType' => (string) $params['documentType'],
+						'expectedUpdatedAt' => (string) $params['expectedUpdatedAt'],
+						'user' => $user,
+					)
+				);
+
+				return new WP_REST_Response(
+					array(
+						'ok' => true,
+						'application' => $application,
+					),
+					200
+				);
+			} catch (Exception $error) {
+				return $this->json_error_response($error->getMessage(), $this->document_mutation_error_status($error));
 			}
 		}
 
@@ -2400,6 +2575,180 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return count(array_intersect($staff_roles, (array) $user['roles'])) > 0;
 		}
 
+		private function user_has_any_role($user, $roles) {
+			return !empty($user['roles']) && count(array_intersect((array) $roles, (array) $user['roles'])) > 0;
+		}
+
+		private function can_manage_workflow_status($user, $status) {
+			if (!$this->can_view_all_applications($user)) {
+				return false;
+			}
+
+			if ($this->is_admin_user($user)) {
+				return true;
+			}
+
+			$migration_roles = array('migration-officer', 'immigration-officer');
+
+			switch ($this->canonical_status_key($status)) {
+				case 'trashed':
+					return false;
+				case 'acceptance-issued':
+				case 'migration-documents':
+					return $this->user_has_any_role($user, array_merge(array('admissions-officer'), $migration_roles));
+				case 'entry-permit-processing':
+					return $this->user_has_any_role($user, $migration_roles);
+				case 'arrival-immigration':
+				case 'enrollment-complete':
+					return $this->user_has_any_role($user, array_merge($migration_roles, array('registrar')));
+				default:
+					return $this->user_has_any_role($user, array('admissions-officer'));
+			}
+		}
+
+		private function can_edit_migration_or_immigration_records($user) {
+			return $this->is_admin_user($user)
+				|| $this->user_has_any_role($user, array('migration-officer', 'immigration-officer'));
+		}
+
+		private function can_upload_admission_document($user, $document_type) {
+			if (!isset($this->document_requirements[$document_type])) {
+				return false;
+			}
+
+			if ($this->can_view_all_applications($user)) {
+				return true;
+			}
+
+			if (!$this->is_agent_user($user)) {
+				return false;
+			}
+
+			$intake_document_ids = array(
+				'passport',
+				'secondaryMarksheet',
+				'higherSecondaryMarksheet',
+				'englishCertificate',
+				'studentSignature',
+				'consultantSignature',
+				'agencyAgreement',
+				'authorizationCertificate',
+				'bachelorDiploma',
+				'bachelorTranscript',
+				'bankTransactionConfirmation',
+			);
+
+			return in_array($document_type, $intake_document_ids, true);
+		}
+
+		private function can_assess_admission_documents($user) {
+			return $this->is_admin_user($user)
+				|| $this->user_has_any_role($user, array('admissions-officer'));
+		}
+
+		private function operations_field_groups() {
+			return array(
+				'common' => array(
+					'workflowNote',
+				),
+				'admissions' => array(
+					'reviewerDecision',
+					'reviewSummary',
+					'decisionDueDate',
+					'offerIssuedDate',
+					'offerExpiryDate',
+					'offerConditionNote',
+					'classesStartDate',
+					'tuitionFeeFirstYear',
+					'tuitionFeeFollowingYears',
+					'termBalanceApplies',
+				),
+				'finance' => array(
+					'paymentStatus',
+					'paymentAmount',
+					'paymentCurrency',
+					'paymentReference',
+					'paymentConfirmedDate',
+					'financeNote',
+					'commissionStatus',
+					'commissionBaseAmount',
+					'commissionAmount',
+					'commissionCurrency',
+					'commissionDueDate',
+					'commissionPaidDate',
+					'commissionNote',
+					'refundStatus',
+					'refundRequestedDate',
+					'refundAmount',
+					'refundCurrency',
+					'refundPaidDate',
+					'refundReason',
+					'refundNote',
+				),
+				'permit' => array(
+					'permitStatus',
+					'permitReference',
+					'permitSubmittedDate',
+					'permitDecisionDate',
+					'permitNote',
+				),
+				'arrival' => array(
+					'arrivalStatus',
+					'travelDate',
+					'accommodationStatus',
+					'enrollmentStatus',
+					'orientationDate',
+					'enrollmentNote',
+					'lateArrivalReason',
+				),
+			);
+		}
+
+		private function allowed_operations_fields_for_user($user) {
+			$groups = $this->operations_field_groups();
+
+			if ($this->is_admin_user($user)) {
+				return array_values(array_unique(array_merge($groups['common'], $groups['admissions'], $groups['finance'], $groups['permit'], $groups['arrival'])));
+			}
+
+			$allowed = $this->can_view_all_applications($user) ? $groups['common'] : array();
+			if ($this->user_has_any_role($user, array('admissions-officer'))) {
+				$allowed = array_merge($allowed, $groups['admissions']);
+			}
+			if ($this->user_has_any_role($user, array('finance-officer'))) {
+				$allowed = array_merge($allowed, $groups['finance']);
+			}
+			if ($this->user_has_any_role($user, array('migration-officer', 'immigration-officer'))) {
+				$allowed = array_merge($allowed, $groups['permit'], $groups['arrival']);
+			}
+			if ($this->user_has_any_role($user, array('registrar'))) {
+				$allowed = array_merge($allowed, $groups['arrival']);
+			}
+
+			return array_values(array_unique($allowed));
+		}
+
+		private function assert_operations_patch_authorized($draft, $user) {
+			if (!$this->can_view_all_applications($user)) {
+				throw new Exception('Only internal admissions staff can update operational case details.');
+			}
+
+			$allowed = $this->allowed_operations_fields_for_user($user);
+			$all_groups = $this->operations_field_groups();
+			$supported = array_values(array_unique(array_merge($all_groups['common'], $all_groups['admissions'], $all_groups['finance'], $all_groups['permit'], $all_groups['arrival'])));
+			$requested = array_keys((array) $draft);
+			$unknown = array_values(array_diff($requested, $supported));
+
+			if (!empty($unknown)) {
+				throw new Exception('Unknown operational fields: ' . implode(', ', $unknown) . '.');
+			}
+
+			$forbidden = array_values(array_diff($requested, $allowed));
+			if (!empty($forbidden)) {
+				throw new Exception('You do not have permission to update operational fields: ' . implode(', ', $forbidden) . '.');
+			}
+		}
+
 		private function trim_to_null($value) {
 			if (null === $value) {
 				return null;
@@ -2489,21 +2838,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		private function should_apply_stale_workflow_target($current_status, $target_status) {
-			$current_key = $this->canonical_status_key($current_status);
-			$target_key = $this->canonical_status_key($target_status);
-
-			if (
-				$current_key === $target_key
-				|| $this->is_terminal_workflow_status($current_key)
-				|| $this->is_terminal_workflow_status($target_key)
-			) {
-				return false;
-			}
-
-			$current_rank = $this->workflow_status_rank($current_key);
-			$target_rank = $this->workflow_status_rank($target_key);
-
-			return $current_rank >= 0 && $target_rank === $current_rank + 1;
+			// A command based on an old case snapshot is never safe to replay.
+			// Even an apparently exact-next transition can have prerequisites or
+			// side effects that changed after the caller loaded the case.
+			return false;
 		}
 
 		private function active_document_pack_for_status($status) {
@@ -2883,10 +3221,53 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				ARRAY_A
 			);
 
+			$communications = array();
+			if ($this->table_exists($this->communications_table)) {
+				$communications = $wpdb->get_results(
+					$wpdb->prepare(
+						"SELECT * FROM {$this->communications_table} WHERE applicationId = %s ORDER BY createdAt DESC LIMIT 24",
+						$application_id
+					),
+					ARRAY_A
+				);
+			}
+
+			$letter_drafts = array();
+			if ($this->table_exists($this->letter_drafts_table)) {
+				$letter_drafts = $wpdb->get_results(
+					$wpdb->prepare(
+						"SELECT * FROM {$this->letter_drafts_table} WHERE applicationId = %s ORDER BY updatedAt DESC",
+						$application_id
+					),
+					ARRAY_A
+				);
+			}
+
+			$commissions = array();
+			if ($this->table_exists($this->commission_records_table)) {
+				$commissions = $wpdb->get_results(
+					$wpdb->prepare(
+						"SELECT * FROM {$this->commission_records_table} WHERE applicationId = %s ORDER BY updatedAt DESC LIMIT 12",
+						$application_id
+					),
+					ARRAY_A
+				);
+			}
+
+			$refunds = array();
+			if ($this->table_exists($this->refund_records_table)) {
+				$refunds = $wpdb->get_results(
+					$wpdb->prepare(
+						"SELECT * FROM {$this->refund_records_table} WHERE applicationId = %s ORDER BY updatedAt DESC LIMIT 12",
+						$application_id
+					),
+					ARRAY_A
+				);
+			}
+
 			$generated_letters = array();
 			$letters_table = 'mc_generated_letters';
-			$has_letters =
-				$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $letters_table)) === $letters_table;
+			$has_letters = $this->table_exists($letters_table);
 			if ($has_letters) {
 				$generated_letters = $wpdb->get_results(
 					$wpdb->prepare(
@@ -2925,7 +3306,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$application['documents'] = is_array($documents) ? $documents : array();
 			$application['activities'] = is_array($activities) ? $activities : array();
+			$application['communications'] = is_array($communications) ? $communications : array();
 			$application['generatedLetters'] = is_array($generated_letters) ? $generated_letters : array();
+			$application['letterDrafts'] = is_array($letter_drafts) ? $letter_drafts : array();
+			$application['commissionRecords'] = is_array($commissions) ? $commissions : array();
+			$application['refundRecords'] = is_array($refunds) ? $refunds : array();
 			$application['paymentTransactions'] = is_array($payments) ? $payments : array();
 			$application['migrationCase'] = $migration_case ? $migration_case : null;
 			$application['immigrationCase'] = $immigration_case ? $immigration_case : null;
@@ -2939,6 +3324,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'type' => $document['type'],
 				'label' => $document['label'],
 				'isReady' => !empty($document['isReady']),
+				'assessmentStatus' => isset($document['assessmentStatus']) ? (string) $document['assessmentStatus'] : 'pending',
+				'assessmentRemark' => !empty($document['assessmentRemark']) ? (string) $document['assessmentRemark'] : null,
+				'assessedAt' => $this->mysql_datetime_to_iso(isset($document['assessedAt']) ? $document['assessedAt'] : null),
+				'assessedByName' => !empty($document['assessedByName']) ? (string) $document['assessedByName'] : null,
 				'uploadedUrl' => !empty($document['uploadedUrl']) ? $document['uploadedUrl'] : null,
 				'originalName' => !empty($document['originalName']) ? $document['originalName'] : null,
 				'mimeType' => !empty($document['mimeType']) ? $document['mimeType'] : null,
@@ -2963,6 +3352,65 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'outputUrl' => '/api/admissions/' . rawurlencode($application_id) . '/letters/' . rawurlencode($letter_id) . '/file',
 				'generatedAt' => $this->mysql_datetime_to_iso($letter['createdAt']),
 				'generatedByName' => (string) $letter['generatedByName'],
+			);
+		}
+
+		private function map_communication($communication) {
+			return array(
+				'id' => (string) $communication['id'],
+				'direction' => $this->normalize_select_value($communication['direction'], array('outbound', 'inbound', 'internal'), 'outbound'),
+				'channel' => $this->normalize_select_value($communication['channel'], array('email', 'phone', 'whatsapp', 'meeting', 'portal'), 'email'),
+				'subject' => !empty($communication['subject']) ? (string) $communication['subject'] : null,
+				'detail' => isset($communication['detail']) ? (string) $communication['detail'] : '',
+				'actorName' => isset($communication['actorName']) ? (string) $communication['actorName'] : '',
+				'createdAt' => $this->mysql_datetime_to_iso($communication['createdAt']),
+			);
+		}
+
+		private function map_letter_draft($draft) {
+			return array(
+				'id' => (string) $draft['id'],
+				'templateId' => (string) $draft['templateId'],
+				'templateLabel' => (string) $draft['templateLabel'],
+				'body' => isset($draft['body']) ? (string) $draft['body'] : '',
+				'status' => $this->normalize_select_value($draft['status'], array('draft', 'reviewed', 'approved'), 'draft'),
+				'isPersisted' => true,
+				'updatedAt' => $this->mysql_datetime_to_iso($draft['updatedAt']),
+				'lastEditedByName' => !empty($draft['lastEditedByName']) ? (string) $draft['lastEditedByName'] : null,
+				'reviewedByName' => !empty($draft['reviewedByName']) ? (string) $draft['reviewedByName'] : null,
+				'reviewedAt' => $this->mysql_datetime_to_iso(isset($draft['reviewedAt']) ? $draft['reviewedAt'] : null),
+				'approvedByName' => !empty($draft['approvedByName']) ? (string) $draft['approvedByName'] : null,
+				'approvedAt' => $this->mysql_datetime_to_iso(isset($draft['approvedAt']) ? $draft['approvedAt'] : null),
+			);
+		}
+
+		private function map_commission_record($record) {
+			return array(
+				'id' => (string) $record['id'],
+				'status' => $this->normalize_select_value($record['status'], $this->commission_statuses, 'not-applicable'),
+				'baseAmount' => !empty($record['baseAmount']) ? (string) $record['baseAmount'] : null,
+				'amount' => !empty($record['amount']) ? (string) $record['amount'] : null,
+				'currency' => !empty($record['currency']) ? (string) $record['currency'] : 'EUR',
+				'dueDate' => !empty($record['dueDate']) ? (string) $record['dueDate'] : null,
+				'paidDate' => !empty($record['paidDate']) ? (string) $record['paidDate'] : null,
+				'note' => !empty($record['note']) ? (string) $record['note'] : null,
+				'createdAt' => $this->mysql_datetime_to_iso($record['createdAt']),
+				'updatedAt' => $this->mysql_datetime_to_iso($record['updatedAt']),
+			);
+		}
+
+		private function map_refund_record($record) {
+			return array(
+				'id' => (string) $record['id'],
+				'status' => $this->normalize_select_value($record['status'], $this->refund_statuses, 'none'),
+				'requestedDate' => !empty($record['requestedDate']) ? (string) $record['requestedDate'] : null,
+				'amount' => !empty($record['amount']) ? (string) $record['amount'] : null,
+				'currency' => !empty($record['currency']) ? (string) $record['currency'] : 'EUR',
+				'paidDate' => !empty($record['paidDate']) ? (string) $record['paidDate'] : null,
+				'reason' => !empty($record['reason']) ? (string) $record['reason'] : null,
+				'note' => !empty($record['note']) ? (string) $record['note'] : null,
+				'createdAt' => $this->mysql_datetime_to_iso($record['createdAt']),
+				'updatedAt' => $this->mysql_datetime_to_iso($record['updatedAt']),
 			);
 		}
 
@@ -3050,6 +3498,30 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				array($this, 'map_activity_entry'),
 				$application['activities']
 			);
+			$communications = array_map(
+				array($this, 'map_communication'),
+				isset($application['communications']) && is_array($application['communications'])
+					? $application['communications']
+					: array()
+			);
+			$letter_drafts = array_map(
+				array($this, 'map_letter_draft'),
+				isset($application['letterDrafts']) && is_array($application['letterDrafts'])
+					? $application['letterDrafts']
+					: array()
+			);
+			$commissions = array_map(
+				array($this, 'map_commission_record'),
+				isset($application['commissionRecords']) && is_array($application['commissionRecords'])
+					? $application['commissionRecords']
+					: array()
+			);
+			$refunds = array_map(
+				array($this, 'map_refund_record'),
+				isset($application['refundRecords']) && is_array($application['refundRecords'])
+					? $application['refundRecords']
+					: array()
+			);
 			$payment_transactions = array_map(
 				array($this, 'map_payment_transaction'),
 				isset($application['paymentTransactions']) && is_array($application['paymentTransactions'])
@@ -3096,6 +3568,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						isset($application['status']) ? (string) $application['status'] : 'profile-preparation'
 					),
 					'fullName' => $application['fullName'],
+					'wordpressUsername' => !empty($application['wordpressUsername']) ? $application['wordpressUsername'] : null,
+					'wordpressEmail' => !empty($application['wordpressEmail']) ? $application['wordpressEmail'] : null,
 					'passportNumber' => $application['passportNumber'],
 					'email' => $application['email'],
 					'phone' => $application['phone'],
@@ -3143,9 +3617,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'enrollmentStatus' => $application['enrollmentStatus'],
 					'orientationDate' => !empty($application['orientationDate']) ? $application['orientationDate'] : null,
 					'enrollmentNote' => !empty($application['enrollmentNote']) ? $application['enrollmentNote'] : null,
+					'lateArrivalReason' => !empty($application['lateArrivalReason']) ? $application['lateArrivalReason'] : null,
+					'commissions' => $commissions,
+					'refunds' => $refunds,
+					'letterDrafts' => $letter_drafts,
 					'letters' => $letters,
 					'documents' => $documents,
 					'activity' => $activity,
+					'communications' => $communications,
 					'paymentTransactions' => $payment_transactions,
 					'migrationCase' => $migration_case,
 					'immigrationCase' => $immigration_case,
@@ -3212,37 +3691,193 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		private function normalize_operations_boolean($value) {
+			if (is_bool($value)) {
+				return $value ? 1 : 0;
+			}
+
+			return in_array(strtolower(trim((string) $value)), array('1', 'true', 'yes', 'on'), true) ? 1 : 0;
+		}
+
 		private function normalize_operations_draft($draft, $fallback_status) {
-			return array(
-				'workflowNote' => $this->trim_to_null(isset($draft['workflowNote']) ? $draft['workflowNote'] : null) ?: $this->workflow_note_for_status($fallback_status),
-				'reviewerDecision' => $this->normalize_select_value(isset($draft['reviewerDecision']) ? $draft['reviewerDecision'] : '', $this->reviewer_decisions, 'pending'),
-				'reviewSummary' => $this->trim_to_null(isset($draft['reviewSummary']) ? $draft['reviewSummary'] : null),
-				'decisionDueDate' => $this->trim_to_null(isset($draft['decisionDueDate']) ? $draft['decisionDueDate'] : null),
-				'offerIssuedDate' => $this->trim_to_null(isset($draft['offerIssuedDate']) ? $draft['offerIssuedDate'] : null),
-				'offerExpiryDate' => $this->trim_to_null(isset($draft['offerExpiryDate']) ? $draft['offerExpiryDate'] : null),
-				'offerConditionNote' => $this->trim_to_null(isset($draft['offerConditionNote']) ? $draft['offerConditionNote'] : null),
-				'classesStartDate' => $this->trim_to_null(isset($draft['classesStartDate']) ? $draft['classesStartDate'] : null),
-				'tuitionFeeFirstYear' => $this->trim_to_null(isset($draft['tuitionFeeFirstYear']) ? $draft['tuitionFeeFirstYear'] : null),
-				'tuitionFeeFollowingYears' => $this->trim_to_null(isset($draft['tuitionFeeFollowingYears']) ? $draft['tuitionFeeFollowingYears'] : null),
-				'termBalanceApplies' => !empty($draft['termBalanceApplies']) ? 1 : 0,
-				'paymentStatus' => $this->normalize_select_value(isset($draft['paymentStatus']) ? $draft['paymentStatus'] : '', $this->payment_statuses, 'awaiting-invoice'),
-				'paymentAmount' => $this->trim_to_null(isset($draft['paymentAmount']) ? $draft['paymentAmount'] : null),
-				'paymentCurrency' => $this->trim_to_null(isset($draft['paymentCurrency']) ? $draft['paymentCurrency'] : null) ?: 'EUR',
-				'paymentReference' => $this->trim_to_null(isset($draft['paymentReference']) ? $draft['paymentReference'] : null),
-				'paymentConfirmedDate' => $this->trim_to_null(isset($draft['paymentConfirmedDate']) ? $draft['paymentConfirmedDate'] : null),
-				'financeNote' => $this->trim_to_null(isset($draft['financeNote']) ? $draft['financeNote'] : null),
-				'permitStatus' => $this->normalize_select_value(isset($draft['permitStatus']) ? $draft['permitStatus'] : '', $this->permit_statuses, 'not-started'),
-				'permitReference' => $this->trim_to_null(isset($draft['permitReference']) ? $draft['permitReference'] : null),
-				'permitSubmittedDate' => $this->trim_to_null(isset($draft['permitSubmittedDate']) ? $draft['permitSubmittedDate'] : null),
-				'permitDecisionDate' => $this->trim_to_null(isset($draft['permitDecisionDate']) ? $draft['permitDecisionDate'] : null),
-				'permitNote' => $this->trim_to_null(isset($draft['permitNote']) ? $draft['permitNote'] : null),
-				'arrivalStatus' => $this->normalize_select_value(isset($draft['arrivalStatus']) ? $draft['arrivalStatus'] : '', $this->arrival_statuses, 'planning'),
-				'travelDate' => $this->trim_to_null(isset($draft['travelDate']) ? $draft['travelDate'] : null),
-				'accommodationStatus' => $this->trim_to_null(isset($draft['accommodationStatus']) ? $draft['accommodationStatus'] : null),
-				'enrollmentStatus' => $this->normalize_select_value(isset($draft['enrollmentStatus']) ? $draft['enrollmentStatus'] : '', $this->enrollment_statuses, 'pending'),
-				'orientationDate' => $this->trim_to_null(isset($draft['orientationDate']) ? $draft['orientationDate'] : null),
-				'enrollmentNote' => $this->trim_to_null(isset($draft['enrollmentNote']) ? $draft['enrollmentNote'] : null),
+			$draft = (array) $draft;
+			$normalized = array();
+			$select_fields = array(
+				'reviewerDecision' => array($this->reviewer_decisions, 'pending'),
+				'paymentStatus' => array($this->payment_statuses, 'awaiting-invoice'),
+				'permitStatus' => array($this->permit_statuses, 'not-started'),
+				'arrivalStatus' => array($this->arrival_statuses, 'planning'),
+				'enrollmentStatus' => array($this->enrollment_statuses, 'pending'),
+				'commissionStatus' => array($this->commission_statuses, 'not-applicable'),
+				'refundStatus' => array($this->refund_statuses, 'none'),
 			);
+
+			foreach ($select_fields as $field => $definition) {
+				if (array_key_exists($field, $draft)) {
+					$normalized[$field] = $this->normalize_select_value($draft[$field], $definition[0], $definition[1]);
+				}
+			}
+
+			$text_fields = array(
+				'workflowNote', 'reviewSummary', 'decisionDueDate', 'offerIssuedDate', 'offerExpiryDate',
+				'offerConditionNote', 'classesStartDate', 'tuitionFeeFirstYear', 'tuitionFeeFollowingYears',
+				'paymentAmount', 'paymentCurrency', 'paymentReference', 'paymentConfirmedDate', 'financeNote',
+				'permitReference', 'permitSubmittedDate', 'permitDecisionDate', 'permitNote', 'travelDate',
+				'accommodationStatus', 'orientationDate', 'enrollmentNote', 'lateArrivalReason',
+				'commissionBaseAmount', 'commissionAmount', 'commissionCurrency', 'commissionDueDate',
+				'commissionPaidDate', 'commissionNote', 'refundRequestedDate', 'refundAmount',
+				'refundCurrency', 'refundPaidDate', 'refundReason', 'refundNote',
+			);
+
+			foreach ($text_fields as $field) {
+				if (array_key_exists($field, $draft)) {
+					$normalized[$field] = $this->trim_to_null($draft[$field]);
+				}
+			}
+
+			if (array_key_exists('workflowNote', $normalized) && null === $normalized['workflowNote']) {
+				$normalized['workflowNote'] = $this->workflow_note_for_status($fallback_status);
+			}
+			if (array_key_exists('paymentCurrency', $normalized) && null === $normalized['paymentCurrency']) {
+				$normalized['paymentCurrency'] = 'EUR';
+			}
+			if (array_key_exists('commissionCurrency', $normalized) && null === $normalized['commissionCurrency']) {
+				$normalized['commissionCurrency'] = 'EUR';
+			}
+			if (array_key_exists('refundCurrency', $normalized) && null === $normalized['refundCurrency']) {
+				$normalized['refundCurrency'] = 'EUR';
+			}
+			if (array_key_exists('termBalanceApplies', $draft)) {
+				$normalized['termBalanceApplies'] = $this->normalize_operations_boolean($draft['termBalanceApplies']);
+			}
+
+			return $normalized;
+		}
+
+		private function table_exists($table) {
+			global $wpdb;
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			return $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table)) === $table;
+		}
+
+		private function application_operations_column_map() {
+			return array(
+				'workflowNote' => array('workflowNote', '%s'),
+				'reviewerDecision' => array('reviewerDecision', '%s'),
+				'reviewSummary' => array('reviewSummary', '%s'),
+				'decisionDueDate' => array('decisionDueDate', '%s'),
+				'offerIssuedDate' => array('offerIssuedDate', '%s'),
+				'offerExpiryDate' => array('offerExpiryDate', '%s'),
+				'offerConditionNote' => array('offerConditionNote', '%s'),
+				'classesStartDate' => array('classesStartDate', '%s'),
+				'tuitionFeeFirstYear' => array('tuitionFeeFirstYear', '%s'),
+				'tuitionFeeFollowingYears' => array('tuitionFeeFollowingYears', '%s'),
+				'termBalanceApplies' => array('termBalanceApplies', '%d'),
+				'paymentStatus' => array('paymentStatus', '%s'),
+				'paymentAmount' => array('paymentAmount', '%s'),
+				'paymentCurrency' => array('paymentCurrency', '%s'),
+				'paymentReference' => array('paymentReference', '%s'),
+				'paymentConfirmedDate' => array('paymentConfirmedDate', '%s'),
+				'financeNote' => array('financeNote', '%s'),
+				'permitStatus' => array('permitStatus', '%s'),
+				'permitReference' => array('permitReference', '%s'),
+				'permitSubmittedDate' => array('permitSubmittedDate', '%s'),
+				'permitDecisionDate' => array('permitDecisionDate', '%s'),
+				'permitNote' => array('permitNote', '%s'),
+				'arrivalStatus' => array('arrivalStatus', '%s'),
+				'travelDate' => array('travelDate', '%s'),
+				'accommodationStatus' => array('accommodationStatus', '%s'),
+				'enrollmentStatus' => array('enrollmentStatus', '%s'),
+				'orientationDate' => array('orientationDate', '%s'),
+				'enrollmentNote' => array('enrollmentNote', '%s'),
+				'lateArrivalReason' => array('lateArrivalReason', '%s'),
+			);
+		}
+
+		private function commission_operations_column_map() {
+			return array(
+				'commissionStatus' => 'status',
+				'commissionBaseAmount' => 'baseAmount',
+				'commissionAmount' => 'amount',
+				'commissionCurrency' => 'currency',
+				'commissionDueDate' => 'dueDate',
+				'commissionPaidDate' => 'paidDate',
+				'commissionNote' => 'note',
+			);
+		}
+
+		private function refund_operations_column_map() {
+			return array(
+				'refundStatus' => 'status',
+				'refundRequestedDate' => 'requestedDate',
+				'refundAmount' => 'amount',
+				'refundCurrency' => 'currency',
+				'refundPaidDate' => 'paidDate',
+				'refundReason' => 'reason',
+				'refundNote' => 'note',
+			);
+		}
+
+		private function upsert_partial_operations_record($table, $application_id, $normalized, $field_map, $defaults, $label) {
+			global $wpdb;
+
+			$patch = array();
+			foreach ($field_map as $draft_field => $column) {
+				if (array_key_exists($draft_field, $normalized)) {
+					$patch[$column] = $normalized[$draft_field];
+				}
+			}
+
+			if (empty($patch)) {
+				return;
+			}
+
+			if (!$this->table_exists($table)) {
+				throw new Exception('The ' . $label . ' table is not available.');
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$existing = $wpdb->get_row(
+				$wpdb->prepare("SELECT id FROM {$table} WHERE applicationId = %s ORDER BY updatedAt DESC LIMIT 1", $application_id),
+				ARRAY_A
+			);
+
+			if ($existing) {
+				$set_parts = array();
+				$args = array();
+				foreach ($patch as $column => $value) {
+					if (null === $value) {
+						$set_parts[] = $column . ' = NULL';
+					} else {
+						$set_parts[] = $column . ' = %s';
+						$args[] = $value;
+					}
+				}
+				$set_parts[] = 'updatedAt = CURRENT_TIMESTAMP(3)';
+				$args[] = $existing['id'];
+				// Column and table names come only from internal maps.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$written = $wpdb->query($wpdb->prepare("UPDATE {$table} SET " . implode(', ', $set_parts) . ' WHERE id = %s', $args));
+				if (false === $written) {
+					throw new Exception('Unable to update the ' . $label . ' record.');
+				}
+				return;
+			}
+
+			$data = array_merge(
+				$defaults,
+				$patch,
+				array(
+					'id' => wp_generate_uuid4(),
+					'applicationId' => $application_id,
+				)
+			);
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			$written = $wpdb->insert($table, $data);
+			if (false === $written || 0 === $written) {
+				throw new Exception('Unable to create the ' . $label . ' record.');
+			}
 		}
 
 		private function get_admission_application_case($user, $application_id) {
@@ -3522,6 +4157,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('You are not allowed to update this application.');
 			}
 
+			if (!$this->can_manage_workflow_status($user, $status)) {
+				throw new Exception('You do not have permission to move this application to the requested stage.');
+			}
+
 			$next_note = $this->trim_to_null($params['note']);
 			$next_note = $next_note ? $next_note : $this->workflow_note_for_status($status);
 			$update_sql = "
@@ -3564,45 +4203,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 				$activity_source = $fresh;
 
-				if (!$this->should_apply_stale_workflow_target($fresh['status'], $status)) {
-					// A stale command may never move a case backwards, replay the
-					// current stage, skip a forward stage, or apply a terminal action.
-					// Return the fresh case as a no-op so the caller can refresh safely.
-					$stale_command_ignored = true;
-				} else {
-					$cas_sql = "
-						UPDATE {$this->applications_table}
-						SET
-							status = %s,
-							workflowNote = %s,
-							lastUpdatedByName = %s,
-							updatedAt = CURRENT_TIMESTAMP(3)
-						WHERE id = %s AND status = %s AND updatedAt = %s
-					";
-					$cas_updated = $wpdb->query(
-						$wpdb->prepare(
-							$cas_sql,
-							$status,
-							$next_note,
-							$user['name'],
-							$application_id,
-							$fresh['status'],
-							$fresh['updatedAt']
-						)
-					);
-
-					if (false === $cas_updated) {
-						throw new Exception('Unable to save the admissions workflow stage.');
-					}
-
-					if (0 === $cas_updated) {
-						// Another writer won the race after the fresh read. Never replay
-						// again; return the newest case and let the user decide from it.
-						$stale_command_ignored = true;
-					} else {
-						$target_applied = true;
-					}
-				}
+				// Never replay a workflow command after its optimistic version has
+				// gone stale. Return the authoritative case as a no-op and require a
+				// deliberate action from the refreshed state.
+				$stale_command_ignored = true;
 			} else {
 				$target_applied = $updated > 0;
 			}
@@ -3660,15 +4264,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$application_id = $params['applicationId'];
 			$expected_version = $this->iso_to_mysql_datetime($params['expectedUpdatedAt']);
 			$existing = $wpdb->get_row(
-				$wpdb->prepare(
-					"
-					SELECT id, wordpressUserId, status, paymentStatus, permitStatus, enrollmentStatus
-					FROM {$this->applications_table}
-					WHERE id = %s
-					LIMIT 1
-					",
-					$application_id
-				),
+				$wpdb->prepare("SELECT * FROM {$this->applications_table} WHERE id = %s LIMIT 1", $application_id),
 				ARRAY_A
 			);
 
@@ -3676,105 +4272,86 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Application not found.');
 			}
 
-			if (!$this->can_view_all_applications($user) && (int) $existing['wordpressUserId'] !== (int) $user['id']) {
-				throw new Exception('You are not allowed to update this application.');
+			$draft = isset($params['draft']) ? (array) $params['draft'] : array();
+			if (empty($draft)) {
+				throw new Exception('No operational fields were provided.');
 			}
 
-			$normalized = $this->normalize_operations_draft($params['draft'], $this->normalize_status($existing['status']));
+			$this->assert_operations_patch_authorized($draft, $user);
+			$normalized = $this->normalize_operations_draft($draft, $this->normalize_status($existing['status']));
 
-			$update_sql = "
-				UPDATE {$this->applications_table}
-				SET
-					workflowNote = %s,
-					reviewerDecision = %s,
-					reviewSummary = %s,
-					decisionDueDate = %s,
-					offerIssuedDate = %s,
-					offerExpiryDate = %s,
-					offerConditionNote = %s,
-					classesStartDate = %s,
-					tuitionFeeFirstYear = %s,
-					tuitionFeeFollowingYears = %s,
-					termBalanceApplies = %d,
-					paymentStatus = %s,
-					paymentAmount = %s,
-					paymentCurrency = %s,
-					paymentReference = %s,
-					paymentConfirmedDate = %s,
-					financeNote = %s,
-					permitStatus = %s,
-					permitReference = %s,
-					permitSubmittedDate = %s,
-					permitDecisionDate = %s,
-					permitNote = %s,
-					arrivalStatus = %s,
-					travelDate = %s,
-					accommodationStatus = %s,
-					enrollmentStatus = %s,
-					orientationDate = %s,
-					enrollmentNote = %s,
-					lastUpdatedByName = %s,
-					updatedAt = CURRENT_TIMESTAMP(3)
-				WHERE id = %s
-			";
+			$set_parts = array();
+			$args = array();
+			foreach ($this->application_operations_column_map() as $field => $definition) {
+				if (!array_key_exists($field, $normalized)) {
+					continue;
+				}
+				if (null === $normalized[$field]) {
+					$set_parts[] = $definition[0] . ' = NULL';
+				} else {
+					$set_parts[] = $definition[0] . ' = ' . $definition[1];
+					$args[] = $normalized[$field];
+				}
+			}
 
-			$args = array(
-				$normalized['workflowNote'],
-				$normalized['reviewerDecision'],
-				$normalized['reviewSummary'],
-				$normalized['decisionDueDate'],
-				$normalized['offerIssuedDate'],
-				$normalized['offerExpiryDate'],
-				$normalized['offerConditionNote'],
-				$normalized['classesStartDate'],
-				$normalized['tuitionFeeFirstYear'],
-				$normalized['tuitionFeeFollowingYears'],
-				$normalized['termBalanceApplies'],
-				$normalized['paymentStatus'],
-				$normalized['paymentAmount'],
-				$normalized['paymentCurrency'],
-				$normalized['paymentReference'],
-				$normalized['paymentConfirmedDate'],
-				$normalized['financeNote'],
-				$normalized['permitStatus'],
-				$normalized['permitReference'],
-				$normalized['permitSubmittedDate'],
-				$normalized['permitDecisionDate'],
-				$normalized['permitNote'],
-				$normalized['arrivalStatus'],
-				$normalized['travelDate'],
-				$normalized['accommodationStatus'],
-				$normalized['enrollmentStatus'],
-				$normalized['orientationDate'],
-				$normalized['enrollmentNote'],
-				$user['name'],
-				$application_id,
-			);
+			$set_parts[] = 'lastUpdatedByName = %s';
+			$args[] = $user['name'];
+			$set_parts[] = 'updatedAt = CURRENT_TIMESTAMP(3)';
+			$update_sql = "UPDATE {$this->applications_table} SET " . implode(', ', $set_parts) . ' WHERE id = %s';
+			$args[] = $application_id;
 
 			if ($expected_version) {
 				$update_sql .= " AND updatedAt = %s";
 				$args[] = $expected_version;
 			}
 
-			$updated = $wpdb->query($wpdb->prepare($update_sql, $args));
-
-			if (false === $updated) {
-				error_log('MC Admissions operations update failed: ' . $wpdb->last_error);
-				throw new Exception('Unable to save the application details. Refresh and try again.');
+			if (false === $wpdb->query('START TRANSACTION')) {
+				throw new Exception('Unable to start the application update.');
 			}
 
-			if (0 === $updated && $expected_version) {
-				throw new Exception(self::STALE_APPLICATION_ERROR);
+			try {
+				$updated = $wpdb->query($wpdb->prepare($update_sql, $args));
+				if (false === $updated) {
+					throw new Exception('Unable to save the application details. Refresh and try again.');
+				}
+				if (0 === $updated && $expected_version) {
+					throw new Exception(self::STALE_APPLICATION_ERROR);
+				}
+
+				$this->upsert_partial_operations_record(
+					$this->commission_records_table,
+					$application_id,
+					$normalized,
+					$this->commission_operations_column_map(),
+					array('status' => 'not-applicable', 'currency' => 'EUR'),
+					'commission'
+				);
+				$this->upsert_partial_operations_record(
+					$this->refund_records_table,
+					$application_id,
+					$normalized,
+					$this->refund_operations_column_map(),
+					array('status' => 'none', 'currency' => 'EUR'),
+					'refund'
+				);
+
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit the application update.');
+				}
+			} catch (Exception $write_error) {
+				$wpdb->query('ROLLBACK');
+				error_log('MC Admissions operations update failed: ' . $write_error->getMessage());
+				throw $write_error;
 			}
 
 			$detail_parts = array();
-			if ($existing['paymentStatus'] !== $normalized['paymentStatus']) {
+			if (array_key_exists('paymentStatus', $normalized) && $existing['paymentStatus'] !== $normalized['paymentStatus']) {
 				$detail_parts[] = 'payment ' . $existing['paymentStatus'] . ' -> ' . $normalized['paymentStatus'];
 			}
-			if ($existing['permitStatus'] !== $normalized['permitStatus']) {
+			if (array_key_exists('permitStatus', $normalized) && $existing['permitStatus'] !== $normalized['permitStatus']) {
 				$detail_parts[] = 'permit ' . $existing['permitStatus'] . ' -> ' . $normalized['permitStatus'];
 			}
-			if ($existing['enrollmentStatus'] !== $normalized['enrollmentStatus']) {
+			if (array_key_exists('enrollmentStatus', $normalized) && $existing['enrollmentStatus'] !== $normalized['enrollmentStatus']) {
 				$detail_parts[] = 'enrollment ' . $existing['enrollmentStatus'] . ' -> ' . $normalized['enrollmentStatus'];
 			}
 
@@ -3799,11 +4376,19 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$mime_type = $params['mimeType'];
 			$file_path = $params['filePath'];
 			$file_size = (int) $params['fileSize'];
+			$expected_updated_at = isset($params['expectedUpdatedAt']) ? trim((string) $params['expectedUpdatedAt']) : '';
+			$expected_version = '' !== $expected_updated_at
+				? $this->iso_to_mysql_datetime($expected_updated_at)
+				: null;
 
 			$this->get_authorized_application_base($application_id, $user);
 
 			if (!isset($this->document_requirements[$document_type])) {
 				throw new Exception('Unknown document type.');
+			}
+
+			if (!$this->can_upload_admission_document($user, $document_type)) {
+				throw new Exception('You do not have permission to upload this document type.');
 			}
 
 			if ($file_size <= 0 || !file_exists($file_path)) {
@@ -3839,16 +4424,38 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			try {
+				$application_sql = "UPDATE {$this->applications_table} SET lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3) WHERE id = %s";
+				$application_args = array($user['name'], $application_id);
+				if ($expected_version) {
+					$application_sql .= ' AND updatedAt = %s';
+					$application_args[] = $expected_version;
+				}
+
+				$application_written = $wpdb->query($wpdb->prepare($application_sql, $application_args));
+				if (false === $application_written) {
+					throw new Exception('Unable to update the application before the document upload.');
+				}
+				if (0 === $application_written) {
+					if ($expected_version) {
+						throw new Exception(self::STALE_APPLICATION_ERROR);
+					}
+					throw new Exception('Unable to update the application before the document upload.');
+				}
+
 				$document_written = $wpdb->query(
 					$wpdb->prepare(
 						"
 						INSERT INTO {$this->documents_table}
-							(id, applicationId, type, label, isReady, uploadedUrl, storedFilename, storageProvider, storageDriveId, storageItemId, storagePath, storageWebUrl, originalName, mimeType, fileSizeBytes, uploadedAt, uploadedByName, createdAt, updatedAt)
+							(id, applicationId, type, label, isReady, assessmentStatus, assessmentRemark, assessedAt, assessedByName, uploadedUrl, storedFilename, storageProvider, storageDriveId, storageItemId, storagePath, storageWebUrl, originalName, mimeType, fileSizeBytes, uploadedAt, uploadedByName, createdAt, updatedAt)
 						VALUES
-							(%s, %s, %s, %s, 1, %s, %s, 'microsoft-365', %s, %s, %s, %s, %s, %s, %d, %s, %s, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))
+							(%s, %s, %s, %s, 1, 'pending', NULL, NULL, NULL, %s, %s, 'microsoft-365', %s, %s, %s, %s, %s, %s, %d, %s, %s, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))
 						ON DUPLICATE KEY UPDATE
 							label = VALUES(label),
 							isReady = VALUES(isReady),
+							assessmentStatus = 'pending',
+							assessmentRemark = NULL,
+							assessedAt = NULL,
+							assessedByName = NULL,
 							uploadedUrl = VALUES(uploadedUrl),
 							storedFilename = VALUES(storedFilename),
 							storageProvider = VALUES(storageProvider),
@@ -3882,21 +4489,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				);
 				if (false === $document_written) {
 					throw new Exception('Unable to save the uploaded document record.');
-				}
-
-				$application_written = $wpdb->query(
-					$wpdb->prepare(
-						"
-						UPDATE {$this->applications_table}
-						SET lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3)
-						WHERE id = %s
-						",
-						$user['name'],
-						$application_id
-					)
-				);
-				if (false === $application_written || 0 === $application_written) {
-					throw new Exception('Unable to update the application after the document upload.');
 				}
 
 				$activity_written = $this->create_activity(
@@ -3938,6 +4530,344 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			if (!empty($existing['storageItemId'])) {
 				$this->delete_document_file($existing['storageDriveId'], $existing['storageItemId']);
+			}
+
+			return $this->to_admission_case($this->get_detailed_application_record($application_id));
+		}
+
+		private function normalize_document_assessment_drafts($assessments) {
+			$normalized = array();
+			$allowed_statuses = array('pending', 'approved', 'rejected');
+
+			foreach ((array) $assessments as $assessment) {
+				$assessment = (array) $assessment;
+				$document_type = isset($assessment['documentType'])
+					? sanitize_text_field((string) $assessment['documentType'])
+					: '';
+
+				if (!isset($this->document_requirements[$document_type])) {
+					throw new Exception('Unknown document type.');
+				}
+
+				$assessment_status = isset($assessment['assessmentStatus'])
+					? sanitize_text_field((string) $assessment['assessmentStatus'])
+					: 'pending';
+				$assessment_status = $this->normalize_select_value($assessment_status, $allowed_statuses, 'pending');
+				$assessment_remark = isset($assessment['assessmentRemark'])
+					? $this->trim_to_null(sanitize_textarea_field((string) $assessment['assessmentRemark']))
+					: null;
+
+				// The last draft for a requirement wins, matching the desktop Map normalization.
+				$normalized[$document_type] = array(
+					'documentType' => $document_type,
+					'label' => $this->document_requirements[$document_type],
+					'assessmentStatus' => $assessment_status,
+					'assessmentRemark' => $assessment_remark,
+				);
+			}
+
+			return array_values($normalized);
+		}
+
+		private function persist_document_assessments($application_id, $assessments, $existing_documents, $expected_version, $user) {
+			global $wpdb;
+
+			if (false === $wpdb->query('START TRANSACTION')) {
+				throw new Exception('Unable to start the document assessment update.');
+			}
+
+			try {
+				$application_written = $wpdb->query(
+					$wpdb->prepare(
+						"
+						UPDATE {$this->applications_table}
+						SET lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3)
+						WHERE id = %s AND updatedAt = %s
+						",
+						$user['name'],
+						$application_id,
+						$expected_version
+					)
+				);
+				if (false === $application_written) {
+					throw new Exception('Unable to update the application document revision.');
+				}
+				if (0 === $application_written) {
+					throw new Exception(self::STALE_APPLICATION_ERROR);
+				}
+
+				$assessed_at = current_time('mysql', true);
+				$detail_parts = array();
+				$status_labels = array(
+					'approved' => 'valid',
+					'rejected' => 'not valid',
+					'pending' => 'pending review',
+				);
+
+				foreach ($assessments as $assessment) {
+					$document_type = $assessment['documentType'];
+					$existing = isset($existing_documents[$document_type]) ? $existing_documents[$document_type] : null;
+					$document_id = !empty($existing['id']) ? (string) $existing['id'] : wp_generate_uuid4();
+					$is_ready = !empty($existing['isReady']) ? 1 : 0;
+					$is_pending = 'pending' === $assessment['assessmentStatus'];
+					$document_written = $wpdb->query(
+						$wpdb->prepare(
+							"
+							INSERT INTO {$this->documents_table}
+								(id, applicationId, type, label, isReady, assessmentStatus, assessmentRemark, assessedAt, assessedByName, createdAt, updatedAt)
+							VALUES
+								(%s, %s, %s, %s, %d, %s, NULLIF(%s, ''), NULLIF(%s, ''), NULLIF(%s, ''), CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))
+							ON DUPLICATE KEY UPDATE
+								label = VALUES(label),
+								assessmentStatus = VALUES(assessmentStatus),
+								assessmentRemark = VALUES(assessmentRemark),
+								assessedAt = VALUES(assessedAt),
+								assessedByName = VALUES(assessedByName),
+								updatedAt = CURRENT_TIMESTAMP(3)
+							",
+							$document_id,
+							$application_id,
+							$document_type,
+							$assessment['label'],
+							$is_ready,
+							$assessment['assessmentStatus'],
+							null === $assessment['assessmentRemark'] ? '' : $assessment['assessmentRemark'],
+							$is_pending ? '' : $assessed_at,
+							$is_pending ? '' : $user['name']
+						)
+					);
+					if (false === $document_written) {
+						throw new Exception('Unable to save a document assessment.');
+					}
+
+					$detail = $assessment['label'] . ': ' . $status_labels[$assessment['assessmentStatus']];
+					if (null !== $assessment['assessmentRemark']) {
+						$detail .= ' (' . $assessment['assessmentRemark'] . ')';
+					}
+					$detail_parts[] = $detail;
+				}
+
+				$activity_written = $this->create_activity(
+					$application_id,
+					$user,
+					'document',
+					'Document assessments updated',
+					implode('; ', $detail_parts)
+				);
+				if (false === $activity_written || 0 === $activity_written) {
+					throw new Exception('Unable to record the document assessment activity.');
+				}
+
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit the document assessment update.');
+				}
+			} catch (Exception $error) {
+				$wpdb->query('ROLLBACK');
+				throw $error;
+			}
+		}
+
+		private function update_admission_document_assessments($params) {
+			global $wpdb;
+
+			$user = $params['user'];
+			$application_id = $params['applicationId'];
+			$expected_updated_at = isset($params['expectedUpdatedAt']) ? trim((string) $params['expectedUpdatedAt']) : '';
+			if ('' === $expected_updated_at) {
+				throw new Exception('Application version is required.');
+			}
+			$expected_version = $this->iso_to_mysql_datetime($expected_updated_at);
+
+			$this->get_authorized_application_base($application_id, $user);
+			if (!$this->can_assess_admission_documents($user)) {
+				throw new Exception('You do not have permission to assess case documents.');
+			}
+
+			$assessments = $this->normalize_document_assessment_drafts($params['assessments']);
+			if (empty($assessments)) {
+				throw new Exception('At least one document assessment is required.');
+			}
+
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"
+					SELECT id, type, label, isReady, assessmentStatus, assessmentRemark
+					FROM {$this->documents_table}
+					WHERE applicationId = %s
+					",
+					$application_id
+				),
+				ARRAY_A
+			);
+			if (!is_array($rows)) {
+				throw new Exception('Unable to load the current document assessments.');
+			}
+
+			$existing_documents = array();
+			foreach ($rows as $row) {
+				$existing_documents[(string) $row['type']] = $row;
+			}
+
+			$changed = array_values(array_filter($assessments, function ($assessment) use ($existing_documents) {
+				$existing = isset($existing_documents[$assessment['documentType']])
+					? $existing_documents[$assessment['documentType']]
+					: null;
+				$existing_status = $this->normalize_select_value(
+					isset($existing['assessmentStatus']) ? (string) $existing['assessmentStatus'] : 'pending',
+					array('pending', 'approved', 'rejected'),
+					'pending'
+				);
+				$existing_remark = $this->trim_to_null(isset($existing['assessmentRemark']) ? $existing['assessmentRemark'] : null);
+
+				return $existing_status !== $assessment['assessmentStatus']
+					|| $existing_remark !== $assessment['assessmentRemark'];
+			}));
+
+			if (!empty($changed)) {
+				$this->persist_document_assessments(
+					$application_id,
+					$changed,
+					$existing_documents,
+					$expected_version,
+					$user
+				);
+			}
+
+			return $this->to_admission_case($this->get_detailed_application_record($application_id));
+		}
+
+		private function clear_document_record_and_touch_application($application_id, $document, $expected_version, $user) {
+			global $wpdb;
+
+			if (false === $wpdb->query('START TRANSACTION')) {
+				throw new Exception('Unable to start the document removal.');
+			}
+
+			try {
+				$application_written = $wpdb->query(
+					$wpdb->prepare(
+						"
+						UPDATE {$this->applications_table}
+						SET lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3)
+						WHERE id = %s AND updatedAt = %s
+						",
+						$user['name'],
+						$application_id,
+						$expected_version
+					)
+				);
+				if (false === $application_written) {
+					throw new Exception('Unable to update the application document revision.');
+				}
+				if (0 === $application_written) {
+					throw new Exception(self::STALE_APPLICATION_ERROR);
+				}
+
+				$document_written = $wpdb->query(
+					$wpdb->prepare(
+						"
+						UPDATE {$this->documents_table}
+						SET isReady = 0,
+							assessmentStatus = 'pending',
+							assessmentRemark = NULL,
+							assessedAt = NULL,
+							assessedByName = NULL,
+							uploadedUrl = NULL,
+							storedFilename = NULL,
+							storageProvider = NULL,
+							storageDriveId = NULL,
+							storageItemId = NULL,
+							storagePath = NULL,
+							storageWebUrl = NULL,
+							originalName = NULL,
+							mimeType = NULL,
+							fileSizeBytes = NULL,
+							uploadedAt = NULL,
+							uploadedByName = NULL,
+							updatedAt = CURRENT_TIMESTAMP(3)
+						WHERE id = %s
+							AND applicationId = %s
+							AND type = %s
+							AND uploadedUrl IS NOT NULL
+							AND COALESCE(storageDriveId, '') = %s
+							AND COALESCE(storageItemId, '') = %s
+						",
+						$document['id'],
+						$application_id,
+						$document['type'],
+						!empty($document['storageDriveId']) ? $document['storageDriveId'] : '',
+						!empty($document['storageItemId']) ? $document['storageItemId'] : ''
+					)
+				);
+				if (false === $document_written || 0 === $document_written) {
+					throw new Exception('No uploaded file was found for this document requirement.');
+				}
+
+				$activity_written = $this->create_activity(
+					$application_id,
+					$user,
+					'document',
+					$document['label'] . ' removed',
+					(!empty($document['originalName']) ? $document['originalName'] : $document['label']) . ' removed from the case file.'
+				);
+				if (false === $activity_written || 0 === $activity_written) {
+					throw new Exception('Unable to record the document removal activity.');
+				}
+
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit the document removal.');
+				}
+			} catch (Exception $error) {
+				$wpdb->query('ROLLBACK');
+				throw $error;
+			}
+		}
+
+		private function delete_admission_document($params) {
+			global $wpdb;
+
+			$user = $params['user'];
+			$application_id = $params['applicationId'];
+			$document_type = $params['documentType'];
+			$expected_updated_at = isset($params['expectedUpdatedAt']) ? trim((string) $params['expectedUpdatedAt']) : '';
+			if ('' === $expected_updated_at) {
+				throw new Exception('Application version is required.');
+			}
+			$expected_version = $this->iso_to_mysql_datetime($expected_updated_at);
+
+			$this->get_authorized_application_base($application_id, $user);
+			if (!$this->can_upload_admission_document($user, $document_type)) {
+				throw new Exception('You do not have permission to remove this document.');
+			}
+
+			$document = $wpdb->get_row(
+				$wpdb->prepare(
+					"
+					SELECT id, type, label, originalName, storageProvider, storageDriveId, storageItemId, uploadedUrl
+					FROM {$this->documents_table}
+					WHERE applicationId = %s AND type = %s
+					LIMIT 1
+					",
+					$application_id,
+					$document_type
+				),
+				ARRAY_A
+			);
+			if (!$document || empty($document['uploadedUrl'])) {
+				throw new Exception('No uploaded file was found for this document requirement.');
+			}
+
+			$this->clear_document_record_and_touch_application(
+				$application_id,
+				$document,
+				$expected_version,
+				$user
+			);
+
+			// Never remove the remote object until the database transaction commits.
+			// Exact drive/item IDs prevent a stale path from targeting a replacement file.
+			if (!empty($document['storageItemId'])) {
+				$this->delete_document_file($document['storageDriveId'], $document['storageItemId']);
 			}
 
 			return $this->to_admission_case($this->get_detailed_application_record($application_id));
@@ -4029,14 +4959,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function delete_document_file($drive_id, $item_id) {
 			if (empty($drive_id) || empty($item_id)) {
-				return;
+				return true;
 			}
 
 			try {
 				$config = $this->get_m365_config();
 				$token = $this->get_m365_access_token($config);
 
-				wp_remote_request(
+				$response = wp_remote_request(
 					'https://graph.microsoft.com/v1.0/drives/' . rawurlencode($drive_id) . '/items/' . rawurlencode($item_id),
 					array(
 						'method' => 'DELETE',
@@ -4046,8 +4976,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						'timeout' => 30,
 					)
 				);
+
+				if (is_wp_error($response)) {
+					return false;
+				}
+
+				$status = (int) wp_remote_retrieve_response_code($response);
+				return (200 <= $status && 300 > $status) || 404 === $status;
 			} catch (Exception $error) {
-				// Ignore remote cleanup failures after the new file is already stored.
+				// Storage cleanup is best-effort after a committed DB mutation.
+				return false;
 			}
 		}
 
@@ -4170,7 +5108,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function rest_list_payments(WP_REST_Request $request) {
 			global $wpdb;
 			try {
+				$user = $this->current_session_user();
 				$application_id = sanitize_text_field($request['application_id']);
+				$this->get_authorized_application_base($application_id, $user);
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$rows = $wpdb->get_results($wpdb->prepare("SELECT id, amount, currency, reference, swiftReference, confirmedDate, recordedByName, note, createdAt FROM {$this->payments_table} WHERE applicationId = %s ORDER BY createdAt DESC LIMIT 24", $application_id), ARRAY_A);
 				return new WP_REST_Response(array('ok' => true, 'transactions' => $rows ?: array()), 200);
@@ -4276,10 +5216,81 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		private function upsert_case_record_and_touch_application($table, $application_id, $data, $user, $label, $expected_updated_at = null) {
+			global $wpdb;
+			$expected_version = $this->iso_to_mysql_datetime($expected_updated_at);
+
+			if (false === $wpdb->query('START TRANSACTION')) {
+				throw new Exception('Unable to start the ' . $label . ' case update.');
+			}
+
+			try {
+				$application_sql = "UPDATE {$this->applications_table} SET lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3) WHERE id = %s";
+				$application_args = array($user['name'], $application_id);
+				if ($expected_version) {
+					$application_sql .= ' AND updatedAt = %s';
+					$application_args[] = $expected_version;
+				}
+
+				$application_written = $wpdb->query($wpdb->prepare($application_sql, $application_args));
+				if (false === $application_written) {
+					throw new Exception('Unable to refresh the parent application before the ' . $label . ' case update.');
+				}
+				if (0 === $application_written && $expected_version) {
+					throw new Exception(self::STALE_APPLICATION_ERROR);
+				}
+
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$existing = $wpdb->get_var($wpdb->prepare("SELECT id FROM {$table} WHERE applicationId = %s LIMIT 1", $application_id));
+				if ($existing) {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+					$written = $wpdb->update($table, $data, array('applicationId' => $application_id));
+					if (false === $written) {
+						throw new Exception('Unable to update the ' . $label . ' case.');
+					}
+				} else {
+					$data['id'] = wp_generate_uuid4();
+					$data['applicationId'] = $application_id;
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+					$written = $wpdb->insert($table, $data);
+					if (false === $written || 0 === $written) {
+						throw new Exception('Unable to create the ' . $label . ' case.');
+					}
+				}
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit the ' . $label . ' case update.');
+				}
+			} catch (Exception $write_error) {
+				$wpdb->query('ROLLBACK');
+				throw $write_error;
+			}
+		}
+
+		private function mutation_error_status($error) {
+			return self::STALE_APPLICATION_ERROR === $error->getMessage() ? 409 : 400;
+		}
+
+		private function document_mutation_error_status($error) {
+			if (self::STALE_APPLICATION_ERROR === $error->getMessage()) {
+				return 409;
+			}
+
+			$permission_errors = array(
+				'You are not allowed to access this application.',
+				'You do not have permission to upload this document type.',
+				'You do not have permission to assess case documents.',
+				'You do not have permission to remove this document.',
+			);
+
+			return in_array($error->getMessage(), $permission_errors, true) ? 403 : 400;
+		}
+
 		public function rest_get_migration_case(WP_REST_Request $request) {
 			global $wpdb;
 			try {
+				$user = $this->current_session_user();
 				$application_id = sanitize_text_field($request['application_id']);
+				$this->get_authorized_application_base($application_id, $user);
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->migration_cases_table} WHERE applicationId = %s LIMIT 1", $application_id), ARRAY_A);
 				return new WP_REST_Response(array('ok' => true, 'migrationCase' => $row ?: null), 200);
@@ -4292,11 +5303,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			global $wpdb;
 			$params = $request->get_json_params();
 			$draft = isset($params['draft']) ? (array) $params['draft'] : array();
+			$expected_updated_at = isset($params['expectedUpdatedAt']) ? (string) $params['expectedUpdatedAt'] : null;
 			try {
 				$user = $this->current_session_user();
+				if (!$this->can_edit_migration_or_immigration_records($user)) {
+					throw new Exception('You do not have permission to update migration case details.');
+				}
 				$application_id = sanitize_text_field($request['application_id']);
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-				$existing = $wpdb->get_var($wpdb->prepare("SELECT id FROM {$this->migration_cases_table} WHERE applicationId = %s LIMIT 1", $application_id));
+				$this->get_authorized_application_base($application_id, $user);
 				$data = array(
 					'packPreparedDate' => isset($draft['packPreparedDate']) ? sanitize_text_field($draft['packPreparedDate']) : null,
 					'packSubmittedDate' => isset($draft['packSubmittedDate']) ? sanitize_text_field($draft['packSubmittedDate']) : null,
@@ -4308,27 +5322,32 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'recordedByName' => $user['name'],
 					'updatedAt' => current_time('mysql', true),
 				);
-				if ($existing) {
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-					$wpdb->update($this->migration_cases_table, $data, array('applicationId' => $application_id));
-				} else {
-					$data['id'] = wp_generate_uuid4();
-					$data['applicationId'] = $application_id;
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-					$wpdb->insert($this->migration_cases_table, $data);
-				}
+				$this->upsert_case_record_and_touch_application(
+					$this->migration_cases_table,
+					$application_id,
+					$data,
+					$user,
+					'migration',
+					$expected_updated_at
+				);
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->migration_cases_table} WHERE applicationId = %s LIMIT 1", $application_id), ARRAY_A);
-				return new WP_REST_Response(array('ok' => true, 'migrationCase' => $row ?: null), 200);
+				return new WP_REST_Response(array(
+					'ok' => true,
+					'migrationCase' => $row ?: null,
+					'application' => $this->to_admission_case($this->get_detailed_application_record($application_id)),
+				), 200);
 			} catch (Exception $error) {
-				return $this->json_error_response($error->getMessage(), 400);
+				return $this->json_error_response($error->getMessage(), $this->mutation_error_status($error));
 			}
 		}
 
 		public function rest_get_immigration_case(WP_REST_Request $request) {
 			global $wpdb;
 			try {
+				$user = $this->current_session_user();
 				$application_id = sanitize_text_field($request['application_id']);
+				$this->get_authorized_application_base($application_id, $user);
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->immigration_cases_table} WHERE applicationId = %s LIMIT 1", $application_id), ARRAY_A);
 				return new WP_REST_Response(array('ok' => true, 'immigrationCase' => $row ?: null), 200);
@@ -4341,11 +5360,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			global $wpdb;
 			$params = $request->get_json_params();
 			$draft = isset($params['draft']) ? (array) $params['draft'] : array();
+			$expected_updated_at = isset($params['expectedUpdatedAt']) ? (string) $params['expectedUpdatedAt'] : null;
 			try {
 				$user = $this->current_session_user();
+				if (!$this->can_edit_migration_or_immigration_records($user)) {
+					throw new Exception('You do not have permission to update immigration case details.');
+				}
 				$application_id = sanitize_text_field($request['application_id']);
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-				$existing = $wpdb->get_var($wpdb->prepare("SELECT id FROM {$this->immigration_cases_table} WHERE applicationId = %s LIMIT 1", $application_id));
+				$this->get_authorized_application_base($application_id, $user);
 				$data = array(
 					'arrivalDate' => isset($draft['arrivalDate']) ? sanitize_text_field($draft['arrivalDate']) : null,
 					'medicalCertDate' => isset($draft['medicalCertDate']) ? sanitize_text_field($draft['medicalCertDate']) : null,
@@ -4360,15 +5382,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'recordedByName' => $user['name'],
 					'updatedAt' => current_time('mysql', true),
 				);
-				if ($existing) {
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-					$wpdb->update($this->immigration_cases_table, $data, array('applicationId' => $application_id));
-				} else {
-					$data['id'] = wp_generate_uuid4();
-					$data['applicationId'] = $application_id;
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-					$wpdb->insert($this->immigration_cases_table, $data);
-				}
+				$this->upsert_case_record_and_touch_application(
+					$this->immigration_cases_table,
+					$application_id,
+					$data,
+					$user,
+					'immigration',
+					$expected_updated_at
+				);
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->immigration_cases_table} WHERE applicationId = %s LIMIT 1", $application_id), ARRAY_A);
 				return new WP_REST_Response(array(
@@ -4377,7 +5398,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'application' => $this->to_admission_case($this->get_detailed_application_record($application_id)),
 				), 200);
 			} catch (Exception $error) {
-				return $this->json_error_response($error->getMessage(), 400);
+				return $this->json_error_response($error->getMessage(), $this->mutation_error_status($error));
 			}
 		}
 
