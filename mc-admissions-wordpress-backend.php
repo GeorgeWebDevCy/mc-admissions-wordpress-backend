@@ -3,7 +3,8 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.46
+ * Version: 0.2.47
+ * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -24,6 +25,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const DEFAULT_SOURCE = 'mc-admissions-wordpress';
 		const INITIAL_APPLICATION_STATUS = 'Application in progress';
 		const STALE_APPLICATION_ERROR = 'This application changed since you opened it. Refresh and try again.';
+		const AUTH_EPOCH_META_KEY = 'mc_admissions_auth_epoch';
+		const AUTH_EPOCH_CLAIM = 'mcAdmissionsAuthEpoch';
+		const PASSWORD_ATTEMPT_LIMIT = 5;
+		const PASSWORD_ATTEMPT_WINDOW_SECONDS = 900;
 
 		/** @var string */
 		private $applications_table = 'mc_admission_applications';
@@ -60,6 +65,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		/** @var string */
 		private $agency_profiles_table = 'mc_agency_profiles';
+
+		/** @var WP_Error|null */
+		private $jwt_auth_epoch_error = null;
+
+		/** @var bool[] */
+		private $password_epoch_preadvanced_user_ids = array();
 
 		/** @var string[] */
 		private $document_requirements = array(
@@ -194,6 +205,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			add_filter('upgrader_source_selection', array($this, 'normalize_update_package_paths'), 5, 4);
 			add_action('admin_menu', array($this, 'register_admin_menu'));
 			add_action('rest_api_init', array($this, 'register_rest_routes'));
+			add_action('wp_set_password', array($this, 'advance_auth_epoch_after_password_change'), 10, 3);
+			add_filter('jwt_auth_token_before_sign', array($this, 'add_jwt_auth_epoch_claim'), 10, 2);
+			add_filter('determine_current_user', array($this, 'enforce_jwt_auth_epoch'), 100, 1);
+			add_filter('rest_authentication_errors', array($this, 'surface_jwt_auth_epoch_error'), 20, 1);
 			add_filter('rest_pre_dispatch', array($this, 'disable_mc_admissions_rest_cache'), 10, 3);
 			add_filter('rest_post_dispatch', array($this, 'add_mc_admissions_rest_no_cache_headers'), 10, 3);
 			add_filter('rest_pre_serve_request', array($this, 'send_rest_cors_headers'), 10, 4);
@@ -930,6 +945,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			register_rest_route(
 				self::API_NAMESPACE,
+				'/account/password',
+				array(
+					'methods' => 'PUT',
+					'callback' => array($this, 'rest_change_password'),
+					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
 				'/email',
 				array(
 					'methods' => WP_REST_Server::CREATABLE,
@@ -1164,7 +1189,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			header('Access-Control-Allow-Origin: ' . esc_url_raw($origin));
 			header('Access-Control-Allow-Credentials: true');
 			header('Access-Control-Allow-Headers: Authorization, Content-Type, X-WP-Nonce');
-			header('Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS');
+			header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, OPTIONS');
 			header('Vary: Origin');
 
 			if ('OPTIONS' === strtoupper($_SERVER['REQUEST_METHOD'])) {
@@ -1243,6 +1268,146 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return true;
 		}
 
+		public function add_jwt_auth_epoch_claim($token, $user = null) {
+			if (!is_array($token)) {
+				return $token;
+			}
+
+			$user_id = is_object($user) && !empty($user->ID)
+				? (int) $user->ID
+				: $this->jwt_payload_user_id($token);
+			if ($user_id <= 0) {
+				return $token;
+			}
+
+			$token[self::AUTH_EPOCH_CLAIM] = $this->auth_epoch_for_user($user_id);
+
+			return $token;
+		}
+
+		public function advance_auth_epoch_after_password_change($_password, $user_id, $_old_user_data = null) {
+			$user_id = (int) $user_id;
+			if ($user_id <= 0) {
+				return;
+			}
+
+			if (!empty($this->password_epoch_preadvanced_user_ids[$user_id])) {
+				return;
+			}
+
+			$current_epoch = $this->auth_epoch_for_user($user_id);
+			update_user_meta($user_id, self::AUTH_EPOCH_META_KEY, $current_epoch + 1);
+		}
+
+		public function enforce_jwt_auth_epoch($user_id) {
+			$this->jwt_auth_epoch_error = null;
+			$bearer_token = $this->bearer_token_from_request();
+			if (null === $bearer_token || (int) $user_id <= 0) {
+				return $user_id;
+			}
+
+			$payload = $this->decode_validated_jwt_payload($bearer_token);
+			$resolved_user_id = (int) $user_id;
+			if (!is_array($payload) || $this->jwt_payload_user_id($payload) !== $resolved_user_id) {
+				$this->jwt_auth_epoch_error = $this->revoked_session_error();
+				return false;
+			}
+
+			$token_epoch = 0;
+			if (array_key_exists(self::AUTH_EPOCH_CLAIM, $payload)) {
+				$claim = $payload[self::AUTH_EPOCH_CLAIM];
+				if (
+					!(is_int($claim) && $claim >= 0)
+					&& !(is_string($claim) && ctype_digit($claim))
+				) {
+					$this->jwt_auth_epoch_error = $this->revoked_session_error();
+					return false;
+				}
+
+				$token_epoch = (int) $claim;
+			}
+
+			if ($token_epoch !== $this->auth_epoch_for_user($resolved_user_id)) {
+				$this->jwt_auth_epoch_error = $this->revoked_session_error();
+				return false;
+			}
+
+			return $user_id;
+		}
+
+		public function surface_jwt_auth_epoch_error($result) {
+			return $this->jwt_auth_epoch_error instanceof WP_Error
+				? $this->jwt_auth_epoch_error
+				: $result;
+		}
+
+		private function auth_epoch_for_user($user_id) {
+			$stored_epoch = get_user_meta((int) $user_id, self::AUTH_EPOCH_META_KEY, true);
+
+			return is_numeric($stored_epoch) ? max(0, (int) $stored_epoch) : 0;
+		}
+
+		private function bearer_token_from_request() {
+			$authorization = isset($_SERVER['HTTP_AUTHORIZATION'])
+				? (string) $_SERVER['HTTP_AUTHORIZATION']
+				: (isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])
+					? (string) $_SERVER['REDIRECT_HTTP_AUTHORIZATION']
+					: '');
+
+			if (!preg_match('/^Bearer\s+(\S+)$/i', trim($authorization), $matches)) {
+				return null;
+			}
+
+			return $matches[1];
+		}
+
+		private function jwt_payload_user_id($payload) {
+			$user_id = is_array($payload)
+				&& isset($payload['data'])
+				&& is_array($payload['data'])
+				&& isset($payload['data']['user'])
+				&& is_array($payload['data']['user'])
+				&& isset($payload['data']['user']['id'])
+					? $payload['data']['user']['id']
+					: null;
+
+			return is_numeric($user_id) && (int) $user_id > 0 ? (int) $user_id : 0;
+		}
+
+		private function decode_validated_jwt_payload($token) {
+			$parts = explode('.', (string) $token);
+			if (3 !== count($parts) || strlen($parts[1]) > 16384) {
+				return null;
+			}
+
+			$encoded_payload = strtr($parts[1], '-_', '+/');
+			$remainder = strlen($encoded_payload) % 4;
+			if (1 === $remainder) {
+				return null;
+			}
+
+			if ($remainder > 0) {
+				$encoded_payload .= str_repeat('=', 4 - $remainder);
+			}
+
+			$decoded_payload = base64_decode($encoded_payload, true);
+			if (false === $decoded_payload) {
+				return null;
+			}
+
+			$payload = json_decode($decoded_payload, true);
+
+			return is_array($payload) ? $payload : null;
+		}
+
+		private function revoked_session_error() {
+			return new WP_Error(
+				'mc_admissions_session_revoked',
+				'Your session has expired. Please sign in again.',
+				array('status' => 401)
+			);
+		}
+
 		public function rest_health() {
 			$role_statuses = $this->get_role_statuses();
 			$missing_roles = array();
@@ -1314,6 +1479,132 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				),
 				200
 			);
+		}
+
+		public function rest_change_password(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+
+			if (
+				!is_array($params)
+				|| !isset($params['currentPassword'], $params['newPassword'], $params['confirmPassword'])
+				|| !is_string($params['currentPassword'])
+				|| !is_string($params['newPassword'])
+				|| !is_string($params['confirmPassword'])
+				|| '' === $params['currentPassword']
+				|| '' === $params['newPassword']
+				|| '' === $params['confirmPassword']
+			) {
+				return $this->password_response(
+					false,
+					'Current password, new password, and password confirmation are required.',
+					400
+				);
+			}
+
+			$current_password = $params['currentPassword'];
+			$new_password = $params['newPassword'];
+			$confirm_password = $params['confirmPassword'];
+			if (
+				strlen($current_password) > 4096
+				|| strlen($new_password) > 4096
+				|| strlen($confirm_password) > 4096
+			) {
+				return $this->password_response(false, 'Password fields must not exceed 4096 characters.', 400);
+			}
+
+			if ($new_password !== $confirm_password) {
+				return $this->password_response(false, 'New password and confirmation do not match.', 400);
+			}
+
+			$password_length = function_exists('mb_strlen')
+				? mb_strlen($new_password)
+				: strlen($new_password);
+			if ($password_length < 12) {
+				return $this->password_response(false, 'New password must contain at least 12 characters.', 400);
+			}
+
+			$current_user = wp_get_current_user();
+			$user_id = isset($current_user->ID) ? (int) $current_user->ID : 0;
+			$current_hash = isset($current_user->user_pass) ? (string) $current_user->user_pass : '';
+
+			if ($user_id <= 0 || '' === $current_hash) {
+				return $this->password_response(false, 'Authentication required.', 401);
+			}
+
+			$failed_attempts = $this->failed_password_attempt_count($user_id);
+			if ($failed_attempts >= self::PASSWORD_ATTEMPT_LIMIT) {
+				return $this->password_response(
+					false,
+					'Too many unsuccessful password attempts. Please try again later.',
+					429
+				);
+			}
+
+			if (!wp_check_password($current_password, $current_hash, $user_id)) {
+				$failed_attempts = $this->record_failed_password_attempt($user_id, $failed_attempts);
+				if ($failed_attempts >= self::PASSWORD_ATTEMPT_LIMIT) {
+					return $this->password_response(
+						false,
+						'Too many unsuccessful password attempts. Please try again later.',
+						429
+					);
+				}
+
+				return $this->password_response(false, 'Current password is incorrect.', 400);
+			}
+
+			if (wp_check_password($new_password, $current_hash, $user_id)) {
+				return $this->password_response(
+					false,
+					'New password must be different from the current password.',
+					400
+				);
+			}
+
+			$current_epoch = $this->auth_epoch_for_user($user_id);
+			$next_epoch = $current_epoch + 1;
+			update_user_meta($user_id, self::AUTH_EPOCH_META_KEY, $next_epoch);
+			if ($this->auth_epoch_for_user($user_id) !== $next_epoch) {
+				return $this->password_response(
+					false,
+					'Password could not be changed. Please try again.',
+					500
+				);
+			}
+
+			$this->password_epoch_preadvanced_user_ids[$user_id] = true;
+			try {
+				wp_set_password($new_password, $user_id);
+				$updated_user = get_userdata($user_id);
+				$updated_hash = is_object($updated_user) && isset($updated_user->user_pass)
+					? (string) $updated_user->user_pass
+					: '';
+				if (
+					'' === $updated_hash
+					|| !wp_check_password($new_password, $updated_hash, $user_id)
+				) {
+					return $this->password_response(
+						false,
+						'Password could not be changed. Please try again.',
+						500
+					);
+				}
+
+				WP_Session_Tokens::get_instance($user_id)->destroy_all();
+				wp_clear_auth_cookie();
+			} catch (Throwable $error) {
+				return $this->password_response(
+					false,
+					'Password could not be changed. Please try again.',
+					500
+				);
+			} finally {
+				unset($this->password_epoch_preadvanced_user_ids[$user_id]);
+			}
+
+			delete_transient($this->password_attempt_transient_key($user_id));
+
+			return $this->password_response(true, 'Password changed successfully.', 200);
 		}
 
 		public function rest_send_email(WP_REST_Request $request) {
@@ -5468,6 +5759,37 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'error' => $message,
 				),
 				$status
+			);
+		}
+
+		private function password_attempt_transient_key($user_id) {
+			return 'mc_admissions_password_attempts_' . (int) $user_id;
+		}
+
+		private function failed_password_attempt_count($user_id) {
+			$stored_attempts = get_transient($this->password_attempt_transient_key($user_id));
+
+			return is_numeric($stored_attempts) ? max(0, (int) $stored_attempts) : 0;
+		}
+
+		private function record_failed_password_attempt($user_id, $current_attempts) {
+			$attempts = max(0, (int) $current_attempts) + 1;
+			set_transient(
+				$this->password_attempt_transient_key($user_id),
+				$attempts,
+				self::PASSWORD_ATTEMPT_WINDOW_SECONDS
+			);
+
+			return $attempts;
+		}
+
+		private function password_response($ok, $message, $status) {
+			return new WP_REST_Response(
+				array(
+					'ok' => (bool) $ok,
+					'message' => (string) $message,
+				),
+				(int) $status
 			);
 		}
 	}
