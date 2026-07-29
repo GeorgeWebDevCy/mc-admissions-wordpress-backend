@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.45
+ * Version: 0.2.46
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
  * License: GPL-2.0-or-later
@@ -194,6 +194,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			add_filter('upgrader_source_selection', array($this, 'normalize_update_package_paths'), 5, 4);
 			add_action('admin_menu', array($this, 'register_admin_menu'));
 			add_action('rest_api_init', array($this, 'register_rest_routes'));
+			add_filter('rest_pre_dispatch', array($this, 'disable_mc_admissions_rest_cache'), 10, 3);
+			add_filter('rest_post_dispatch', array($this, 'add_mc_admissions_rest_no_cache_headers'), 10, 3);
 			add_filter('rest_pre_serve_request', array($this, 'send_rest_cors_headers'), 10, 4);
 		}
 
@@ -1171,6 +1173,62 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			return $served;
+		}
+
+		public function disable_mc_admissions_rest_cache($result, $server, $request) {
+			if (!$this->is_mc_admissions_rest_request($request)) {
+				return $result;
+			}
+
+			if (!defined('DONOTCACHEPAGE')) {
+				define('DONOTCACHEPAGE', true);
+			}
+
+			do_action(
+				'litespeed_control_set_nocache',
+				'Authenticated MC Admissions REST responses must never be cached.'
+			);
+
+			if (function_exists('nocache_headers')) {
+				nocache_headers();
+			}
+
+			if (!headers_sent()) {
+				header('X-LiteSpeed-Cache-Control: no-cache', true);
+				header('Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0', true);
+				header('Pragma: no-cache', true);
+				header('Expires: Wed, 11 Jan 1984 05:00:00 GMT', true);
+			}
+
+			return $result;
+		}
+
+		public function add_mc_admissions_rest_no_cache_headers($response, $server, $request) {
+			if (
+				!$this->is_mc_admissions_rest_request($request) ||
+				!is_object($response) ||
+				!method_exists($response, 'header')
+			) {
+				return $response;
+			}
+
+			$response->header('X-LiteSpeed-Cache-Control', 'no-cache');
+			$response->header('Cache-Control', 'private, no-store, no-cache, must-revalidate, max-age=0');
+			$response->header('Pragma', 'no-cache');
+			$response->header('Expires', 'Wed, 11 Jan 1984 05:00:00 GMT');
+
+			return $response;
+		}
+
+		private function is_mc_admissions_rest_request($request) {
+			if (!is_object($request) || !method_exists($request, 'get_route')) {
+				return false;
+			}
+
+			$route = (string) $request->get_route();
+			$namespace = '/' . trim(self::API_NAMESPACE, '/');
+
+			return $namespace === $route || 0 === strpos($route, $namespace . '/');
 		}
 
 		public function permission_authenticated() {
