@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.48
+ * Version: 0.2.49
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -29,6 +29,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const AUTH_EPOCH_CLAIM = 'mcAdmissionsAuthEpoch';
 		const PASSWORD_ATTEMPT_LIMIT = 5;
 		const PASSWORD_ATTEMPT_WINDOW_SECONDS = 900;
+		const NOTIFICATION_EVENT_PAGE_SIZE = 50;
+		const NOTIFICATION_DOCUMENT_ACTIVITY_KIND = 'agent-document-upload';
 		const PRESIDENT_ACTIVITY_ALERT_EMAIL = 'president@mesoyios.ac.cy';
 		const PRESIDENT_ACTIVITY_ALERT_NAME = 'Theodoros';
 
@@ -1841,13 +1843,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function should_send_review_submission_alert($application, $user, $was_submitted_for_review) {
 			return (bool) $was_submitted_for_review
-				&& $this->is_agent_user($user)
+				&& $this->is_external_agent_user($user)
 				&& empty($application['isTestData'])
 				&& 'review-pending' === $this->canonical_status_key(isset($application['status']) ? (string) $application['status'] : '');
 		}
 
 		private function should_send_post_submission_agent_document_alert($application, $user) {
-			if (!$this->is_agent_user($user) || !empty($application['isTestData'])) {
+			if (!$this->is_external_agent_user($user) || !empty($application['isTestData'])) {
 				return false;
 			}
 
@@ -2368,27 +2370,90 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		private function current_notification_event_mysql_datetime() {
+			return (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s.v');
+		}
+
+		private function encode_notification_event_cursor($created_at, $event_id = '') {
+			$created_at_iso = $this->mysql_datetime_to_iso($created_at);
+			if (empty($created_at_iso)) {
+				throw new Exception('Unable to create the notification cursor.');
+			}
+
+			return $created_at_iso . '|' . (string) $event_id;
+		}
+
+		private function parse_notification_event_cursor($value, $fallback_mysql) {
+			$value = trim((string) $value);
+			if ('' === $value) {
+				return array(
+					'createdAt' => $fallback_mysql,
+					'id' => '',
+				);
+			}
+
+			$parts = explode('|', $value, 2);
+			try {
+				$date = new DateTimeImmutable($parts[0], new DateTimeZone('UTC'));
+			} catch (Exception $error) {
+				return null;
+			}
+
+			$event_id = isset($parts[1]) ? trim((string) $parts[1]) : '';
+			if ('' !== $event_id && 1 !== preg_match('/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,190}$/', $event_id)) {
+				return null;
+			}
+
+			return array(
+				'createdAt' => $date->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d H:i:s.v'),
+				'id' => $event_id,
+			);
+		}
+
 		public function rest_notification_events(WP_REST_Request $request) {
 			global $wpdb;
 
 			try {
 				$user = $this->current_session_user();
-				$cursor_mysql = current_time('mysql', true);
-				$cursor = gmdate('c', strtotime($cursor_mysql . ' UTC'));
+				$upper_bound_mysql = $this->current_notification_event_mysql_datetime();
+				$empty_cursor = $this->encode_notification_event_cursor($upper_bound_mysql);
 
-				if ($this->is_agent_user($user) || !$this->can_view_all_applications($user)) {
-					return new WP_REST_Response(array('ok' => true, 'cursor' => $cursor, 'events' => array()), 200);
+				if (!$this->can_view_all_applications($user)) {
+					return new WP_REST_Response(
+						array(
+							'ok' => true,
+							'cursor' => $empty_cursor,
+							'events' => array(),
+							'hasMore' => false,
+						),
+						200
+					);
 				}
 
 				$since_value = sanitize_text_field((string) $request->get_param('since'));
-				$since_timestamp = $since_value ? strtotime($since_value) : false;
-				if (false === $since_timestamp) {
-					$since_timestamp = strtotime($cursor_mysql . ' UTC');
+				$since = $this->parse_notification_event_cursor($since_value, $upper_bound_mysql);
+				if (null === $since) {
+					return $this->json_error_response('Invalid notification cursor.', 400);
 				}
-				$since_mysql = gmdate('Y-m-d H:i:s', $since_timestamp);
 
-				// Lightweight indexed query: notify internal users about agent-created
-				// application changes, workflow submissions, and document changes.
+				$query_args = array();
+				if ('' === $since['id']) {
+					$cursor_filter_sql = 'activity.createdAt >= %s';
+					$query_args[] = $since['createdAt'];
+				} else {
+					$cursor_filter_sql = '(activity.createdAt > %s OR (activity.createdAt = %s AND activity.id > %s))';
+					$query_args[] = $since['createdAt'];
+					$query_args[] = $since['createdAt'];
+					$query_args[] = $since['id'];
+				}
+				$query_args[] = $upper_bound_mysql;
+				$query_args[] = self::NOTIFICATION_EVENT_PAGE_SIZE;
+
+				// Only the durable agent-document-upload kind is sound-eligible.
+				// Ordinary document timeline rows include preparation uploads,
+				// assessments, and removals and must never enter this feed.
+				$notification_document_kind = self::NOTIFICATION_DOCUMENT_ACTIVITY_KIND;
+
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$rows = $wpdb->get_results(
 					$wpdb->prepare(
@@ -2397,21 +2462,28 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						FROM {$this->activities_table} activity
 						INNER JOIN {$this->applications_table} app ON app.id = activity.applicationId
 						WHERE activity.actorRole = 'agent'
-						AND activity.createdAt >= %s AND activity.createdAt <= %s
-						AND activity.kind IN ('application', 'workflow', 'document')
-						ORDER BY activity.createdAt ASC
-						LIMIT 50",
-						$since_mysql,
-						$cursor_mysql
+						AND {$cursor_filter_sql}
+						AND activity.createdAt <= %s
+						AND activity.kind IN ('workflow', '{$notification_document_kind}')
+						AND COALESCE(app.isTestData, 0) = 0
+						ORDER BY activity.createdAt ASC, activity.id ASC
+						LIMIT %d",
+						$query_args
 					),
 					ARRAY_A
 				);
 
+				if (!is_array($rows)) {
+					return $this->json_error_response('Unable to load notification events.', 503);
+				}
+
+				$rows = array_slice($rows, 0, self::NOTIFICATION_EVENT_PAGE_SIZE);
+				$has_more = self::NOTIFICATION_EVENT_PAGE_SIZE === count($rows);
 				$events = array_map(
 					function ($row) {
 						return array(
 							'id' => $row['id'],
-							'type' => 'document' === $row['kind']
+							'type' => self::NOTIFICATION_DOCUMENT_ACTIVITY_KIND === $row['kind']
 								? 'document-uploaded'
 								: ('workflow' === $row['kind'] ? 'application-submitted' : 'application-updated'),
 							'applicationId' => $row['applicationId'],
@@ -2422,10 +2494,24 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'createdAt' => $this->mysql_datetime_to_iso($row['createdAt']),
 						);
 					},
-					is_array($rows) ? $rows : array()
+					$rows
 				);
 
-				return new WP_REST_Response(array('ok' => true, 'cursor' => $cursor, 'events' => $events), 200);
+				$cursor = $empty_cursor;
+				if ($has_more) {
+					$last_row = $rows[count($rows) - 1];
+					$cursor = $this->encode_notification_event_cursor($last_row['createdAt'], $last_row['id']);
+				}
+
+				return new WP_REST_Response(
+					array(
+						'ok' => true,
+						'cursor' => $cursor,
+						'events' => $events,
+						'hasMore' => $has_more,
+					),
+					200
+				);
 			} catch (Exception $error) {
 				return $this->json_error_response($error->getMessage(), 400);
 			}
@@ -3098,6 +3184,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private function is_agent_user($user) {
 			$agent_roles = array('mc_agent', 'mc-agent', 'agency', 'agent', 'consultant', 'admissions-agent', 'subscriber');
 			return !empty($user['roles']) && count(array_intersect($agent_roles, (array) $user['roles'])) > 0;
+		}
+
+		private function is_external_agent_user($user) {
+			return $this->is_agent_user($user) && !$this->can_view_all_applications($user);
 		}
 
 		private function can_edit_application_data($user) {
@@ -3798,12 +3888,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
-		private function get_authorized_application_base($application_id, $user) {
+		private function get_authorized_application_base($application_id, $user, $for_update = false) {
 			global $wpdb;
 
+			$lock_sql = $for_update ? ' FOR UPDATE' : '';
 			$application = $wpdb->get_row(
 				$wpdb->prepare(
-					"SELECT id, wordpressUserId, status, isTestData FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+					"SELECT id, wordpressUserId, status, isTestData FROM {$this->applications_table} WHERE id = %s LIMIT 1{$lock_sql}",
 					$application_id
 				),
 				ARRAY_A
@@ -4266,7 +4357,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private function map_activity_entry($entry) {
 			return array(
 				'id' => $entry['id'],
-				'kind' => $entry['kind'],
+				'kind' => self::NOTIFICATION_DOCUMENT_ACTIVITY_KIND === $entry['kind'] ? 'document' : $entry['kind'],
 				'title' => $entry['title'],
 				'detail' => !empty($entry['detail']) ? $entry['detail'] : null,
 				'actorName' => $entry['actorName'],
@@ -4286,11 +4377,20 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'title' => $title,
 					'detail' => $this->trim_to_null($detail),
 					'actorName' => $user['name'],
-					'actorRole' => $this->is_agent_user($user) ? 'agent' : 'internal',
-					'createdAt' => current_time('mysql', true),
+					'actorRole' => $this->is_external_agent_user($user) ? 'agent' : 'internal',
+					'createdAt' => $this->current_notification_event_mysql_datetime(),
 				),
 				array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
 			);
+		}
+
+		private function create_required_activity($application_id, $user, $kind, $title, $detail, $failure_message) {
+			$written = $this->create_activity($application_id, $user, $kind, $title, $detail);
+			if (false === $written || 0 === $written) {
+				throw new Exception($failure_message);
+			}
+
+			return $written;
 		}
 
 		private function sync_document_checklist($application_id, $documents) {
@@ -4562,7 +4662,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$existing_application = $this->get_authorized_application_base($record_id, $user);
 					$is_preparation_status = 'profile-preparation' === $this->canonical_status_key((string) $existing_application['status']);
 					$is_submitting_prepared_application = 'review' === $mode && ($this->is_agent_user($user) || $this->is_admin_user($user)) && $is_preparation_status;
-					$should_notify_review_submission = $is_submitting_prepared_application && $this->is_agent_user($user);
+					$should_notify_review_submission = $is_submitting_prepared_application && $this->is_external_agent_user($user);
 					$next_is_test_data = $this->resolve_application_test_data(
 						$draft,
 						$user,
@@ -4664,14 +4764,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 					$this->sync_document_checklist($record_id, isset($draft['documents']) ? (array) $draft['documents'] : array());
 
-					$this->create_activity(
+					$this->create_required_activity(
 						$record_id,
 						$user,
 						$is_submitting_prepared_application ? 'workflow' : 'application',
 						$is_submitting_prepared_application ? 'Application submitted for review' : 'Application details corrected',
 						$is_submitting_prepared_application
 							? 'The completed application was submitted into the admissions review queue.'
-							: 'Application data was updated without changing the current workflow stage.'
+							: 'Application data was updated without changing the current workflow stage.',
+						'Unable to record the application activity.'
 					);
 				} else {
 					$owner = $user;
@@ -4695,7 +4796,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 
 					$record_id = wp_generate_uuid4();
-					$should_notify_review_submission = 'review' === $mode && $this->is_agent_user($user);
+					$should_notify_review_submission = 'review' === $mode && $this->is_external_agent_user($user);
 					$next_is_test_data = $this->resolve_application_test_data(
 						$draft,
 						$user,
@@ -4748,14 +4849,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 					$this->sync_document_checklist($record_id, isset($draft['documents']) ? (array) $draft['documents'] : array());
 
-					$this->create_activity(
+					$this->create_required_activity(
 						$record_id,
 						$user,
 						'review' === $mode ? 'workflow' : 'application',
 						'review' === $mode ? 'Application submitted for review' : 'Application created',
 						'review' === $mode
 							? 'A new application was submitted into the review queue from the intake form.'
-							: 'A new admissions case was created from the desktop intake form.'
+							: 'A new admissions case was created from the desktop intake form.',
+						'Unable to record the application activity.'
 					);
 				}
 
@@ -5046,11 +5148,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				? $this->iso_to_mysql_datetime($expected_updated_at)
 				: null;
 
-			$application_before_upload = $this->get_authorized_application_base($application_id, $user);
-			$should_notify_agent_document_upload = $this->should_send_post_submission_agent_document_alert(
-				$application_before_upload,
-				$user
-			);
+			$this->get_authorized_application_base($application_id, $user);
+			$should_notify_agent_document_upload = false;
 
 			if (!isset($this->document_requirements[$document_type])) {
 				throw new Exception('Unknown document type.');
@@ -5093,6 +5192,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			try {
+				$application_at_upload = $this->get_authorized_application_base($application_id, $user, true);
+				$should_notify_agent_document_upload = $this->should_send_post_submission_agent_document_alert(
+					$application_at_upload,
+					$user
+				);
+
 				$application_sql = "UPDATE {$this->applications_table} SET lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3) WHERE id = %s";
 				$application_args = array($user['name'], $application_id);
 				if ($expected_version) {
@@ -5160,16 +5265,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					throw new Exception('Unable to save the uploaded document record.');
 				}
 
-				$activity_written = $this->create_activity(
+				$this->create_required_activity(
 					$application_id,
 					$user,
-					'document',
+					$should_notify_agent_document_upload ? self::NOTIFICATION_DOCUMENT_ACTIVITY_KIND : 'document',
 					$this->document_requirements[$document_type] . ' uploaded',
-					$file_name . ' attached to the case file.'
+					$file_name . ' attached to the case file.',
+					'Unable to record the document upload activity.'
 				);
-				if (false === $activity_written || 0 === $activity_written) {
-					throw new Exception('Unable to record the document upload activity.');
-				}
 
 				$saved_document = $wpdb->get_row(
 					$wpdb->prepare(
