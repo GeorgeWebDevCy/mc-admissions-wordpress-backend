@@ -92,7 +92,7 @@ $GLOBALS['mc_alert_users'] = array(
 		'ID' => 2,
 		'display_name' => 'Agent Actor',
 		'user_email' => 'actor@example.test',
-		'roles' => array('mc_agent', 'admissions-officer'),
+		'roles' => array('mc_agent'),
 	),
 	(object) array(
 		'ID' => 3,
@@ -111,6 +111,12 @@ $GLOBALS['mc_alert_users'] = array(
 		'display_name' => 'Finance Officer',
 		'user_email' => 'finance@example.test',
 		'roles' => array('finance-officer'),
+	),
+	(object) array(
+		'ID' => 6,
+		'display_name' => 'Admissions Officer',
+		'user_email' => 'admissions@example.test',
+		'roles' => array('admissions-officer'),
 	),
 );
 
@@ -295,6 +301,12 @@ $agent = array(
 	'id' => 2,
 	'name' => 'Agent Actor',
 	'email' => 'actor@example.test',
+	'roles' => array('mc_agent'),
+);
+$dual_role_internal = array(
+	'id' => 7,
+	'name' => 'Dual Role Internal',
+	'email' => 'dual-role@example.test',
 	'roles' => array('mc_agent', 'admissions-officer'),
 );
 $internal_user = array(
@@ -306,6 +318,7 @@ $internal_user = array(
 
 alert_assert_same(true, $review_gate->invoke($plugin, $application, $agent, true), 'An authoritative agent submission in review must alert.');
 alert_assert_same(false, $review_gate->invoke($plugin, $application, $internal_user, true), 'An internal submission must not masquerade as an incoming agent application.');
+alert_assert_same(false, $review_gate->invoke($plugin, $application, $dual_role_internal, true), 'A dual-role internal submission must not masquerade as an incoming agent application.');
 alert_assert_same(false, $review_gate->invoke($plugin, array_merge($application, array('status' => 'profile-preparation')), $agent, true), 'A preparation-stage application must not emit a submission alert.');
 alert_assert_same(false, $review_gate->invoke($plugin, array_merge($application, array('isTestData' => 1)), $agent, true), 'A test application submission must remain silent.');
 alert_assert_same(false, $review_gate->invoke($plugin, $application, $agent, false), 'A normal edit must not emit a submission alert.');
@@ -316,6 +329,7 @@ foreach (array('profile-preparation', 'Application in progress', 'Draft') as $pr
 	alert_assert_same(false, $gate->invoke($plugin, $preparation, $agent), $preparation_status . ' uploads must remain silent.');
 }
 alert_assert_same(false, $gate->invoke($plugin, $application, $internal_user), 'Internal staff uploads must not use the agent-update alert.');
+alert_assert_same(false, $gate->invoke($plugin, $application, $dual_role_internal), 'Dual-role internal uploads must not use the agent-update alert.');
 alert_assert_same(
 	false,
 	$gate->invoke($plugin, array_merge($application, array('isTestData' => 1)), $agent),
@@ -394,7 +408,8 @@ $submission_addresses = alert_mail_addresses();
 alert_assert_same(true, $submission_result['ok'], 'A fully delivered submission alert must succeed.');
 alert_assert_same(4, count($submission_addresses), 'President plus matching role accounts must receive one message each.');
 alert_assert_same(1, count(array_keys($submission_addresses, 'president@mesoyios.ac.cy', true)), 'President direct and administrator matches must deduplicate.');
-alert_assert_same(1, count(array_keys($submission_addresses, 'actor@example.test', true)), 'The actor must not be filtered from a matching role.');
+alert_assert_same(false, in_array('actor@example.test', $submission_addresses, true), 'An external agent must not become an internal role recipient.');
+alert_assert_same(1, count(array_keys($submission_addresses, 'admissions@example.test', true)), 'The Admissions Officer role must receive one deduplicated message.');
 alert_assert_same(2, count($GLOBALS['wpdb']->insert_calls), 'Delivery must write one communication and one activity audit.');
 alert_assert_contains(
 	'Email delivery: sent to 4 recipient(s).',
@@ -439,7 +454,7 @@ alert_assert_same(array(), $GLOBALS['mc_alert_mail_calls'], 'Test application al
 alert_assert_same(array(), $GLOBALS['wpdb']->insert_calls, 'Test application alerts must not create delivery audit noise.');
 
 alert_reset_side_effects();
-$GLOBALS['mc_alert_mail_exceptions'] = array('actor@example.test');
+$GLOBALS['mc_alert_mail_exceptions'] = array('admissions@example.test');
 $GLOBALS['mc_alert_mail_failures'] = array('immigration@example.test');
 $partial = $send->invoke($plugin, $application, $agent, 'new-application-submitted');
 alert_assert_same(false, $partial['ok'], 'Any failed recipient must make the delivery summary partial.');
@@ -477,7 +492,7 @@ alert_assert_same(
 	strpos($save_source, '$wpdb->query(\'COMMIT\')') < strpos($save_source, '$this->send_application_activity_alert('),
 	'Submission email must be attempted only after the application transaction commits.'
 );
-alert_assert_contains("\$should_notify_review_submission = 'review' === \$mode && \$this->is_agent_user(\$user)", $save_source, 'Draft and internal creation must not set the submission alert gate.');
+alert_assert_contains("\$should_notify_review_submission = 'review' === \$mode && \$this->is_external_agent_user(\$user)", $save_source, 'Draft and internal creation must not set the submission alert gate.');
 alert_assert_same(
 	true,
 	strpos($upload_source, '$wpdb->query(\'COMMIT\')') < strpos($upload_source, '$this->send_application_activity_alert('),
@@ -490,6 +505,6 @@ alert_assert_not_contains('send_application_activity_alert', $delete_source, 'Do
 alert_assert_not_contains('send_application_activity_alert', $rest_email_source, 'The ordinary /email endpoint must remain independent.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-alert_assert_contains('Version: 0.2.48', $plugin_source, 'The plugin header must advertise version 0.2.48.');
+alert_assert_contains('Version: 0.2.49', $plugin_source, 'The plugin header must advertise version 0.2.49.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;

@@ -431,6 +431,7 @@ try {
 	$stale_upload_db->row_results = array(
 		document_application_base(),
 		array('id' => 'passport-document', 'storageDriveId' => 'drive-1', 'storageItemId' => 'old-storage-item'),
+		document_application_base(),
 	);
 	$stale_upload_db->var_results = array(
 		'tenant-1', 'client-1', 'secret-1', 'drive-1', 'Admissions',
