@@ -473,20 +473,30 @@ $persist_assessments->setAccessible(true);
 $clear_document = $reflection->getMethod('clear_document_record_and_touch_application');
 $clear_document->setAccessible(true);
 
-foreach (array('upload_admission_document', 'update_admission_document_assessments', 'delete_admission_document') as $method_name) {
+foreach (array('update_admission_document_assessments', 'delete_admission_document') as $method_name) {
 	document_assert_contains(
 		'return $this->to_admission_case($this->get_detailed_application_record($application_id))',
 		document_method_source($reflection, $method_name),
 		$method_name . ' must return a complete authoritative application.'
 	);
 }
+$upload_method_source = document_method_source($reflection, 'upload_admission_document');
+document_assert_contains(
+	'$application = $this->get_detailed_application_record($application_id)',
+	$upload_method_source,
+	'upload_admission_document must reload the authoritative application after commit.'
+);
+document_assert_contains(
+	'return $this->to_admission_case($application)',
+	$upload_method_source,
+	'upload_admission_document must return the reloaded authoritative application.'
+);
 $delete_method_source = document_method_source($reflection, 'delete_admission_document');
 document_assert_same(
 	true,
 	strpos($delete_method_source, '$this->clear_document_record_and_touch_application(') < strpos($delete_method_source, '$this->delete_document_file('),
 	'M365 deletion must occur only after the database removal transaction returns successfully.'
 );
-$upload_method_source = document_method_source($reflection, 'upload_admission_document');
 document_assert_same(
 	true,
 	strpos($upload_method_source, '$wpdb->query(\'COMMIT\')') < strpos($upload_method_source, '$this->delete_document_file($existing[\'storageDriveId\']'),
