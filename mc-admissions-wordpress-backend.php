@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.49
+ * Version: 0.2.50
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -33,6 +33,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const NOTIFICATION_DOCUMENT_ACTIVITY_KIND = 'agent-document-upload';
 		const PRESIDENT_ACTIVITY_ALERT_EMAIL = 'president@mesoyios.ac.cy';
 		const PRESIDENT_ACTIVITY_ALERT_NAME = 'Theodoros';
+		const DESKTOP_RELEASE_REPOSITORY = 'GeorgeWebDevCy/mc-admissions-app';
+		const RELEASE_NOTIFICATION_SECRET_SETTING = 'release_notification_secret';
+		const RELEASE_NOTIFICATION_STATE_PREFIX = 'release_notification_delivery_';
+		const RELEASE_NOTIFICATION_LOCK_PREFIX = 'mc_admissions_release_';
 
 		/** @var string */
 		private $applications_table = 'mc_admission_applications';
@@ -866,6 +870,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$this->save_setting($key, $value);
 				}
 
+				$release_notification_secret = $this->posted_setting(self::RELEASE_NOTIFICATION_SECRET_SETTING);
+				if ('' !== $release_notification_secret) {
+					$this->save_setting(self::RELEASE_NOTIFICATION_SECRET_SETTING, $release_notification_secret);
+				}
+
 				$saved = true;
 			}
 
@@ -875,6 +884,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$drive_id = $this->get_setting('m365_drive_id');
 			$document_root = $this->get_setting('m365_document_root', 'Admissions');
 			$github_token = $this->get_setting('github_token');
+			$release_notification_secret_configured = '' !== $this->get_setting(self::RELEASE_NOTIFICATION_SECRET_SETTING);
 			$role_statuses = array_values($this->get_role_statuses());
 			$missing_roles = array();
 			$available_roles = array();
@@ -951,6 +961,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 									<p class="description"><?php echo esc_html__('Personal access token with read access to the private GitHub repository. Used by the auto-update checker to fetch new plugin releases.', 'mc-admissions-wordpress-backend'); ?></p>
 								</td>
 							</tr>
+							<tr>
+								<th scope="row"><label for="release_notification_secret"><?php echo esc_html__('Desktop Release Notification Secret', 'mc-admissions-wordpress-backend'); ?></label></th>
+								<td>
+									<input name="release_notification_secret" id="release_notification_secret" type="password" class="regular-text" value="" autocomplete="new-password" placeholder="<?php echo esc_attr($release_notification_secret_configured ? __('Configured - enter a new value to rotate', 'mc-admissions-wordpress-backend') : __('Enter the GitHub Actions webhook secret', 'mc-admissions-wordpress-backend')); ?>" />
+									<p class="description"><?php echo esc_html__('Shared HMAC secret for signed desktop release notifications. Use the same value in the app release workflow. Leaving this field blank preserves the configured secret.', 'mc-admissions-wordpress-backend'); ?></p>
+								</td>
+							</tr>
 						</tbody>
 					</table>
 					<?php submit_button(__('Save settings', 'mc-admissions-wordpress-backend')); ?>
@@ -997,6 +1014,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'methods' => WP_REST_Server::CREATABLE,
 					'callback' => array($this, 'rest_send_email'),
 					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
+				'/release-notification',
+				array(
+					'methods' => WP_REST_Server::CREATABLE,
+					'callback' => array($this, 'rest_release_notification'),
+					'permission_callback' => '__return_true',
 				)
 			);
 
@@ -1642,6 +1669,424 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			delete_transient($this->password_attempt_transient_key($user_id));
 
 			return $this->password_response(true, 'Password changed successfully.', 200);
+		}
+
+
+		private function release_notification_error_response($code, $message, $status, $tag = null, $sent_count = 0, $failed_count = 0, $response_status = 'rejected') {
+			return new WP_REST_Response(
+				array(
+					'ok' => false,
+					'duplicate' => false,
+					'status' => (string) $response_status,
+					'tag' => $tag,
+					'sentCount' => max(0, (int) $sent_count),
+					'failedCount' => max(0, (int) $failed_count),
+					'code' => (string) $code,
+					'error' => (string) $message,
+				),
+				(int) $status
+			);
+		}
+
+		private function release_notification_success_response($status, $tag, $duplicate, $sent_count = 0, $failed_count = 0, $http_status = 200) {
+			return new WP_REST_Response(
+				array(
+					'ok' => true,
+					'duplicate' => (bool) $duplicate,
+					'status' => (string) $status,
+					'tag' => (string) $tag,
+					'sentCount' => max(0, (int) $sent_count),
+					'failedCount' => max(0, (int) $failed_count),
+				),
+				(int) $http_status
+			);
+		}
+
+		private function release_notification_state_key($repository, $tag) {
+			return self::RELEASE_NOTIFICATION_STATE_PREFIX . substr(
+				hash('sha256', (string) $repository . ':' . (string) $tag),
+				0,
+				48
+			);
+		}
+
+		private function release_notification_lock_name($repository, $tag) {
+			return self::RELEASE_NOTIFICATION_LOCK_PREFIX . substr(
+				hash('sha256', (string) $repository . ':' . (string) $tag),
+				0,
+				32
+			);
+		}
+
+		private function acquire_release_notification_lock($lock_name) {
+			global $wpdb;
+
+			$acquired = $wpdb->get_var(
+				$wpdb->prepare('SELECT GET_LOCK(%s, 0)', (string) $lock_name)
+			);
+
+			return 1 === (int) $acquired;
+		}
+
+		private function release_release_notification_lock($lock_name) {
+			global $wpdb;
+
+			$wpdb->get_var(
+				$wpdb->prepare('SELECT RELEASE_LOCK(%s)', (string) $lock_name)
+			);
+		}
+
+		private function read_release_notification_state($state_key, $repository, $tag) {
+			$empty_state = array(
+				'repository' => (string) $repository,
+				'tag' => (string) $tag,
+				'complete' => false,
+				'sentEmails' => array(),
+				'attemptCount' => 0,
+				'lastDeliveryId' => null,
+				'updatedAt' => null,
+			);
+			$encoded = $this->get_setting($state_key);
+			if ('' === $encoded) {
+				return $empty_state;
+			}
+
+			$decoded = json_decode($encoded, true);
+			if (
+				!is_array($decoded)
+				|| (string) ($decoded['repository'] ?? '') !== (string) $repository
+				|| (string) ($decoded['tag'] ?? '') !== (string) $tag
+			) {
+				return $empty_state;
+			}
+
+			$sent_emails = array();
+			foreach ((array) ($decoded['sentEmails'] ?? array()) as $email) {
+				$email = sanitize_email((string) $email);
+				if (is_email($email)) {
+					$sent_emails[strtolower($email)] = true;
+				}
+			}
+
+			return array(
+				'repository' => (string) $repository,
+				'tag' => (string) $tag,
+				'complete' => !empty($decoded['complete']),
+				'sentEmails' => array_keys($sent_emails),
+				'attemptCount' => max(0, (int) ($decoded['attemptCount'] ?? 0)),
+				'lastDeliveryId' => isset($decoded['lastDeliveryId'])
+					? sanitize_text_field((string) $decoded['lastDeliveryId'])
+					: null,
+				'updatedAt' => isset($decoded['updatedAt'])
+					? sanitize_text_field((string) $decoded['updatedAt'])
+					: null,
+			);
+		}
+
+		private function save_release_notification_state($state_key, $state) {
+			$encoded = wp_json_encode($state);
+			if (!is_string($encoded) || '' === $encoded) {
+				return false;
+			}
+
+			return $this->save_setting($state_key, $encoded);
+		}
+
+		private function desktop_release_notification_payload($tag) {
+			$marker = 'MC Admissions desktop update ' . (string) $tag . ' is available';
+			$message = array(
+				$marker . '.',
+				'The app checks for updates automatically. When the update-ready prompt appears, choose Restart now to install it.',
+			);
+
+			return array(
+				'roles' => array(
+					'administrator',
+					'admissions-officer',
+					'finance-officer',
+					'migration-officer',
+					'immigration-officer',
+					'registrar',
+				),
+				'to' => array(
+					array(
+						'email' => self::PRESIDENT_ACTIVITY_ALERT_EMAIL,
+						'name' => self::PRESIDENT_ACTIVITY_ALERT_NAME,
+					),
+				),
+				'subject' => $marker,
+				'message' => implode("\n", $message),
+			);
+		}
+
+		public function rest_release_notification(WP_REST_Request $request) {
+			$secret = $this->get_setting(self::RELEASE_NOTIFICATION_SECRET_SETTING);
+			if ('' === $secret) {
+				return $this->release_notification_error_response(
+					'release_notification_not_configured',
+					'Desktop release notifications are not configured.',
+					503
+				);
+			}
+
+			$raw_body = (string) $request->get_body();
+			if ('' === $raw_body) {
+				return $this->release_notification_error_response(
+					'empty_payload',
+					'Release notification payload is required.',
+					400
+				);
+			}
+			if (strlen($raw_body) > 1024 * 1024) {
+				return $this->release_notification_error_response(
+					'payload_too_large',
+					'Release notification payload is too large.',
+					413
+				);
+			}
+
+			$signature = strtolower(trim((string) $request->get_header('x-hub-signature-256')));
+			$expected_signature = 'sha256=' . hash_hmac('sha256', $raw_body, $secret);
+			if (
+				1 !== preg_match('/^sha256=[a-f0-9]{64}$/', $signature)
+				|| !hash_equals($expected_signature, $signature)
+			) {
+				return $this->release_notification_error_response(
+					'invalid_signature',
+					'Release notification signature is invalid.',
+					401
+				);
+			}
+
+			if ('release' !== strtolower(trim((string) $request->get_header('x-github-event')))) {
+				return $this->release_notification_error_response(
+					'invalid_event',
+					'Only published release events are accepted.',
+					400
+				);
+			}
+
+			$params = json_decode($raw_body, true);
+			if (!is_array($params)) {
+				return $this->release_notification_error_response(
+					'invalid_json',
+					'Release notification payload must be valid JSON.',
+					400
+				);
+			}
+			if ('published' !== (string) ($params['action'] ?? '')) {
+				return $this->release_notification_error_response(
+					'invalid_action',
+					'Only the published release action is accepted.',
+					400
+				);
+			}
+
+			$repository = isset($params['repository']) && is_array($params['repository'])
+				? $params['repository']
+				: array();
+			$repository_name = (string) ($repository['full_name'] ?? '');
+			if (self::DESKTOP_RELEASE_REPOSITORY !== $repository_name) {
+				return $this->release_notification_error_response(
+					'invalid_repository',
+					'Release notification repository is not allowed.',
+					400
+				);
+			}
+
+			$release = isset($params['release']) && is_array($params['release'])
+				? $params['release']
+				: array();
+			$tag = (string) ($release['tag_name'] ?? '');
+			if (1 !== preg_match('/^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/', $tag)) {
+				return $this->release_notification_error_response(
+					'invalid_tag',
+					'Release tag must use semantic vX.Y.Z format.',
+					400,
+					$tag ?: null
+				);
+			}
+			if (
+				!array_key_exists('draft', $release)
+				|| false !== $release['draft']
+				|| !array_key_exists('prerelease', $release)
+				|| false !== $release['prerelease']
+			) {
+				return $this->release_notification_error_response(
+					'invalid_release_state',
+					'Draft and prerelease builds are not eligible for staff notification.',
+					400,
+					$tag
+				);
+			}
+
+			$version = substr($tag, 1);
+			$required_assets = array(
+				'mc-admissions-' . $version . '-win-x64.exe',
+				'mc-admissions-' . $version . '-win-x64.exe.blockmap',
+				'latest.yml',
+			);
+			$asset_names = array();
+			foreach ((array) ($release['assets'] ?? array()) as $asset) {
+				if (is_array($asset) && isset($asset['name'])) {
+					$asset_names[] = (string) $asset['name'];
+				}
+			}
+			$missing_assets = array_values(array_diff($required_assets, array_unique($asset_names)));
+			if (!empty($missing_assets)) {
+				return $this->release_notification_error_response(
+					'missing_release_assets',
+					'Release notification is missing required Windows update assets.',
+					400,
+					$tag
+				);
+			}
+
+			$state_key = $this->release_notification_state_key($repository_name, $tag);
+			$lock_name = $this->release_notification_lock_name($repository_name, $tag);
+			if (!$this->acquire_release_notification_lock($lock_name)) {
+				return $this->release_notification_error_response(
+					'release_notification_in_progress',
+					'This release notification is already being processed.',
+					409,
+					$tag
+				);
+			}
+
+			try {
+				$state = $this->read_release_notification_state($state_key, $repository_name, $tag);
+				if (!empty($state['complete'])) {
+					return $this->release_notification_success_response('duplicate', $tag, true);
+				}
+
+				$payload = $this->desktop_release_notification_payload($tag);
+				$recipients = $this->resolve_email_recipients($payload);
+				if (empty($recipients)) {
+					return $this->release_notification_error_response(
+						'no_release_recipients',
+						'No internal release notification recipients were found.',
+						502,
+						$tag
+					);
+				}
+
+				$sent_email_map = array();
+				foreach ((array) $state['sentEmails'] as $sent_email) {
+					$sent_email_map[strtolower((string) $sent_email)] = true;
+				}
+				$pending_recipients = array_values(
+					array_filter(
+						$recipients,
+						static function ($recipient) use ($sent_email_map) {
+							return empty($sent_email_map[strtolower((string) $recipient['email'])]);
+						}
+					)
+				);
+				if (empty($pending_recipients)) {
+					$state['complete'] = true;
+					$state['updatedAt'] = current_time('mysql', true);
+					if (!$this->save_release_notification_state($state_key, $state)) {
+						return $this->release_notification_error_response(
+							'idempotency_storage_failed',
+							'Release notification state could not be saved.',
+							503,
+							$tag
+						);
+					}
+					return $this->release_notification_success_response('duplicate', $tag, true);
+				}
+
+				$state['attemptCount'] = max(0, (int) $state['attemptCount']) + 1;
+				$state['lastDeliveryId'] = substr(
+					sanitize_text_field((string) $request->get_header('x-github-delivery')),
+					0,
+					191
+				);
+				$state['updatedAt'] = current_time('mysql', true);
+				if (!$this->save_release_notification_state($state_key, $state)) {
+					return $this->release_notification_error_response(
+						'idempotency_storage_failed',
+						'Release notification state could not be saved.',
+						503,
+						$tag
+					);
+				}
+
+				$headers = array('Content-Type: text/html; charset=UTF-8');
+				$html_message = $this->build_email_message($payload['message']);
+				$sent_count = 0;
+				$failed_count = 0;
+
+				foreach ($pending_recipients as $recipient) {
+					try {
+						$delivered = wp_mail(
+							array($recipient['email']),
+							$payload['subject'],
+							$html_message,
+							$headers
+						);
+					} catch (Throwable $mail_error) {
+						$delivered = false;
+					}
+
+					if (!$delivered) {
+						$failed_count++;
+						continue;
+					}
+
+					$sent_count++;
+					$sent_email_map[strtolower((string) $recipient['email'])] = true;
+					$state['sentEmails'] = array_keys($sent_email_map);
+					$state['updatedAt'] = current_time('mysql', true);
+					if (!$this->save_release_notification_state($state_key, $state)) {
+						return $this->release_notification_error_response(
+							'idempotency_storage_failed',
+							'Release notification state could not be saved.',
+							503,
+							$tag,
+							$sent_count,
+							count($pending_recipients) - $sent_count
+						);
+					}
+				}
+
+				$state['complete'] = 0 === $failed_count;
+				$state['updatedAt'] = current_time('mysql', true);
+				if (!$this->save_release_notification_state($state_key, $state)) {
+					return $this->release_notification_error_response(
+						'idempotency_storage_failed',
+						'Release notification state could not be saved.',
+						503,
+						$tag,
+						$sent_count,
+						$failed_count
+					);
+				}
+
+				if (0 === $failed_count) {
+					return $this->release_notification_success_response(
+						'sent',
+						$tag,
+						false,
+						$sent_count,
+						0
+					);
+				}
+
+				return $this->release_notification_error_response(
+					$sent_count > 0 ? 'release_notification_partial' : 'release_notification_failed',
+					$sent_count > 0
+						? 'Desktop release notification was only partially delivered.'
+						: 'Desktop release notification could not be delivered.',
+					502,
+					$tag,
+					$sent_count,
+					$failed_count,
+					$sent_count > 0 ? 'partial' : 'failed'
+				);
+			} finally {
+				$this->release_release_notification_lock($lock_name);
+			}
 		}
 
 		public function rest_send_email(WP_REST_Request $request) {
@@ -3137,7 +3582,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private function save_setting($key, $value) {
 			global $wpdb;
 
-			$wpdb->query(
+			return false !== $wpdb->query(
 				$wpdb->prepare(
 					"
 					INSERT INTO {$this->settings_table} (settingKey, settingValue, updatedAt)
