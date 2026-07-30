@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.47
+ * Version: 0.2.48
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -29,6 +29,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const AUTH_EPOCH_CLAIM = 'mcAdmissionsAuthEpoch';
 		const PASSWORD_ATTEMPT_LIMIT = 5;
 		const PASSWORD_ATTEMPT_WINDOW_SECONDS = 900;
+		const PRESIDENT_ACTIVITY_ALERT_EMAIL = 'president@mesoyios.ac.cy';
+		const PRESIDENT_ACTIVITY_ALERT_NAME = 'Theodoros';
 
 		/** @var string */
 		private $applications_table = 'mc_admission_applications';
@@ -192,6 +194,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		public function boot() {
 			$this->ensure_roles();
+			$this->ensure_application_test_data_schema();
 			$this->ensure_immigration_insurance_columns();
 			$this->ensure_offer_detail_columns();
 			$this->ensure_case_detail_columns();
@@ -240,6 +243,37 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			update_option('mc_admissions_notification_activity_schema_version', '1', false);
+		}
+
+		private function ensure_application_test_data_schema() {
+			global $wpdb;
+
+			if ('1' === get_option('mc_admissions_application_test_data_schema_version')) {
+				return;
+			}
+
+			// The application table may predate the test-data classification field.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			if ($this->applications_table !== $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->applications_table))) {
+				return;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$present = $wpdb->get_var("SHOW COLUMNS FROM {$this->applications_table} LIKE 'isTestData'");
+			if (!$present) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$added = $wpdb->query("ALTER TABLE {$this->applications_table} ADD COLUMN isTestData BOOLEAN NOT NULL DEFAULT 0 AFTER gdprAcknowledged");
+				if (false === $added) {
+					return;
+				}
+			}
+
+			// Confirm the column exists before recording the migration as complete.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$present = $wpdb->get_var("SHOW COLUMNS FROM {$this->applications_table} LIKE 'isTestData'");
+			if ($present) {
+				update_option('mc_admissions_application_test_data_schema_version', '1', false);
+			}
 		}
 
 		private function ensure_resource_indexes() {
@@ -442,6 +476,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					tuitionAcknowledged BOOLEAN NOT NULL,
 					offerTermsAcknowledged BOOLEAN NOT NULL,
 					gdprAcknowledged BOOLEAN NOT NULL,
+					isTestData BOOLEAN NOT NULL DEFAULT 0,
 					status VARCHAR(191) NOT NULL DEFAULT 'Application in progress',
 					workflowNote TEXT NULL,
 					lastUpdatedByName VARCHAR(191) NULL,
@@ -1759,6 +1794,251 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
+		private function has_application_test_data_marker($value) {
+			$normalized = strtolower(trim((string) $value));
+
+			if ('' === $normalized) {
+				return false;
+			}
+
+			return false !== strpos($normalized, 'local.invalid')
+				|| false !== strpos($normalized, '.example')
+				|| false !== strpos($normalized, '.test')
+				|| 1 === preg_match('/\b(test|verification|smoke|codex|uat)\b/i', $normalized);
+		}
+
+		private function infer_application_test_data($draft, $user) {
+			if (isset($user['id']) && (int) $user['id'] < 0) {
+				return true;
+			}
+
+			$values = array(
+				isset($user['username']) ? $user['username'] : null,
+				isset($user['name']) ? $user['name'] : null,
+				isset($user['email']) ? $user['email'] : null,
+				isset($draft['fullName']) ? $draft['fullName'] : null,
+				isset($draft['passportNumber']) ? $draft['passportNumber'] : null,
+				isset($draft['email']) ? $draft['email'] : null,
+				isset($draft['agencyName']) ? $draft['agencyName'] : null,
+				isset($draft['consultantName']) ? $draft['consultantName'] : null,
+				isset($draft['consultantEmail']) ? $draft['consultantEmail'] : null,
+			);
+
+			foreach ($values as $value) {
+				if ($this->has_application_test_data_marker($value)) {
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		private function resolve_application_test_data($draft, $user, $requested = null, $current = false) {
+			return !empty($current)
+				|| (true === $requested && $this->is_admin_user($user))
+				|| $this->infer_application_test_data($draft, $user);
+		}
+
+		private function should_send_review_submission_alert($application, $user, $was_submitted_for_review) {
+			return (bool) $was_submitted_for_review
+				&& $this->is_agent_user($user)
+				&& empty($application['isTestData'])
+				&& 'review-pending' === $this->canonical_status_key(isset($application['status']) ? (string) $application['status'] : '');
+		}
+
+		private function should_send_post_submission_agent_document_alert($application, $user) {
+			if (!$this->is_agent_user($user) || !empty($application['isTestData'])) {
+				return false;
+			}
+
+			$status = isset($application['status']) ? (string) $application['status'] : '';
+
+			return 'profile-preparation' !== $this->canonical_status_key($status);
+		}
+
+		private function application_activity_alert_payload($application, $user, $event_type, $document_type = null, $file_name = null) {
+			$reference = isset($application['referenceCode']) ? (string) $application['referenceCode'] : '';
+			$full_name = isset($application['fullName']) ? (string) $application['fullName'] : '';
+			$student_label = implode(' / ', array_filter(array($reference, $full_name)));
+			$actor_name = isset($user['name']) ? (string) $user['name'] : 'An admissions user';
+			$roles = array('administrator', 'admissions-officer', 'immigration-officer');
+
+			if ('agent-document-uploaded' === $event_type && 'bankTransactionConfirmation' === $document_type) {
+				$roles[] = 'finance-officer';
+			}
+
+			if ('new-application-submitted' === $event_type) {
+				$subject = sanitize_text_field('New application submitted: ' . $student_label);
+				$message = implode(
+					"\n",
+					array(
+						'A new application was submitted to Admissions and is ready for review.',
+						'Submitted by: ' . $actor_name . '.',
+						'Please open MC Admissions and review the case.',
+					)
+				);
+			} else {
+				$document_label = isset($this->document_requirements[$document_type])
+					? $this->document_requirements[$document_type]
+					: 'Application document';
+				$subject = sanitize_text_field('Agent document uploaded: ' . $student_label);
+				$message_parts = array(
+					$actor_name . ' uploaded or replaced a document after the application was submitted.',
+					'Document: ' . $document_label . '.',
+				);
+				if (null !== $file_name && '' !== trim((string) $file_name)) {
+					$message_parts[] = 'File: ' . (string) $file_name . '.';
+				}
+				$message_parts[] = 'Please open MC Admissions and review the updated document.';
+				$message = implode("\n", $message_parts);
+			}
+
+			return array(
+				'roles' => array_values(array_unique($roles)),
+				'to' => array(
+					array(
+						'email' => self::PRESIDENT_ACTIVITY_ALERT_EMAIL,
+						'name' => self::PRESIDENT_ACTIVITY_ALERT_NAME,
+					),
+				),
+				'subject' => $subject,
+				'message' => $message,
+				'application' => array(
+					'id' => isset($application['id']) ? (string) $application['id'] : null,
+					'referenceCode' => $reference,
+					'fullName' => $full_name,
+				),
+			);
+		}
+
+		private function record_application_activity_alert($application_id, $user, $payload, $sent, $failed, $error = null) {
+			global $wpdb;
+
+			$sent_count = count((array) $sent);
+			$failed_count = count((array) $failed);
+			if ($sent_count > 0 && 0 === $failed_count) {
+				$delivery_status = sprintf('Email delivery: sent to %d recipient(s).', $sent_count);
+			} elseif ($sent_count > 0) {
+				$delivery_status = sprintf(
+					'Email delivery: partially sent to %d recipient(s); %d failed.',
+					$sent_count,
+					$failed_count
+				);
+			} else {
+				$delivery_status = 'Email delivery failed: ' . ($error ? (string) $error : 'WordPress did not accept the message.');
+			}
+
+			$detail = implode(
+				"\n",
+				array(
+					(string) $payload['message'],
+					'Recipient roles: ' . implode(', ', (array) $payload['roles']) . '.',
+					$delivery_status,
+				)
+			);
+
+			try {
+				if ($this->table_exists($this->communications_table)) {
+					$wpdb->insert(
+						$this->communications_table,
+						array(
+							'id' => wp_generate_uuid4(),
+							'applicationId' => $application_id,
+							'direction' => 'outbound',
+							'channel' => 'email',
+							'subject' => (string) $payload['subject'],
+							'detail' => $detail,
+							'actorName' => isset($user['name']) ? (string) $user['name'] : 'MC Admissions',
+							'createdAt' => current_time('mysql', true),
+						),
+						array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
+					);
+				}
+
+				$this->create_activity(
+					$application_id,
+					$user,
+					'communication',
+					(string) $payload['subject'],
+					$delivery_status
+				);
+			} catch (Throwable $audit_error) {
+				error_log('MC Admissions could not record urgent email delivery: ' . $audit_error->getMessage());
+			}
+		}
+
+		private function send_application_activity_alert($application, $user, $event_type, $document_type = null, $file_name = null) {
+			if (!empty($application['isTestData'])) {
+				return array('ok' => false, 'skipped' => true, 'sent' => array(), 'failed' => array());
+			}
+
+			$payload = $this->application_activity_alert_payload(
+				$application,
+				$user,
+				$event_type,
+				$document_type,
+				$file_name
+			);
+			$recipients = array();
+			$sent = array();
+			$failed = array();
+			$error_message = null;
+
+			try {
+				$recipients = $this->resolve_email_recipients($payload);
+				if (empty($recipients)) {
+					throw new Exception('No valid urgent-alert email recipients were found.');
+				}
+
+				$headers = array('Content-Type: text/html; charset=UTF-8');
+				if (!empty($user['email']) && is_email($user['email'])) {
+					$headers[] = sprintf(
+						'Reply-To: %s <%s>',
+						$this->sanitize_mail_header_name($user['name']),
+						$user['email']
+					);
+				}
+				$html_message = $this->build_email_message($payload['message'], $payload['application']);
+
+				foreach ($recipients as $recipient) {
+					try {
+						$delivered = wp_mail(
+							array($recipient['email']),
+							$payload['subject'],
+							$html_message,
+							$headers
+						);
+					} catch (Throwable $mail_error) {
+						$delivered = false;
+						$error_message = $mail_error->getMessage();
+					}
+					if ($delivered) {
+						$sent[] = $recipient;
+					} else {
+						$failed[] = $recipient;
+					}
+				}
+			} catch (Throwable $delivery_error) {
+				$error_message = $delivery_error->getMessage();
+			}
+
+			$this->record_application_activity_alert(
+				isset($application['id']) ? (string) $application['id'] : '',
+				$user,
+				$payload,
+				$sent,
+				$failed,
+				$error_message
+			);
+
+			return array(
+				'ok' => !empty($sent) && empty($failed),
+				'sent' => $sent,
+				'failed' => $failed,
+				'error' => $error_message,
+			);
+		}
+
 		private function create_email_attachments($attachments) {
 			$paths = array();
 			$total_bytes = 0;
@@ -2480,6 +2760,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					array(
 						'applicationId' => isset($params['applicationId']) ? (string) $params['applicationId'] : null,
 						'expectedUpdatedAt' => isset($params['expectedUpdatedAt']) ? (string) $params['expectedUpdatedAt'] : null,
+						'isTestData' => array_key_exists('isTestData', $params) ? (bool) $params['isTestData'] : null,
 						'mode' => (string) $params['mode'],
 						'draft' => (array) $params['draft'],
 						'user' => $user,
@@ -3522,7 +3803,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$application = $wpdb->get_row(
 				$wpdb->prepare(
-					"SELECT id, wordpressUserId, status FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+					"SELECT id, wordpressUserId, status, isTestData FROM {$this->applications_table} WHERE id = %s LIMIT 1",
 					$application_id
 				),
 				ARRAY_A
@@ -4263,8 +4544,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$expected_version = $this->iso_to_mysql_datetime($params['expectedUpdatedAt']);
 			$record_id = !empty($params['applicationId']) ? $params['applicationId'] : null;
 			$assigned_agent_id = !empty($params['assignedAgentId']) ? absint($params['assignedAgentId']) : 0;
+			$requested_is_test_data = array_key_exists('isTestData', $params) && null !== $params['isTestData']
+				? (bool) $params['isTestData']
+				: null;
+			$should_notify_review_submission = false;
 
-			$wpdb->query('START TRANSACTION');
+			if (false === $wpdb->query('START TRANSACTION')) {
+				throw new Exception('Unable to start the application save transaction.');
+			}
 
 			try {
 				if ($record_id) {
@@ -4273,9 +4560,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 
 					$existing_application = $this->get_authorized_application_base($record_id, $user);
-					$existing_status = strtolower(trim((string) $existing_application['status']));
-					$is_preparation_status = in_array($existing_status, array('application in progress', 'profile-preparation', 'profile preparation'), true);
+					$is_preparation_status = 'profile-preparation' === $this->canonical_status_key((string) $existing_application['status']);
 					$is_submitting_prepared_application = 'review' === $mode && ($this->is_agent_user($user) || $this->is_admin_user($user)) && $is_preparation_status;
+					$should_notify_review_submission = $is_submitting_prepared_application && $this->is_agent_user($user);
+					$next_is_test_data = $this->resolve_application_test_data(
+						$draft,
+						$user,
+						$requested_is_test_data,
+						!empty($existing_application['isTestData'])
+					);
 
 					if ('review' === $mode && !$is_submitting_prepared_application) {
 						throw new Exception('Only an agent or administrator can submit an application that is still in preparation.');
@@ -4307,6 +4600,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							tuitionAcknowledged = %d,
 							offerTermsAcknowledged = %d,
 							gdprAcknowledged = %d,
+							isTestData = %d,
 							lastUpdatedByName = %s,
 							updatedAt = CURRENT_TIMESTAMP(3)
 						WHERE id = %s
@@ -4336,6 +4630,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						!empty($draft['tuitionAcknowledged']) ? 1 : 0,
 						!empty($draft['offerTermsAcknowledged']) ? 1 : 0,
 						!empty($draft['gdprAcknowledged']) ? 1 : 0,
+						$next_is_test_data ? 1 : 0,
 						$user['name'],
 						$record_id,
 					);
@@ -4346,13 +4641,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 
 					$updated = $wpdb->query($wpdb->prepare($update_sql, $args));
-
+					if (false === $updated) {
+						throw new Exception('Unable to save the application details.');
+					}
 					if (0 === $updated && $expected_version) {
 						throw new Exception(self::STALE_APPLICATION_ERROR);
 					}
 
 					if ($is_submitting_prepared_application) {
-						$wpdb->update(
+						$status_written = $wpdb->update(
 							$this->applications_table,
 							array(
 								'status' => 'Under review',
@@ -4360,6 +4657,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							),
 							array('id' => $record_id)
 						);
+						if (false === $status_written || 0 === $status_written) {
+							throw new Exception('Unable to submit the application into the review queue.');
+						}
 					}
 
 					$this->sync_document_checklist($record_id, isset($draft['documents']) ? (array) $draft['documents'] : array());
@@ -4395,8 +4695,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 
 					$record_id = wp_generate_uuid4();
+					$should_notify_review_submission = 'review' === $mode && $this->is_agent_user($user);
+					$next_is_test_data = $this->resolve_application_test_data(
+						$draft,
+						$user,
+						$requested_is_test_data
+					);
 
-					$wpdb->insert(
+					$inserted = $wpdb->insert(
 						$this->applications_table,
 						array(
 							'id' => $record_id,
@@ -4427,6 +4733,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'tuitionAcknowledged' => !empty($draft['tuitionAcknowledged']) ? 1 : 0,
 							'offerTermsAcknowledged' => !empty($draft['offerTermsAcknowledged']) ? 1 : 0,
 							'gdprAcknowledged' => !empty($draft['gdprAcknowledged']) ? 1 : 0,
+							'isTestData' => $next_is_test_data ? 1 : 0,
 							'status' => $status,
 							'workflowNote' => $this->workflow_note_for_status($status),
 							'lastUpdatedByName' => $user['name'],
@@ -4435,6 +4742,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'updatedAt' => current_time('mysql', true),
 						)
 					);
+					if (false === $inserted || 0 === $inserted) {
+						throw new Exception('Unable to create the application.');
+					}
 
 					$this->sync_document_checklist($record_id, isset($draft['documents']) ? (array) $draft['documents'] : array());
 
@@ -4449,13 +4759,19 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					);
 				}
 
-				$wpdb->query('COMMIT');
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit the application save transaction.');
+				}
 			} catch (Exception $error) {
 				$wpdb->query('ROLLBACK');
 				throw $error;
 			}
 
 			$application = $this->get_detailed_application_record($record_id);
+
+			if ($this->should_send_review_submission_alert($application, $user, $should_notify_review_submission)) {
+				$this->send_application_activity_alert($application, $user, 'new-application-submitted');
+			}
 
 			return array(
 				'id' => $record_id,
@@ -4730,7 +5046,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				? $this->iso_to_mysql_datetime($expected_updated_at)
 				: null;
 
-			$this->get_authorized_application_base($application_id, $user);
+			$application_before_upload = $this->get_authorized_application_base($application_id, $user);
+			$should_notify_agent_document_upload = $this->should_send_post_submission_agent_document_alert(
+				$application_before_upload,
+				$user
+			);
 
 			if (!isset($this->document_requirements[$document_type])) {
 				throw new Exception('Unknown document type.');
@@ -4881,7 +5201,21 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$this->delete_document_file($existing['storageDriveId'], $existing['storageItemId']);
 			}
 
-			return $this->to_admission_case($this->get_detailed_application_record($application_id));
+			$application = $this->get_detailed_application_record($application_id);
+			if (
+				$should_notify_agent_document_upload
+				&& $this->should_send_post_submission_agent_document_alert($application, $user)
+			) {
+				$this->send_application_activity_alert(
+					$application,
+					$user,
+					'agent-document-uploaded',
+					$document_type,
+					$file_name
+				);
+			}
+
+			return $this->to_admission_case($application);
 		}
 
 		private function normalize_document_assessment_drafts($assessments) {

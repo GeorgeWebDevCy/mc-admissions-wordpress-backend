@@ -669,7 +669,7 @@ account_assert_not_contains('error_log', $epoch_source, 'The global password hoo
 account_assert_not_contains('update_option', $epoch_source, 'The global password hook must store only the numeric per-user epoch.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-account_assert_contains('Version: 0.2.47', $plugin_source, 'The plugin header must advertise version 0.2.47.');
+account_assert_contains('Version: 0.2.48', $plugin_source, 'The plugin header must advertise version 0.2.48.');
 account_assert_contains('GET, POST, PUT, PATCH, OPTIONS', $plugin_source, 'CORS must permit the password route PUT request.');
 
 echo 'Account password tests passed.' . PHP_EOL;
