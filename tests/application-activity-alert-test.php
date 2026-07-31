@@ -505,6 +505,6 @@ alert_assert_not_contains('send_application_activity_alert', $delete_source, 'Do
 alert_assert_not_contains('send_application_activity_alert', $rest_email_source, 'The ordinary /email endpoint must remain independent.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-alert_assert_contains('Version: 0.2.50', $plugin_source, 'The plugin header must advertise version 0.2.50.');
+alert_assert_contains('Version: 0.2.51', $plugin_source, 'The plugin header must advertise version 0.2.51.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;

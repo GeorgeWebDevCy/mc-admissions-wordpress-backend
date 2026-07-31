@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.50
+ * Version: 0.2.51
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -2371,15 +2371,20 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$sent_count,
 					$failed_count
 				);
+			} elseif (!empty($payload['deliverySkipped'])) {
+				$delivery_status = 'Email delivery skipped: ' . ($error ? (string) $error : 'No delivery attempt was made.');
 			} else {
 				$delivery_status = 'Email delivery failed: ' . ($error ? (string) $error : 'WordPress did not accept the message.');
 			}
 
+			$recipient_detail = !empty($payload['recipientLabel'])
+				? 'Recipient: ' . (string) $payload['recipientLabel'] . '.'
+				: 'Recipient roles: ' . implode(', ', (array) $payload['roles']) . '.';
 			$detail = implode(
 				"\n",
 				array(
 					(string) $payload['message'],
-					'Recipient roles: ' . implode(', ', (array) $payload['roles']) . '.',
+					$recipient_detail,
 					$delivery_status,
 				)
 			);
@@ -2480,6 +2485,142 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			return array(
 				'ok' => !empty($sent) && empty($failed),
+				'sent' => $sent,
+				'failed' => $failed,
+				'error' => $error_message,
+			);
+		}
+
+		private function review_rejection_notification_payload($application) {
+			$reference = isset($application['referenceCode']) ? trim((string) $application['referenceCode']) : '';
+			$full_name = isset($application['fullName']) ? trim((string) $application['fullName']) : '';
+			$student_label = $full_name . ' (' . $reference . ')';
+
+			return array(
+				'roles' => array(),
+				'subject' => sanitize_text_field('Application closed after review for ' . $student_label),
+				'message' => 'Admissions review has concluded and the application has been closed as rejected.',
+				'application' => array(
+					'id' => isset($application['id']) ? (string) $application['id'] : null,
+					'referenceCode' => $reference,
+					'fullName' => $full_name,
+				),
+			);
+		}
+
+		private function has_application_email_audit($application_id, $subject) {
+			global $wpdb;
+
+			if (!$this->table_exists($this->communications_table)) {
+				return false;
+			}
+
+			// Count only a confirmed successful delivery in the current review
+			// cycle. Failed or skipped attempts remain retryable, while a later
+			// reopen activity starts a fresh notification cycle.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			return (int) $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(1) FROM {$this->communications_table} communication WHERE communication.applicationId = %s AND communication.direction = 'outbound' AND communication.subject = %s AND LOCATE('Email delivery: sent to ', communication.detail) > 0 AND NOT EXISTS (SELECT 1 FROM {$this->activities_table} activity WHERE activity.applicationId = communication.applicationId AND activity.kind = 'workflow' AND activity.title IN ('Case reopened for review', 'Stage moved to review-pending') AND activity.createdAt > communication.createdAt)",
+					$application_id,
+					$subject
+				)
+			) > 0;
+		}
+
+		private function send_review_rejection_notification($application, $user) {
+			if (!empty($application['isTestData'])) {
+				return array('ok' => false, 'skipped' => true, 'sent' => array(), 'failed' => array());
+			}
+
+			$payload = $this->review_rejection_notification_payload($application);
+			$application_id = isset($application['id']) ? (string) $application['id'] : '';
+
+			if ($this->has_application_email_audit($application_id, $payload['subject'])) {
+				return array('ok' => false, 'skipped' => true, 'duplicate' => true, 'sent' => array(), 'failed' => array());
+			}
+
+			$consultant_email = sanitize_email(
+				isset($application['consultantEmail']) ? (string) $application['consultantEmail'] : ''
+			);
+			$student_email = sanitize_email(
+				isset($application['email']) ? (string) $application['email'] : ''
+			);
+			$consultant_name = $this->trim_to_null(
+				isset($application['consultantName']) ? $application['consultantName'] : null
+			);
+			$agency_name = $this->trim_to_null(
+				isset($application['agencyName']) ? $application['agencyName'] : null
+			);
+			$recipient_name = $consultant_name ? $consultant_name : ($agency_name ? $agency_name : 'Originating consultant');
+			$recipient_label = is_email($consultant_email)
+				? $recipient_name . ' (' . $consultant_email . ')'
+				: $recipient_name;
+			$payload['recipientLabel'] = $recipient_label;
+			$sent = array();
+			$failed = array();
+			$error_message = null;
+			$is_student_email = is_email($student_email) && strtolower($student_email) === strtolower($consultant_email);
+
+			if (!is_email($consultant_email)) {
+				$payload['deliverySkipped'] = true;
+				$error_message = 'No valid originating consultant email is recorded.';
+			} elseif ($is_student_email) {
+				$payload['deliverySkipped'] = true;
+				$error_message = 'The consultant email matches the student email, so delivery was skipped.';
+			} else {
+				$recipient = array(
+					'email' => $consultant_email,
+					'name' => $recipient_name,
+					'role' => 'originating-consultant',
+				);
+				$headers = array('Content-Type: text/html; charset=UTF-8');
+				if (
+					$this->can_view_all_applications($user)
+					&& !empty($user['email'])
+					&& is_email($user['email'])
+				) {
+					$headers[] = sprintf(
+						'Reply-To: %s <%s>',
+						$this->sanitize_mail_header_name($user['name']),
+						sanitize_email($user['email'])
+					);
+				}
+
+				try {
+					$delivered = wp_mail(
+						array($consultant_email),
+						$payload['subject'],
+						$this->build_email_message($payload['message'], $payload['application']),
+						$headers
+					);
+				} catch (Throwable $mail_error) {
+					$delivered = false;
+					$error_message = $mail_error->getMessage();
+				}
+
+				if ($delivered) {
+					$sent[] = $recipient;
+				} else {
+					$failed[] = $recipient;
+					if (!$error_message) {
+						$error_message = 'WordPress did not accept the message.';
+					}
+				}
+			}
+
+			$this->record_application_activity_alert(
+				$application_id,
+				$user,
+				$payload,
+				$sent,
+				$failed,
+				$error_message
+			);
+
+			return array(
+				'ok' => !empty($sent) && empty($failed),
+				'skipped' => empty($sent) && empty($failed),
 				'sent' => $sent,
 				'failed' => $failed,
 				'error' => $error_message,
@@ -3355,6 +3496,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			if (empty($params['draft'])) {
 				return $this->json_error_response('Operations payload is required.', 400);
+			}
+			if (!isset($params['expectedUpdatedAt']) || '' === trim((string) $params['expectedUpdatedAt'])) {
+				return $this->json_error_response('Application version is required.', 400);
 			}
 
 			try {
@@ -5475,6 +5619,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$user = $params['user'];
 			$application_id = $params['applicationId'];
 			$expected_version = $this->iso_to_mysql_datetime($params['expectedUpdatedAt']);
+			if (!$expected_version) {
+				throw new Exception('Application version is required.');
+			}
 			$existing = $wpdb->get_row(
 				$wpdb->prepare("SELECT * FROM {$this->applications_table} WHERE id = %s LIMIT 1", $application_id),
 				ARRAY_A
@@ -5490,10 +5637,38 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			$this->assert_operations_patch_authorized($draft, $user);
-			$normalized = $this->normalize_operations_draft($draft, $this->normalize_status($existing['status']));
+			if (
+				array_key_exists('reviewerDecision', $draft)
+				&& !in_array($draft['reviewerDecision'], $this->reviewer_decisions, true)
+			) {
+				throw new Exception('Invalid reviewer decision.');
+			}
+			$existing_status = $this->canonical_status_key((string) $existing['status']);
+			$normalized = $this->normalize_operations_draft($draft, $existing_status);
+			$next_reviewer_decision = array_key_exists('reviewerDecision', $normalized)
+				? (string) $normalized['reviewerDecision']
+				: (string) $existing['reviewerDecision'];
+			$next_status = $existing_status;
 
-			$set_parts = array();
-			$args = array();
+			if ('review-pending' === $existing_status && 'rejected' === $next_reviewer_decision) {
+				$next_status = 'rejected';
+				if (!array_key_exists('workflowNote', $draft)) {
+					$normalized['workflowNote'] = $this->workflow_note_for_status('rejected');
+				}
+			} elseif (
+				'rejected' === $existing_status
+				&& array_key_exists('reviewerDecision', $draft)
+				&& 'rejected' !== $next_reviewer_decision
+			) {
+				$next_status = 'review-pending';
+				if (!array_key_exists('workflowNote', $draft)) {
+					$normalized['workflowNote'] = 'Application has been submitted and is waiting for admissions assessment and document verification.';
+				}
+			}
+			$status_changed = $next_status !== $existing_status;
+
+			$set_parts = array('status = %s');
+			$args = array($next_status);
 			foreach ($this->application_operations_column_map() as $field => $definition) {
 				if (!array_key_exists($field, $normalized)) {
 					continue;
@@ -5515,6 +5690,23 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if ($expected_version) {
 				$update_sql .= " AND updatedAt = %s";
 				$args[] = $expected_version;
+			}
+
+			$detail_parts = array();
+			if ((string) $existing['reviewerDecision'] !== $next_reviewer_decision) {
+				$detail_parts[] = 'review ' . $existing['reviewerDecision'] . ' -> ' . $next_reviewer_decision;
+			}
+			if ($status_changed) {
+				$detail_parts[] = 'stage ' . $existing_status . ' -> ' . $next_status;
+			}
+			if (array_key_exists('paymentStatus', $normalized) && $existing['paymentStatus'] !== $normalized['paymentStatus']) {
+				$detail_parts[] = 'payment ' . $existing['paymentStatus'] . ' -> ' . $normalized['paymentStatus'];
+			}
+			if (array_key_exists('permitStatus', $normalized) && $existing['permitStatus'] !== $normalized['permitStatus']) {
+				$detail_parts[] = 'permit ' . $existing['permitStatus'] . ' -> ' . $normalized['permitStatus'];
+			}
+			if (array_key_exists('enrollmentStatus', $normalized) && $existing['enrollmentStatus'] !== $normalized['enrollmentStatus']) {
+				$detail_parts[] = 'enrollment ' . $existing['enrollmentStatus'] . ' -> ' . $normalized['enrollmentStatus'];
 			}
 
 			if (false === $wpdb->query('START TRANSACTION')) {
@@ -5547,6 +5739,43 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'refund'
 				);
 
+				$written_state = $wpdb->get_row(
+					$wpdb->prepare(
+						"SELECT status, reviewerDecision, workflowNote FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+						$application_id
+					),
+					ARRAY_A
+				);
+				if (
+					!$written_state
+					|| $next_status !== $this->canonical_status_key((string) $written_state['status'])
+					|| $next_reviewer_decision !== (string) $written_state['reviewerDecision']
+				) {
+					throw new Exception('The application review outcome was not saved. Refresh and try again.');
+				}
+
+				if ($status_changed) {
+					$this->create_required_activity(
+						$application_id,
+						$user,
+						'workflow',
+						'rejected' === $next_status ? 'Case closed as rejected' : 'Case reopened for review',
+						!empty($normalized['reviewSummary'])
+							? $normalized['reviewSummary']
+							: (isset($normalized['workflowNote']) ? $normalized['workflowNote'] : $existing['workflowNote']),
+						'Unable to record the review workflow activity.'
+					);
+				}
+
+				$this->create_required_activity(
+					$application_id,
+					$user,
+					'operations',
+					'Operational details updated',
+					!empty($detail_parts) ? implode(', ', $detail_parts) : 'Review, offer, finance, permit, or enrollment fields were updated.',
+					'Unable to record the operational update activity.'
+				);
+
 				if (false === $wpdb->query('COMMIT')) {
 					throw new Exception('Unable to commit the application update.');
 				}
@@ -5556,26 +5785,34 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw $write_error;
 			}
 
-			$detail_parts = array();
-			if (array_key_exists('paymentStatus', $normalized) && $existing['paymentStatus'] !== $normalized['paymentStatus']) {
-				$detail_parts[] = 'payment ' . $existing['paymentStatus'] . ' -> ' . $normalized['paymentStatus'];
-			}
-			if (array_key_exists('permitStatus', $normalized) && $existing['permitStatus'] !== $normalized['permitStatus']) {
-				$detail_parts[] = 'permit ' . $existing['permitStatus'] . ' -> ' . $normalized['permitStatus'];
-			}
-			if (array_key_exists('enrollmentStatus', $normalized) && $existing['enrollmentStatus'] !== $normalized['enrollmentStatus']) {
-				$detail_parts[] = 'enrollment ' . $existing['enrollmentStatus'] . ' -> ' . $normalized['enrollmentStatus'];
-			}
-
-			$this->create_activity(
-				$application_id,
-				$user,
-				'operations',
-				'Operational details updated',
-				!empty($detail_parts) ? implode(', ', $detail_parts) : 'Review, offer, finance, permit, or enrollment fields were updated.'
+			$authoritative_review = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT id, referenceCode, fullName, email, agencyName, consultantName, consultantEmail, isTestData, status, reviewerDecision FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+					$application_id
+				),
+				ARRAY_A
 			);
+			if (
+				!$authoritative_review
+				|| $next_status !== $this->canonical_status_key((string) $authoritative_review['status'])
+				|| $next_reviewer_decision !== (string) $authoritative_review['reviewerDecision']
+			) {
+				throw new Exception('The application review outcome was not saved. Refresh and try again.');
+			}
 
-			return $this->to_admission_case($this->get_detailed_application_record($application_id));
+			if ('rejected' === $next_status && 'rejected' === $next_reviewer_decision) {
+				$this->send_review_rejection_notification($authoritative_review, $user);
+			}
+
+			$application = $this->get_detailed_application_record($application_id);
+			if (
+				$next_status !== $this->canonical_status_key((string) $application['status'])
+				|| $next_reviewer_decision !== (string) $application['reviewerDecision']
+			) {
+				throw new Exception('The application review outcome was not saved. Refresh and try again.');
+			}
+
+			return $this->to_admission_case($application);
 		}
 
 		private function upload_admission_document($params) {
