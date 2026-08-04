@@ -320,8 +320,8 @@ $internal_user = array(
 
 $preparation_application = array_merge($application, array('status' => 'profile-preparation'));
 alert_assert_same(true, $draft_creation_gate->invoke($plugin, $preparation_application, $agent, true), 'A newly created external-agent draft must alert staff.');
-alert_assert_same(false, $draft_creation_gate->invoke($plugin, $preparation_application, $internal_user, true), 'An internally created draft must not masquerade as an incoming agent draft.');
-alert_assert_same(false, $draft_creation_gate->invoke($plugin, $preparation_application, $dual_role_internal, true), 'A dual-role internal draft must not masquerade as an incoming agent draft.');
+alert_assert_same(true, $draft_creation_gate->invoke($plugin, $preparation_application, $internal_user, true), 'A newly created internal draft must alert the fixed staff watchers.');
+alert_assert_same(true, $draft_creation_gate->invoke($plugin, $preparation_application, $dual_role_internal, true), 'A newly created dual-role draft must alert the fixed staff watchers.');
 alert_assert_same(false, $draft_creation_gate->invoke($plugin, $application, $agent, true), 'A non-preparation application must not emit the draft-created alert.');
 alert_assert_same(false, $draft_creation_gate->invoke($plugin, array_merge($preparation_application, array('isTestData' => 1)), $agent, true), 'A test draft must remain silent.');
 alert_assert_same(false, $draft_creation_gate->invoke($plugin, $preparation_application, $agent, false), 'A later draft save must not repeat the first-creation alert.');
@@ -406,6 +406,7 @@ alert_assert_same(
 );
 alert_assert_contains('New application started:', $draft_payload['subject'], 'Draft-created alerts must be distinguishable from submitted applications.');
 alert_assert_contains('incomplete', $draft_payload['message'], 'The draft-created alert must clearly state that the case is incomplete.');
+alert_assert_not_contains('started by an agent', $draft_payload['message'], 'The draft-created alert must describe internal and external creators accurately.');
 alert_assert_contains('not yet been submitted for review', $draft_payload['message'], 'The draft-created alert must not imply that review can begin.');
 
 $bank_payload = $payload_method->invoke(
@@ -427,6 +428,14 @@ $draft_result = $send->invoke($plugin, $preparation_application, $agent, 'new-ap
 alert_assert_same(true, $draft_result['ok'], 'A fully delivered first-draft alert must succeed.');
 alert_assert_same(4, count(alert_mail_addresses()), 'The first-draft alert must use the same deduplicated staff watcher set.');
 alert_assert_same(2, count($GLOBALS['wpdb']->insert_calls), 'First-draft delivery must write one communication and one activity audit.');
+
+alert_reset_side_effects();
+$internal_draft_result = $send->invoke($plugin, $preparation_application, $internal_user, 'new-application-created');
+$internal_draft_addresses = alert_mail_addresses();
+alert_assert_same(true, $internal_draft_result['ok'], 'A fully delivered internal-created first-draft alert must succeed.');
+alert_assert_same(4, count($internal_draft_addresses), 'An internal-created first draft must reach the same deduplicated staff watcher set.');
+alert_assert_same(true, in_array('admin@example.test', $internal_draft_addresses, true), 'The administrator watcher must still receive an administrator-created first-draft alert.');
+alert_assert_same(2, count($GLOBALS['wpdb']->insert_calls), 'Internal-created first-draft delivery must write one communication and one activity audit.');
 
 alert_reset_side_effects();
 $submission_result = $send->invoke($plugin, $application, $agent, 'new-application-submitted');
@@ -529,11 +538,11 @@ alert_assert_same(
 	'The review-submission email must be attempted only after the application transaction commits.'
 );
 alert_assert_contains("\$should_notify_review_submission = 'review' === \$mode && \$this->is_external_agent_user(\$user)", $save_source, 'Draft and internal creation must not set the submission alert gate.');
-alert_assert_contains("\$should_notify_draft_creation = 'draft' === \$mode && \$this->is_external_agent_user(\$user)", $save_source, 'Only a new external-agent draft may set the first-creation alert gate.');
-alert_assert_same(1, substr_count($save_source, "\$should_notify_draft_creation = 'draft' === \$mode && \$this->is_external_agent_user(\$user)"), 'The first-draft alert gate must be assigned in exactly one new-record path.');
+alert_assert_contains("\$should_notify_draft_creation = 'draft' === \$mode", $save_source, 'Every new draft may set the first-creation alert gate regardless of creator role.');
+alert_assert_same(1, substr_count($save_source, "\$should_notify_draft_creation = 'draft' === \$mode"), 'The first-draft alert gate must be assigned in exactly one new-record path.');
 alert_assert_same(
 	true,
-	strpos($save_source, '$record_id = wp_generate_uuid4();') < strpos($save_source, "\$should_notify_draft_creation = 'draft' === \$mode && \$this->is_external_agent_user(\$user)"),
+	strpos($save_source, '$record_id = wp_generate_uuid4();') < strpos($save_source, "\$should_notify_draft_creation = 'draft' === \$mode"),
 	'The first-draft alert gate must only be set after the save path has entered new-record creation.'
 );
 alert_assert_contains('should_send_draft_creation_alert', $save_source, 'Draft creation must be rechecked against authoritative post-commit state.');
@@ -550,6 +559,6 @@ alert_assert_not_contains('send_application_activity_alert', $delete_source, 'Do
 alert_assert_not_contains('send_application_activity_alert', $rest_email_source, 'The ordinary /email endpoint must remain independent.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-alert_assert_contains('Version: 0.2.52', $plugin_source, 'The plugin header must advertise version 0.2.52.');
+alert_assert_contains('Version: 0.2.53', $plugin_source, 'The plugin header must advertise version 0.2.53.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;

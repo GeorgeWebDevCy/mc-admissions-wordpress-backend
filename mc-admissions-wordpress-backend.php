@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.52
+ * Version: 0.2.53
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -2295,7 +2295,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function should_send_draft_creation_alert($application, $user, $was_created_as_draft) {
 			return (bool) $was_created_as_draft
-				&& $this->is_external_agent_user($user)
 				&& empty($application['isTestData'])
 				&& 'profile-preparation' === $this->canonical_status_key(isset($application['status']) ? (string) $application['status'] : '');
 		}
@@ -2326,7 +2325,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$message = implode(
 					"\n",
 					array(
-						'A new incomplete application was started by an agent.',
+						'A new incomplete application was started.',
 						'Started by: ' . $actor_name . '.',
 						'The application has not yet been submitted for review.',
 						'Please open MC Admissions if you need to monitor its progress.',
@@ -5405,7 +5404,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 					$record_id = wp_generate_uuid4();
 					$should_notify_review_submission = 'review' === $mode && $this->is_external_agent_user($user);
-					$should_notify_draft_creation = 'draft' === $mode && $this->is_external_agent_user($user);
+					$should_notify_draft_creation = 'draft' === $mode;
 					$next_is_test_data = $this->resolve_application_test_data(
 						$draft,
 						$user,
