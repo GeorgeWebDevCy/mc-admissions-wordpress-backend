@@ -341,6 +341,7 @@ $first_query = $wpdb->prepared_calls[count($wpdb->prepared_calls) - 1];
 notification_assert_contains('COALESCE(app.isTestData, 0) = 0', $first_query['query'], 'Test applications must be excluded in SQL before pagination.');
 notification_assert_contains("'workflow', 'agent-document-upload'", $first_query['query'], 'Only submitted applications and durable post-submission agent uploads may enter the sound feed.');
 notification_assert_not_contains("'application'", $first_query['query'], 'Agent draft creation and field corrections must stay out of the sound feed.');
+notification_assert_not_contains("'communication'", $first_query['query'], 'Draft email audit rows must not create a duplicate sound notification.');
 notification_assert_not_contains("'document'", $first_query['query'], 'Ordinary document timeline rows must stay out of the sound feed.');
 notification_assert_not_contains('app.status', $first_query['query'], 'Polling must use the event-time marker, not the application current stage.');
 notification_assert_contains('ORDER BY activity.createdAt ASC, activity.id ASC', $first_query['query'], 'Timestamp ties must have a deterministic ID order.');
@@ -429,7 +430,7 @@ notification_assert_not_contains('$this->create_activity(', $save_source, 'Appli
 notification_assert_not_contains('$this->create_activity(', $upload_source, 'Document uploads must not use unchecked event inserts.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-notification_assert_contains('Version: 0.2.51', $plugin_source, 'The plugin header must advertise version 0.2.51.');
+notification_assert_contains('Version: 0.2.52', $plugin_source, 'The plugin header must advertise version 0.2.52.');
 notification_assert_same(0, $GLOBALS['mc_notification_event_mail_calls'], 'Offline event tests must never call wp_mail.');
 notification_assert_same(0, $GLOBALS['mc_notification_event_network_calls'], 'Offline event tests must never access the network.');
 

@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.51
+ * Version: 0.2.52
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -2293,6 +2293,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				&& 'review-pending' === $this->canonical_status_key(isset($application['status']) ? (string) $application['status'] : '');
 		}
 
+		private function should_send_draft_creation_alert($application, $user, $was_created_as_draft) {
+			return (bool) $was_created_as_draft
+				&& $this->is_external_agent_user($user)
+				&& empty($application['isTestData'])
+				&& 'profile-preparation' === $this->canonical_status_key(isset($application['status']) ? (string) $application['status'] : '');
+		}
+
 		private function should_send_post_submission_agent_document_alert($application, $user) {
 			if (!$this->is_external_agent_user($user) || !empty($application['isTestData'])) {
 				return false;
@@ -2314,7 +2321,18 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$roles[] = 'finance-officer';
 			}
 
-			if ('new-application-submitted' === $event_type) {
+			if ('new-application-created' === $event_type) {
+				$subject = sanitize_text_field('New application started: ' . $student_label);
+				$message = implode(
+					"\n",
+					array(
+						'A new incomplete application was started by an agent.',
+						'Started by: ' . $actor_name . '.',
+						'The application has not yet been submitted for review.',
+						'Please open MC Admissions if you need to monitor its progress.',
+					)
+				);
+			} elseif ('new-application-submitted' === $event_type) {
 				$subject = sanitize_text_field('New application submitted: ' . $student_label);
 				$message = implode(
 					"\n",
@@ -5237,6 +5255,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				? (bool) $params['isTestData']
 				: null;
 			$should_notify_review_submission = false;
+			$should_notify_draft_creation = false;
 
 			if (false === $wpdb->query('START TRANSACTION')) {
 				throw new Exception('Unable to start the application save transaction.');
@@ -5386,6 +5405,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 					$record_id = wp_generate_uuid4();
 					$should_notify_review_submission = 'review' === $mode && $this->is_external_agent_user($user);
+					$should_notify_draft_creation = 'draft' === $mode && $this->is_external_agent_user($user);
 					$next_is_test_data = $this->resolve_application_test_data(
 						$draft,
 						$user,
@@ -5459,6 +5479,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			$application = $this->get_detailed_application_record($record_id);
+
+			if ($this->should_send_draft_creation_alert($application, $user, $should_notify_draft_creation)) {
+				$this->send_application_activity_alert($application, $user, 'new-application-created');
+			}
 
 			if ($this->should_send_review_submission_alert($application, $user, $should_notify_review_submission)) {
 				$this->send_application_activity_alert($application, $user, 'new-application-submitted');
