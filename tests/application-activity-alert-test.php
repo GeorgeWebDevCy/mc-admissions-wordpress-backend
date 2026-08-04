@@ -277,6 +277,8 @@ function alert_method_source($reflection, $method_name) {
 
 $plugin = mc_admissions_wordpress_backend();
 $reflection = new ReflectionClass($plugin);
+$draft_creation_gate = $reflection->getMethod('should_send_draft_creation_alert');
+$draft_creation_gate->setAccessible(true);
 $review_gate = $reflection->getMethod('should_send_review_submission_alert');
 $review_gate->setAccessible(true);
 $gate = $reflection->getMethod('should_send_post_submission_agent_document_alert');
@@ -315,6 +317,14 @@ $internal_user = array(
 	'email' => 'admin@example.test',
 	'roles' => array('administrator'),
 );
+
+$preparation_application = array_merge($application, array('status' => 'profile-preparation'));
+alert_assert_same(true, $draft_creation_gate->invoke($plugin, $preparation_application, $agent, true), 'A newly created external-agent draft must alert staff.');
+alert_assert_same(false, $draft_creation_gate->invoke($plugin, $preparation_application, $internal_user, true), 'An internally created draft must not masquerade as an incoming agent draft.');
+alert_assert_same(false, $draft_creation_gate->invoke($plugin, $preparation_application, $dual_role_internal, true), 'A dual-role internal draft must not masquerade as an incoming agent draft.');
+alert_assert_same(false, $draft_creation_gate->invoke($plugin, $application, $agent, true), 'A non-preparation application must not emit the draft-created alert.');
+alert_assert_same(false, $draft_creation_gate->invoke($plugin, array_merge($preparation_application, array('isTestData' => 1)), $agent, true), 'A test draft must remain silent.');
+alert_assert_same(false, $draft_creation_gate->invoke($plugin, $preparation_application, $agent, false), 'A later draft save must not repeat the first-creation alert.');
 
 alert_assert_same(true, $review_gate->invoke($plugin, $application, $agent, true), 'An authoritative agent submission in review must alert.');
 alert_assert_same(false, $review_gate->invoke($plugin, $application, $internal_user, true), 'An internal submission must not masquerade as an incoming agent application.');
@@ -388,6 +398,16 @@ alert_assert_same(
 );
 alert_assert_same('president@mesoyios.ac.cy', $submission_payload['to'][0]['email'], 'The President recipient must be explicit.');
 
+$draft_payload = $payload_method->invoke($plugin, $preparation_application, $agent, 'new-application-created');
+alert_assert_same(
+	array('administrator', 'admissions-officer', 'immigration-officer'),
+	$draft_payload['roles'],
+	'Draft-created alerts must target the same fixed staff watcher roles.'
+);
+alert_assert_contains('New application started:', $draft_payload['subject'], 'Draft-created alerts must be distinguishable from submitted applications.');
+alert_assert_contains('incomplete', $draft_payload['message'], 'The draft-created alert must clearly state that the case is incomplete.');
+alert_assert_contains('not yet been submitted for review', $draft_payload['message'], 'The draft-created alert must not imply that review can begin.');
+
 $bank_payload = $payload_method->invoke(
 	$plugin,
 	$application,
@@ -401,6 +421,12 @@ alert_assert_same(
 	$bank_payload['roles'],
 	'Bank confirmation alerts must add Finance to the same delivery.'
 );
+
+alert_reset_side_effects();
+$draft_result = $send->invoke($plugin, $preparation_application, $agent, 'new-application-created');
+alert_assert_same(true, $draft_result['ok'], 'A fully delivered first-draft alert must succeed.');
+alert_assert_same(4, count(alert_mail_addresses()), 'The first-draft alert must use the same deduplicated staff watcher set.');
+alert_assert_same(2, count($GLOBALS['wpdb']->insert_calls), 'First-draft delivery must write one communication and one activity audit.');
 
 alert_reset_side_effects();
 $submission_result = $send->invoke($plugin, $application, $agent, 'new-application-submitted');
@@ -489,10 +515,29 @@ alert_assert_contains('false === $status_written || 0 === $status_written', $sav
 alert_assert_contains("false === \$wpdb->query('COMMIT')", $save_source, 'The application save COMMIT must be checked.');
 alert_assert_same(
 	true,
-	strpos($save_source, '$wpdb->query(\'COMMIT\')') < strpos($save_source, '$this->send_application_activity_alert('),
-	'Submission email must be attempted only after the application transaction commits.'
+	strpos($save_source, '$wpdb->query(\'COMMIT\')') < strrpos($save_source, '$this->send_application_activity_alert('),
+	'Every draft-creation and submission email must be attempted only after the application transaction commits.'
+);
+alert_assert_same(
+	true,
+	strpos($save_source, '$wpdb->query(\'COMMIT\')') < strpos($save_source, "'new-application-created'"),
+	'The first-draft email must be attempted only after the application transaction commits.'
+);
+alert_assert_same(
+	true,
+	strpos($save_source, '$wpdb->query(\'COMMIT\')') < strpos($save_source, "'new-application-submitted'"),
+	'The review-submission email must be attempted only after the application transaction commits.'
 );
 alert_assert_contains("\$should_notify_review_submission = 'review' === \$mode && \$this->is_external_agent_user(\$user)", $save_source, 'Draft and internal creation must not set the submission alert gate.');
+alert_assert_contains("\$should_notify_draft_creation = 'draft' === \$mode && \$this->is_external_agent_user(\$user)", $save_source, 'Only a new external-agent draft may set the first-creation alert gate.');
+alert_assert_same(1, substr_count($save_source, "\$should_notify_draft_creation = 'draft' === \$mode && \$this->is_external_agent_user(\$user)"), 'The first-draft alert gate must be assigned in exactly one new-record path.');
+alert_assert_same(
+	true,
+	strpos($save_source, '$record_id = wp_generate_uuid4();') < strpos($save_source, "\$should_notify_draft_creation = 'draft' === \$mode && \$this->is_external_agent_user(\$user)"),
+	'The first-draft alert gate must only be set after the save path has entered new-record creation.'
+);
+alert_assert_contains('should_send_draft_creation_alert', $save_source, 'Draft creation must be rechecked against authoritative post-commit state.');
+alert_assert_contains("'new-application-created'", $save_source, 'The post-commit save path must emit the distinct first-draft event.');
 alert_assert_same(
 	true,
 	strpos($upload_source, '$wpdb->query(\'COMMIT\')') < strpos($upload_source, '$this->send_application_activity_alert('),
@@ -505,6 +550,6 @@ alert_assert_not_contains('send_application_activity_alert', $delete_source, 'Do
 alert_assert_not_contains('send_application_activity_alert', $rest_email_source, 'The ordinary /email endpoint must remain independent.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-alert_assert_contains('Version: 0.2.51', $plugin_source, 'The plugin header must advertise version 0.2.51.');
+alert_assert_contains('Version: 0.2.52', $plugin_source, 'The plugin header must advertise version 0.2.52.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;
