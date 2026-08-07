@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.53
+ * Version: 0.2.54
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -1143,6 +1143,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				array(
 					'methods' => WP_REST_Server::READABLE,
 					'callback' => array($this, 'rest_download_document_file'),
+					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
+				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/letters',
+				array(
+					'methods' => WP_REST_Server::CREATABLE,
+					'callback' => array($this, 'rest_generate_admission_letter'),
 					'permission_callback' => array($this, 'permission_authenticated'),
 				)
 			);
@@ -3715,6 +3725,35 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		public function rest_generate_admission_letter(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+
+			if (!is_array($params) || empty($params['generated']) || !is_array($params['generated'])) {
+				return $this->json_error_response('Generated letter payload is required.', 400);
+			}
+
+			try {
+				$user = $this->current_session_user();
+				$result = $this->persist_generated_admission_letter(
+					(string) $request['application_id'],
+					(array) $params['generated'],
+					$user
+				);
+
+				return new WP_REST_Response(
+					array(
+						'ok' => true,
+						'application' => $result['application'],
+						'letter' => $result['letter'],
+					),
+					200
+				);
+			} catch (Exception $error) {
+				$status = false !== stripos($error->getMessage(), 'permission') ? 403 : 400;
+				return $this->json_error_response($error->getMessage(), $status);
+			}
+		}
+
 		private function posted_setting($key, $fallback = '') {
 			if (!isset($_POST[$key])) {
 				return $fallback;
@@ -4515,6 +4554,211 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			return $application;
+		}
+
+		private function persist_generated_admission_letter($application_id, $generated, $user) {
+			global $wpdb;
+
+			$application_id = sanitize_text_field((string) $application_id);
+			$this->get_authorized_application_base($application_id, $user);
+
+			if (!$this->is_admin_user($user) && !$this->user_has_any_role($user, array('admissions-officer'))) {
+				throw new Exception('You do not have permission to generate an offer letter.');
+			}
+
+			$application = $this->get_detailed_application_record($application_id);
+			$template_id = isset($generated['templateId']) ? sanitize_key((string) $generated['templateId']) : '';
+			if ('offer-letter' !== $template_id) {
+				throw new Exception('Mobile web generation currently supports the Offer Letter only.');
+			}
+
+			$reviewer_decision = isset($application['reviewerDecision']) ? (string) $application['reviewerDecision'] : 'pending';
+			if (!in_array($reviewer_decision, array('academically-cleared', 'conditional-offer'), true)) {
+				throw new Exception('Record a cleared or conditional review decision first.');
+			}
+			if (empty($application['classesStartDate'])) {
+				throw new Exception('Set the classes start date in operations first.');
+			}
+			if (empty($application['tuitionFeeFirstYear'])) {
+				throw new Exception('Set the first-year tuition fee before generating the offer.');
+			}
+
+			$content_base64 = isset($generated['contentBase64']) ? (string) $generated['contentBase64'] : '';
+			$content = base64_decode($content_base64, true);
+			if (false === $content || strlen($content) < 5 || '%PDF-' !== substr($content, 0, 5)) {
+				throw new Exception('Generated Offer Letter PDF is invalid.');
+			}
+			if (strlen($content) > 15 * 1024 * 1024) {
+				throw new Exception('Generated Offer Letter PDF exceeds the 15 MB limit.');
+			}
+
+			$template_label = 'Offer letter';
+			$template_version = isset($generated['templateVersion'])
+				? sanitize_text_field((string) $generated['templateVersion'])
+				: '';
+			$file_name = isset($generated['fileName']) ? sanitize_file_name((string) $generated['fileName']) : '';
+			if ('' === $template_version || '' === $file_name || 'pdf' !== strtolower((string) ($generated['outputFormat'] ?? ''))) {
+				throw new Exception('Generated Offer Letter metadata is incomplete.');
+			}
+			$input_snapshot = wp_json_encode(isset($generated['inputSnapshot']) ? $generated['inputSnapshot'] : array());
+			if (false === $input_snapshot) {
+				throw new Exception('Generated Offer Letter input snapshot is invalid.');
+			}
+
+			$letter_id = wp_generate_uuid4();
+			if (false === $wpdb->query('START TRANSACTION')) {
+				throw new Exception('Unable to start Offer Letter generation.');
+			}
+
+			try {
+				$letter_written = $wpdb->insert(
+					'mc_generated_letters',
+					array(
+						'id' => $letter_id,
+						'applicationId' => $application_id,
+						'templateId' => $template_id,
+						'templateLabel' => $template_label,
+						'templateVersion' => $template_version,
+						'stageKeySnapshot' => (string) $application['status'],
+						'fileName' => $file_name,
+						'outputFormat' => 'pdf',
+						'renderedHtml' => $content_base64,
+						'inputSnapshot' => $input_snapshot,
+						'generatedByName' => $user['name'],
+					),
+					array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
+				);
+				if (false === $letter_written || 0 === $letter_written) {
+					throw new Exception('Unable to save the generated Offer Letter.');
+				}
+
+				$application_written = $wpdb->query(
+					$wpdb->prepare(
+						"UPDATE {$this->applications_table} SET lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3) WHERE id = %s",
+						$user['name'],
+						$application_id
+					)
+				);
+				if (false === $application_written || 0 === $application_written) {
+					throw new Exception('Unable to update the application after Offer Letter generation.');
+				}
+
+				$this->create_required_activity(
+					$application_id,
+					$user,
+					'letter',
+					'Offer letter generated',
+					$file_name . ' created from template version ' . $template_version . '.',
+					'Unable to record the Offer Letter activity.'
+				);
+
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit Offer Letter generation.');
+				}
+			} catch (Exception $error) {
+				$wpdb->query('ROLLBACK');
+				throw $error;
+			}
+
+			$this->send_generated_offer_letter_email($application, $user, $file_name, $content_base64);
+
+			$refreshed = $this->get_detailed_application_record($application_id);
+			$saved_letter = null;
+			foreach ((array) $refreshed['generatedLetters'] as $letter) {
+				if ((string) $letter['id'] === $letter_id) {
+					$saved_letter = $letter;
+					break;
+				}
+			}
+			if (!$saved_letter) {
+				throw new Exception('Generated Offer Letter could not be reloaded.');
+			}
+
+			return array(
+				'application' => $this->to_admission_case($refreshed),
+				'letter' => $this->map_generated_letter($saved_letter),
+			);
+		}
+
+		private function send_generated_offer_letter_email($application, $user, $file_name, $content_base64) {
+			global $wpdb;
+
+			$application_id = (string) $application['id'];
+			$reference = !empty($application['referenceCode']) ? (string) $application['referenceCode'] : $application_id;
+			$full_name = !empty($application['fullName']) ? (string) $application['fullName'] : 'Applicant';
+			$subject = 'Offer letter for ' . $full_name . ' (' . $reference . ')';
+			$message = "An official offer letter has been generated for {$full_name}.\nApplication reference: {$reference}.\nThe generated document is attached.";
+			$to = array();
+			if (!empty($application['consultantEmail'])) {
+				$to[] = array('email' => $application['consultantEmail'], 'name' => $application['consultantName'] ?? $application['agencyName'] ?? null);
+			} elseif (!empty($application['wordpressEmail'])) {
+				$to[] = array('email' => $application['wordpressEmail'], 'name' => $application['consultantName'] ?? $application['agencyName'] ?? null);
+			}
+			$to[] = array('email' => self::PRESIDENT_ACTIVITY_ALERT_EMAIL, 'name' => self::PRESIDENT_ACTIVITY_ALERT_NAME);
+			$payload = array('to' => $to);
+			$sent = array();
+			$failed = array();
+			$error_message = null;
+			$attachments = array();
+
+			if (empty($application['isTestData'])) {
+				try {
+					$recipients = $this->resolve_email_recipients($payload);
+					$attachments = $this->create_email_attachments(array(array('fileName' => $file_name, 'contentBase64' => $content_base64)));
+					$headers = array('Content-Type: text/html; charset=UTF-8');
+					if (!empty($user['email']) && is_email($user['email'])) {
+						$headers[] = sprintf('Reply-To: %s <%s>', $this->sanitize_mail_header_name($user['name']), $user['email']);
+					}
+					$html_message = $this->build_email_message($message, array('referenceCode' => $reference, 'fullName' => $full_name));
+					foreach ($recipients as $recipient) {
+						if (wp_mail(array($recipient['email']), $subject, $html_message, $headers, $attachments)) {
+							$sent[] = $recipient;
+						} else {
+							$failed[] = $recipient;
+						}
+					}
+				} catch (Throwable $error) {
+					$error_message = $error->getMessage();
+				} finally {
+					$this->delete_temp_files($attachments);
+				}
+			} else {
+				$error_message = 'Test-data application; email delivery disabled.';
+			}
+
+			if (!empty($sent) && empty($failed)) {
+				$delivery_status = 'Email delivery: sent to ' . count($sent) . ' recipient(s).';
+			} elseif (!empty($sent)) {
+				$delivery_status = 'Email delivery: partially sent to ' . count($sent) . ' recipient(s); ' . count($failed) . ' failed.';
+			} elseif (!empty($application['isTestData'])) {
+				$delivery_status = 'Email delivery skipped: ' . $error_message;
+			} else {
+				$delivery_status = 'Email delivery failed: ' . ($error_message ?: 'WordPress did not accept the message.');
+			}
+
+			if ($this->table_exists($this->communications_table)) {
+				$wpdb->insert(
+					$this->communications_table,
+					array(
+						'id' => wp_generate_uuid4(),
+						'applicationId' => $application_id,
+						'direction' => 'outbound',
+						'channel' => 'email',
+						'subject' => $subject,
+						'detail' => $message . "\nRecipients: " . count($sent) . " sent, " . count($failed) . " failed.\n" . $delivery_status,
+						'actorName' => $user['name'],
+						'createdAt' => current_time('mysql', true),
+					),
+					array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
+				);
+			}
+			$this->create_activity(
+				$application_id,
+				$user,
+				'communication',
+				!empty($sent) ? 'Offer letter emailed' : 'Offer letter email delivery not completed',
+				$delivery_status
+			);
 		}
 
 		private function get_detailed_application_record($application_id) {
