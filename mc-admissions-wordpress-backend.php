@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.54
+ * Version: 0.2.55
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -1112,6 +1112,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						'callback' => array($this, 'rest_update_operations'),
 						'permission_callback' => array($this, 'permission_authenticated'),
 					),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
+				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/pending-message',
+				array(
+					'methods' => WP_REST_Server::CREATABLE,
+					'callback' => array($this, 'rest_send_pending_review_message'),
+					'permission_callback' => array($this, 'permission_authenticated'),
 				)
 			);
 
@@ -2303,12 +2313,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				&& 'review-pending' === $this->canonical_status_key(isset($application['status']) ? (string) $application['status'] : '');
 		}
 
-		private function should_send_draft_creation_alert($application, $user, $was_created_as_draft) {
-			return (bool) $was_created_as_draft
-				&& empty($application['isTestData'])
-				&& 'profile-preparation' === $this->canonical_status_key(isset($application['status']) ? (string) $application['status'] : '');
-		}
-
 		private function should_send_post_submission_agent_document_alert($application, $user) {
 			if (!$this->is_external_agent_user($user) || !empty($application['isTestData'])) {
 				return false;
@@ -2330,18 +2334,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$roles[] = 'finance-officer';
 			}
 
-			if ('new-application-created' === $event_type) {
-				$subject = sanitize_text_field('New application started: ' . $student_label);
-				$message = implode(
-					"\n",
-					array(
-						'A new incomplete application was started.',
-						'Started by: ' . $actor_name . '.',
-						'The application has not yet been submitted for review.',
-						'Please open MC Admissions if you need to monitor its progress.',
-					)
-				);
-			} elseif ('new-application-submitted' === $event_type) {
+			if ('new-application-submitted' === $event_type) {
 				$subject = sanitize_text_field('New application submitted: ' . $student_label);
 				$message = implode(
 					"\n",
@@ -2416,9 +2409,17 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				)
 			);
 
+			$communication_recorded = false;
+			$activity_recorded = false;
+			$audit_errors = array();
+			$log_errors = array();
+
 			try {
-				if ($this->table_exists($this->communications_table)) {
-					$wpdb->insert(
+				if (!$this->table_exists($this->communications_table)) {
+					$audit_errors[] = 'Communication audit could not be recorded.';
+					$log_errors[] = 'the communications table is unavailable';
+				} else {
+					$communication_written = $wpdb->insert(
 						$this->communications_table,
 						array(
 							'id' => wp_generate_uuid4(),
@@ -2432,23 +2433,68 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						),
 						array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
 					);
+					$communication_recorded = false !== $communication_written && 0 !== $communication_written;
+					if (!$communication_recorded) {
+						$audit_errors[] = 'Communication audit could not be recorded.';
+						$log_errors[] = 'the communication insert returned no written row';
+					}
 				}
+			} catch (Throwable $communication_audit_error) {
+				$audit_errors[] = 'Communication audit could not be recorded.';
+				$log_errors[] = 'communication exception: ' . $communication_audit_error->getMessage();
+			}
 
-				$this->create_activity(
+			try {
+				$activity_written = $this->create_activity(
 					$application_id,
 					$user,
 					'communication',
 					(string) $payload['subject'],
 					$delivery_status
 				);
-			} catch (Throwable $audit_error) {
-				error_log('MC Admissions could not record urgent email delivery: ' . $audit_error->getMessage());
+				$activity_recorded = false !== $activity_written && 0 !== $activity_written;
+				if (!$activity_recorded) {
+					$audit_errors[] = 'Activity audit could not be recorded.';
+					$log_errors[] = 'the activity insert returned no written row';
+				}
+			} catch (Throwable $activity_audit_error) {
+				$audit_errors[] = 'Activity audit could not be recorded.';
+				$log_errors[] = 'activity exception: ' . $activity_audit_error->getMessage();
 			}
+
+			if (!empty($log_errors)) {
+				error_log(
+					'MC Admissions email delivery audit incomplete for application '
+					. (string) $application_id
+					. ': '
+					. implode('; ', $log_errors)
+				);
+			}
+
+			return array(
+				'ok' => empty($audit_errors),
+				'skipped' => false,
+				'communicationRecorded' => $communication_recorded,
+				'activityRecorded' => $activity_recorded,
+				'error' => !empty($audit_errors) ? implode(' ', array_values(array_unique($audit_errors))) : null,
+			);
 		}
 
 		private function send_application_activity_alert($application, $user, $event_type, $document_type = null, $file_name = null) {
 			if (!empty($application['isTestData'])) {
-				return array('ok' => false, 'skipped' => true, 'sent' => array(), 'failed' => array());
+				return array(
+					'ok' => false,
+					'skipped' => true,
+					'sent' => array(),
+					'failed' => array(),
+					'audit' => array(
+						'ok' => true,
+						'skipped' => true,
+						'communicationRecorded' => false,
+						'activityRecorded' => false,
+						'error' => null,
+					),
+				);
 			}
 
 			$payload = $this->application_activity_alert_payload(
@@ -2501,7 +2547,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$error_message = $delivery_error->getMessage();
 			}
 
-			$this->record_application_activity_alert(
+			$audit_result = $this->record_application_activity_alert(
 				isset($application['id']) ? (string) $application['id'] : '',
 				$user,
 				$payload,
@@ -2515,6 +2561,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'sent' => $sent,
 				'failed' => $failed,
 				'error' => $error_message,
+				'audit' => $audit_result,
 			);
 		}
 
@@ -2527,6 +2574,23 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'roles' => array(),
 				'subject' => sanitize_text_field('Application closed after review for ' . $student_label),
 				'message' => 'Admissions review has concluded and the application has been closed as rejected.',
+				'application' => array(
+					'id' => isset($application['id']) ? (string) $application['id'] : null,
+					'referenceCode' => $reference,
+					'fullName' => $full_name,
+				),
+			);
+		}
+
+		private function pending_review_message_notification_payload($application, $message) {
+			$reference = isset($application['referenceCode']) ? trim((string) $application['referenceCode']) : '';
+			$full_name = isset($application['fullName']) ? trim((string) $application['fullName']) : '';
+			$student_label = $full_name . ' (' . $reference . ')';
+
+			return array(
+				'roles' => array(),
+				'subject' => sanitize_text_field('Additional information required for ' . $student_label),
+				'message' => (string) $message,
 				'application' => array(
 					'id' => isset($application['id']) ? (string) $application['id'] : null,
 					'referenceCode' => $reference,
@@ -2555,16 +2619,41 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			) > 0;
 		}
 
-		private function send_review_rejection_notification($application, $user) {
+		private function send_originating_consultant_notification($application, $user, $payload, $deduplicate = false) {
 			if (!empty($application['isTestData'])) {
-				return array('ok' => false, 'skipped' => true, 'sent' => array(), 'failed' => array());
+				return array(
+					'ok' => false,
+					'skipped' => true,
+					'sent' => array(),
+					'failed' => array(),
+					'error' => 'Test-data applications do not send email.',
+					'audit' => array(
+						'ok' => true,
+						'skipped' => true,
+						'communicationRecorded' => false,
+						'activityRecorded' => false,
+						'error' => null,
+					),
+				);
 			}
 
-			$payload = $this->review_rejection_notification_payload($application);
 			$application_id = isset($application['id']) ? (string) $application['id'] : '';
 
-			if ($this->has_application_email_audit($application_id, $payload['subject'])) {
-				return array('ok' => false, 'skipped' => true, 'duplicate' => true, 'sent' => array(), 'failed' => array());
+			if ($deduplicate && $this->has_application_email_audit($application_id, $payload['subject'])) {
+				return array(
+					'ok' => false,
+					'skipped' => true,
+					'duplicate' => true,
+					'sent' => array(),
+					'failed' => array(),
+					'audit' => array(
+						'ok' => true,
+						'skipped' => true,
+						'communicationRecorded' => false,
+						'activityRecorded' => false,
+						'error' => null,
+					),
+				);
 			}
 
 			$consultant_email = sanitize_email(
@@ -2636,7 +2725,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				}
 			}
 
-			$this->record_application_activity_alert(
+			$audit_result = $this->record_application_activity_alert(
 				$application_id,
 				$user,
 				$payload,
@@ -2651,6 +2740,25 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'sent' => $sent,
 				'failed' => $failed,
 				'error' => $error_message,
+				'audit' => $audit_result,
+			);
+		}
+
+		private function send_review_rejection_notification($application, $user) {
+			return $this->send_originating_consultant_notification(
+				$application,
+				$user,
+				$this->review_rejection_notification_payload($application),
+				true
+			);
+		}
+
+		private function send_pending_review_message_notification($application, $user, $message) {
+			return $this->send_originating_consultant_notification(
+				$application,
+				$user,
+				$this->pending_review_message_notification_payload($application, $message),
+				false
 			);
 		}
 
@@ -3543,6 +3651,59 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					array(
 						'ok' => true,
 						'application' => $application,
+					),
+					200
+				);
+			} catch (Exception $error) {
+				$status = self::STALE_APPLICATION_ERROR === $error->getMessage() ? 409 : 400;
+				return $this->json_error_response($error->getMessage(), $status);
+			}
+		}
+
+		public function rest_send_pending_review_message(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+			$message = isset($params['message'])
+				? trim(sanitize_textarea_field((string) $params['message']))
+				: '';
+			$expected_updated_at = isset($params['expectedUpdatedAt'])
+				? trim((string) $params['expectedUpdatedAt'])
+				: '';
+
+			if ('' === $message) {
+				return $this->json_error_response('A message to the agent is required.', 400);
+			}
+			$message_length = function_exists('mb_strlen') ? mb_strlen($message) : strlen($message);
+			if ($message_length > 4000) {
+				return $this->json_error_response('The message must be 4,000 characters or fewer.', 400);
+			}
+			if ('' === $expected_updated_at) {
+				return $this->json_error_response('Application version is required.', 400);
+			}
+
+			try {
+				$user = $this->current_session_user();
+				if (!$this->can_assess_admission_documents($user)) {
+					return $this->json_error_response(
+						'Only an administrator or Admissions Officer can send a pending-review message.',
+						403
+					);
+				}
+
+				$result = $this->send_pending_review_message(
+					array(
+						'applicationId' => (string) $request['application_id'],
+						'message' => $message,
+						'expectedUpdatedAt' => $expected_updated_at,
+						'user' => $user,
+					)
+				);
+
+				return new WP_REST_Response(
+					array(
+						'ok' => true,
+						'application' => $result['application'],
+						'delivery' => $result['delivery'],
+						'audit' => $result['audit'],
 					),
 					200
 				);
@@ -5498,7 +5659,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				? (bool) $params['isTestData']
 				: null;
 			$should_notify_review_submission = false;
-			$should_notify_draft_creation = false;
 
 			if (false === $wpdb->query('START TRANSACTION')) {
 				throw new Exception('Unable to start the application save transaction.');
@@ -5648,7 +5808,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 					$record_id = wp_generate_uuid4();
 					$should_notify_review_submission = 'review' === $mode && $this->is_external_agent_user($user);
-					$should_notify_draft_creation = 'draft' === $mode;
 					$next_is_test_data = $this->resolve_application_test_data(
 						$draft,
 						$user,
@@ -5722,10 +5881,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			$application = $this->get_detailed_application_record($record_id);
-
-			if ($this->should_send_draft_creation_alert($application, $user, $should_notify_draft_creation)) {
-				$this->send_application_activity_alert($application, $user, 'new-application-created');
-			}
 
 			if ($this->should_send_review_submission_alert($application, $user, $should_notify_review_submission)) {
 				$this->send_application_activity_alert($application, $user, 'new-application-submitted');
@@ -6080,6 +6235,52 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			return $this->to_admission_case($application);
+		}
+
+		private function send_pending_review_message($params) {
+			$user = $params['user'];
+			$application_id = (string) $params['applicationId'];
+			$message = trim((string) $params['message']);
+			$existing = $this->get_authorized_application_base($application_id, $user);
+
+			if ('review-pending' !== $this->canonical_status_key((string) $existing['status'])) {
+				throw new Exception('Only an application awaiting review can be kept pending with an agent message.');
+			}
+
+			$application = $this->update_admission_application_operations(
+				array(
+					'applicationId' => $application_id,
+					'draft' => array('reviewerDecision' => 'hold'),
+					'expectedUpdatedAt' => $params['expectedUpdatedAt'],
+					'user' => $user,
+				)
+			);
+			$authoritative = $this->get_detailed_application_record($application_id);
+			$delivery_result = $this->send_pending_review_message_notification(
+				$authoritative,
+				$user,
+				$message
+			);
+
+			return array(
+				'application' => $application,
+				'delivery' => array(
+					'ok' => !empty($delivery_result['ok']),
+					'skipped' => !empty($delivery_result['skipped']),
+					'sentCount' => count(isset($delivery_result['sent']) ? (array) $delivery_result['sent'] : array()),
+					'failedCount' => count(isset($delivery_result['failed']) ? (array) $delivery_result['failed'] : array()),
+					'error' => isset($delivery_result['error']) ? $delivery_result['error'] : null,
+				),
+				'audit' => isset($delivery_result['audit'])
+					? $delivery_result['audit']
+					: array(
+						'ok' => false,
+						'skipped' => false,
+						'communicationRecorded' => false,
+						'activityRecorded' => false,
+						'error' => 'Email delivery audit result is unavailable.',
+					),
+			);
 		}
 
 		private function upload_admission_document($params) {
