@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.55
+ * Version: 0.2.56
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -113,6 +113,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private $programme_labels = array(
 			'hotel-casino-resort-management' => "Bachelor's degree in Hotel, Casino & Resort Management",
 			'business-administration' => "Bachelor's degree in Business Administration",
+			'business-administration-masters' => "Business Administration (Master's)",
 			'english-foundation' => 'English Foundation Year',
 		);
 
@@ -4534,6 +4535,21 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return isset($this->programme_labels[$code]) ? $this->programme_labels[$code] : 'Programme not selected';
 		}
 
+		private function resolve_programme_label($application) {
+			$stored_label = isset($application['programmeLabel'])
+				? trim((string) $application['programmeLabel'])
+				: '';
+			$programme_code = isset($application['programmeCode'])
+				? trim((string) $application['programmeCode'])
+				: '';
+
+			if ('' === $stored_label || 0 === strcasecmp($stored_label, 'Programme not selected')) {
+				return $this->programme_label_from_code($programme_code);
+			}
+
+			return $stored_label;
+		}
+
 		private function iso_to_mysql_datetime($value) {
 			if (empty($value)) {
 				return null;
@@ -4659,7 +4675,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'id' => $application['referenceCode'],
 				'studentName' => $application['fullName'],
 				'agentName' => $application['agencyName'],
-				'programme' => $application['programmeLabel'],
+				'programme' => $this->resolve_programme_label($application),
 				'semester' => trim($application['semester'] . ' ' . $application['year']),
 				'stage' => $status,
 				'stageKey' => isset($application['status']) ? (string) $application['status'] : $status,

@@ -128,6 +128,12 @@ $case_record_upsert = $reflection->getMethod('upsert_case_record_and_touch_appli
 $case_record_upsert->setAccessible(true);
 $mutation_error_status = $reflection->getMethod('mutation_error_status');
 $mutation_error_status->setAccessible(true);
+$programme_label_from_code = $reflection->getMethod('programme_label_from_code');
+$programme_label_from_code->setAccessible(true);
+$resolve_programme_label = $reflection->getMethod('resolve_programme_label');
+$resolve_programme_label->setAccessible(true);
+$to_board_application = $reflection->getMethod('to_board_application');
+$to_board_application->setAccessible(true);
 
 function assert_same($expected, $actual, $message) {
 	if ($expected !== $actual) {
@@ -158,6 +164,57 @@ function assert_throws($callback, $message) {
 
 	throw new RuntimeException($message);
 }
+
+assert_same(
+	"Business Administration (Master's)",
+	$programme_label_from_code->invoke($plugin, 'business-administration-masters'),
+	'The WordPress backend must recognize the canonical Master\'s programme code.'
+);
+assert_same(
+	"Business Administration (Master's)",
+	$resolve_programme_label->invoke(
+		$plugin,
+		array(
+			'programmeCode' => 'business-administration-masters',
+			'programmeLabel' => 'Programme not selected',
+		)
+	),
+	'A stale fallback label must be repaired from a recognized programme code.'
+);
+assert_same(
+	'Legacy custom programme label',
+	$resolve_programme_label->invoke(
+		$plugin,
+		array(
+			'programmeCode' => 'business-administration-masters',
+			'programmeLabel' => 'Legacy custom programme label',
+		)
+	),
+	'A meaningful stored programme label must not be overwritten.'
+);
+
+$masters_board = $to_board_application->invoke(
+	$plugin,
+	array(
+		'id' => 'offline-master-record',
+		'referenceCode' => 'MC-OFFLINE',
+		'fullName' => 'Offline Master Applicant',
+		'agencyName' => 'Offline Agency',
+		'applicationRoute' => 'postgraduate',
+		'programmeCode' => 'business-administration-masters',
+		'programmeLabel' => 'Programme not selected',
+		'semester' => 'fall',
+		'year' => '2026',
+		'status' => 'prepayment-pending',
+		'paymentStatus' => 'cleared',
+		'updatedAt' => '2026-08-12 07:00:00.000',
+	)
+);
+assert_same(
+	"Business Administration (Master's)",
+	$masters_board['programme'],
+	'Board and case responses must expose the repaired Master\'s programme label.'
+);
 
 function assert_throws_message($expected, $callback, $message) {
 	try {
