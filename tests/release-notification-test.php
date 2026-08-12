@@ -666,7 +666,7 @@ release_assert_not_contains('current_session_user', $release_source, 'The releas
 release_assert_not_contains('wp_remote_', $release_source, 'The release endpoint must not contact GitHub or any external service.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-release_assert_contains('Version: 0.2.55', $plugin_source, 'The plugin header must advertise version 0.2.55.');
+release_assert_contains('Version: 0.2.56', $plugin_source, 'The plugin header must advertise version 0.2.56.');
 release_assert_contains('name="release_notification_secret"', $plugin_source, 'Settings must expose the release notification password field.');
 release_assert_contains('type="password"', $plugin_source, 'The release notification setting must use a password input.');
 release_assert_same(0, $GLOBALS['mc_release_network_calls'], 'The complete offline suite must never contact the network.');
