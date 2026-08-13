@@ -58,6 +58,7 @@ final class MC_Agency_Identity_Wpdb {
 	public $applications = array();
 	public $updates = array();
 	public $insert_calls = array();
+	public $queries = array();
 
 	public function prepare($query, ...$args) {
 		if (1 === count($args) && is_array($args[0])) $args = $args[0];
@@ -107,6 +108,13 @@ final class MC_Agency_Identity_Wpdb {
 		return null;
 	}
 
+	public function get_results($query, $output = null) {
+		if (false !== strpos((string) $query, 'FROM mc_agency_profiles')) {
+			return array_values($this->profiles);
+		}
+		return array();
+	}
+
 	public function update($table, $data, $where) {
 		if (!empty($GLOBALS['mc_identity_fail_table_write']) && $GLOBALS['mc_identity_fail_table_write'] === $table) return false;
 		$this->updates[] = array('table' => $table, 'data' => $data, 'where' => $where);
@@ -125,7 +133,34 @@ final class MC_Agency_Identity_Wpdb {
 	}
 
 	public function insert($table, $data) { if (!empty($GLOBALS['mc_identity_fail_table_write']) && $GLOBALS['mc_identity_fail_table_write'] === $table) return false; $this->insert_calls[] = array('table' => $table, 'data' => $data); return 1; }
-	public function query($query) { return 1; }
+	public function query($prepared) {
+		$call = $this->unpack($prepared);
+		$this->queries[] = $call;
+		if (false !== strpos($call['query'], 'UPDATE mc_admission_applications SET')) {
+			if ('mc_admission_applications' === ($GLOBALS['mc_identity_fail_table_write'] ?? null)) return false;
+			$args = $call['args'];
+			$user_id = (int) array_pop($args);
+			$data = array(
+				'wordpressUsername' => $args[0] ?? null,
+				'wordpressEmail' => $args[1] ?? null,
+				'agencyName' => $args[2] ?? '',
+				'consultantEmail' => $args[3] ?? null,
+			);
+			if (false !== strpos($call['query'], 'consultantName = %s')) {
+				$data['consultantName'] = $args[4] ?? '';
+				$data['consultantPhone'] = $args[5] ?? null;
+			}
+			$written = 0;
+			foreach ($this->applications as $id => $application) {
+				if ((int) ($application['wordpressUserId'] ?? 0) === $user_id) {
+					$this->applications[$id] = array_merge($application, $data);
+					$written++;
+				}
+			}
+			return $written;
+		}
+		return 1;
+	}
 	public function get_col($prepared) {
 		$call = $this->unpack($prepared);
 		if (false !== strpos($call['query'], 'FROM wp_users')) {
@@ -179,25 +214,29 @@ $GLOBALS['mc_identity_options'] = array(
 	'mc_admissions_offer_detail_schema_version' => '0.2.38',
 	'mc_admissions_case_detail_schema_version' => '0.2.45',
 	'mc_admissions_document_assessment_schema_version' => '1',
-	// Deliberately incomplete before the plugin file is required. Version 0.2.57
-	// fatally called get_userdata() from boot under this exact state.
-	'mc_admissions_agency_identity_version' => '0.2.57',
+	// Deliberately incomplete before the plugin file is required. The original
+	// synchronous migration fatally called get_userdata() under this state.
+	'mc_admissions_agency_identity_version' => '0.2.58',
 );
 $GLOBALS['mc_identity_transients'] = array();
 $GLOBALS['mc_identity_users'] = array(
 	10 => (object) array('ID' => 10, 'user_login' => '12th-Study-Abroad', 'display_name' => '12th-Study-Abroad', 'user_email' => 'owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	11 => (object) array('ID' => 11, 'user_login' => 'Atlas_Bridge', 'display_name' => '', 'user_email' => 'atlas@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
-	12 => (object) array('ID' => 12, 'user_login' => 'machine-agent', 'display_name' => 'Intentional Agency Ltd', 'user_email' => 'custom@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
+	12 => (object) array('ID' => 12, 'user_login' => 'machineagent', 'display_name' => 'Intentional Agency Ltd', 'user_email' => 'custom@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	13 => (object) array('ID' => 13, 'user_login' => 'staff-account', 'display_name' => 'staff-account', 'user_email' => 'staff@example.invalid', 'roles' => array('administrator'), 'allcaps' => array()),
 	14 => (object) array('ID' => 14, 'user_login' => 'incomplete-agent', 'display_name' => 'Incomplete Agency', 'user_email' => 'incomplete@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	15 => (object) array('ID' => 15, 'user_login' => '', 'display_name' => '', 'user_email' => 'nameless@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	16 => (object) array('ID' => 16, 'user_login' => 'invalid-email-agent', 'display_name' => 'Invalid Email Agency', 'user_email' => 'not-an-email', 'roles' => array('mc_agent'), 'allcaps' => array()),
-	17 => (object) array('ID' => 17, 'user_login' => 'profile-owner', 'display_name' => 'Old Custom Name', 'user_email' => 'profile-owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
-	18 => (object) array('ID' => 18, 'user_login' => 'application-owner', 'display_name' => 'Another Custom Name', 'user_email' => 'application-owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
+	17 => (object) array('ID' => 17, 'user_login' => 'profileowner', 'display_name' => 'Old Custom Name', 'user_email' => 'profile-owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
+	18 => (object) array('ID' => 18, 'user_login' => 'applicationowner', 'display_name' => 'Another Custom Name', 'user_email' => 'application-owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	19 => (object) array('ID' => 19, 'user_login' => 'Fallback_Agency', 'display_name' => 'Fallback_Agency', 'user_email' => 'fallback@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	20 => (object) array('ID' => 20, 'user_login' => 'Retry_Agency', 'display_name' => 'Retry_Agency', 'user_email' => 'retry@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	21 => (object) array('ID' => 21, 'user_login' => 'html-agency', 'display_name' => '<b>Agency & Co</b>', 'user_email' => 'html@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	22 => (object) array('ID' => 22, 'user_login' => 'Whitespace_Agency', 'display_name' => 'Whitespace Agency', 'user_email' => 'whitespace@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
+	23 => (object) array('ID' => 23, 'user_login' => 'admissions-staff', 'display_name' => 'Admissions Staff', 'user_email' => 'admissions@example.invalid', 'roles' => array('admissions-officer'), 'allcaps' => array()),
+	24 => (object) array('ID' => 24, 'user_login' => 'finance-staff', 'display_name' => 'Finance Staff', 'user_email' => 'finance@example.invalid', 'roles' => array('finance-officer'), 'allcaps' => array()),
+	25 => (object) array('ID' => 25, 'user_login' => 'dual-role-staff', 'display_name' => 'Dual Role Staff', 'user_email' => 'dual-role@example.invalid', 'roles' => array('mc_agent', 'admissions-officer'), 'allcaps' => array()),
+	54 => (object) array('ID' => 54, 'user_login' => 'OnePoint-Education', 'display_name' => 'Kashif', 'user_email' => 'onepoint@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 );
 $GLOBALS['wpdb']->profiles[10] = array(
 	'id' => 'profile-10', 'wordpressUserId' => 10, 'wordpressUsername' => 'stale-user',
@@ -271,15 +310,24 @@ function get_userdata($user_id) {
 	return $GLOBALS['mc_identity_users'][(int) $user_id] ?? false;
 }
 function get_users($args = array()) {
-	if (isset($args['fields']) && 'ids' === $args['fields']) {
-		return array_keys(array_filter($GLOBALS['mc_identity_users'], function ($user) { return in_array('mc_agent', (array) $user->roles, true); }));
+	$users = $GLOBALS['mc_identity_users'];
+	if (!empty($args['role__in'])) {
+		$roles = array_map('strval', (array) $args['role__in']);
+		$users = array_filter($users, function ($user) use ($roles) {
+			return count(array_intersect($roles, (array) $user->roles)) > 0;
+		});
 	}
-	return array_values($GLOBALS['mc_identity_users']);
+	if (isset($args['fields']) && 'ids' === $args['fields']) {
+		return array_keys($users);
+	}
+	return array_values($users);
 }
 function wp_get_current_user() { return get_userdata($GLOBALS['mc_identity_current_user_id']); }
 function get_current_user_id() { return (int) $GLOBALS['mc_identity_current_user_id']; }
 function get_avatar_url($user_id, $args = array()) { return ''; }
 function current_time($type, $gmt = false) { return '2026-08-13 10:00:00'; }
+function absint($value) { return abs((int) $value); }
+function wp_list_pluck($list, $field) { return array_map(function ($item) use ($field) { return $item->{$field}; }, $list); }
 function sanitize_email($value) { return trim((string) $value); }
 function sanitize_user($value, $strict = false) { return trim((string) $value); }
 function sanitize_text_field($value) { return trim(strip_tags((string) $value)); }
@@ -339,7 +387,7 @@ function identity_method($reflection, $name) {
 $plugin = mc_admissions_wordpress_backend();
 $reflection = new ReflectionClass($plugin);
 identity_assert_same(0, $GLOBALS['mc_identity_early_user_calls'], 'Plugin boot must not call get_userdata before WordPress pluggable functions load.');
-identity_assert_same('0.2.57', $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'], 'Plugin boot must not synchronously advance an incomplete identity migration.');
+identity_assert_same('0.2.58', $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'], 'Plugin boot must not synchronously advance an incomplete identity migration.');
 identity_assert_true(!empty($GLOBALS['mc_identity_actions']['plugins_loaded']), 'Agency identity migration must be registered on plugins_loaded.');
 $migration_hook = end($GLOBALS['mc_identity_actions']['plugins_loaded']);
 identity_assert_same(20, $migration_hook['priority'], 'Agency identity migration must run only after pluggable functions become available.');
@@ -358,9 +406,9 @@ $plugin->schedule_authoritative_agency_identity_backfill();
 identity_assert_same($scheduled_once, $GLOBALS['mc_identity_scheduled_events'], 'The scheduler must not duplicate a pending identity migration event.');
 identity_assert_same(array(), $GLOBALS['mc_identity_agent_batches'], 'Scheduling must perform no agent migration work synchronously.');
 identity_assert_same(array(), $GLOBALS['mc_identity_owner_batches'], 'Scheduling must perform no owner migration work synchronously.');
-$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'] = '0.2.58';
+$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'] = '0.2.59';
 unset($GLOBALS['mc_identity_scheduled_events']['mc_admissions_agency_identity_backfill']);
-$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'] = '0.2.57';
+$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'] = '0.2.58';
 $GLOBALS['mc_identity_transients']['mc_admissions_agency_identity_backfill_lock'] = 1;
 $plugin->run_authoritative_agency_identity_backfill();
 identity_assert_same(array(), $GLOBALS['mc_identity_agent_batches'], 'An overlapping cron callback must perform no migration work while the lock is held.');
@@ -369,7 +417,7 @@ unset(
 	$GLOBALS['mc_identity_transients']['mc_admissions_agency_identity_backfill_lock'],
 	$GLOBALS['mc_identity_scheduled_events']['mc_admissions_agency_identity_backfill']
 );
-$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'] = '0.2.58';
+$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'] = '0.2.59';
 $contact = identity_method($reflection, 'authoritative_agency_contact');
 $overlay = identity_method($reflection, 'application_with_authoritative_agency_identity');
 $migrate_display_name = identity_method($reflection, 'migrate_legacy_agency_display_name');
@@ -406,6 +454,8 @@ identity_assert_true($migrate_display_name->invoke($plugin, 11), 'A blank displa
 identity_assert_same('Atlas Bridge', $GLOBALS['mc_identity_users'][11]->display_name, 'Underscore runs must become spaces.');
 identity_assert_true($migrate_display_name->invoke($plugin, 13), 'Internal staff must be a successful migration no-op.');
 identity_assert_same('staff-account', $GLOBALS['mc_identity_users'][13]->display_name, 'Internal staff display names must not be changed by agency migration.');
+identity_assert_true($migrate_display_name->invoke($plugin, 25), 'Internal dual-role staff must be a successful migration no-op.');
+identity_assert_same('Dual Role Staff', $GLOBALS['mc_identity_users'][25]->display_name, 'Agency migration must preserve dual-role internal staff display names even when their username uses separators.');
 identity_assert_true($migrate_display_name->invoke($plugin, 17), 'Legacy profile agency name migration must succeed.');
 identity_assert_same('Legacy Profile Agency', $GLOBALS['mc_identity_users'][17]->display_name, 'Agency Profile name must take migration precedence.');
 identity_assert_true($migrate_display_name->invoke($plugin, 18), 'Legacy application agency name migration must succeed.');
@@ -414,6 +464,9 @@ identity_assert_true($migrate_display_name->invoke($plugin, 19), 'Username fallb
 identity_assert_same('Fallback Agency', $GLOBALS['mc_identity_users'][19]->display_name, 'Username separators must be replaced when no legacy agency name exists.');
 identity_assert_true($migrate_display_name->invoke($plugin, 12), 'A custom display name without a legacy agency snapshot is a successful no-op.');
 identity_assert_same('Intentional Agency Ltd', $GLOBALS['mc_identity_users'][12]->display_name, 'Migration must preserve a custom display name when no legacy agency snapshot exists.');
+identity_assert_true($migrate_display_name->invoke($plugin, 54), 'A separator-based agency username must override an individual display name.');
+identity_assert_same('OnePoint Education', $GLOBALS['mc_identity_users'][54]->display_name, 'OnePoint-Education must become the WordPress agency display name even when the previous display name was Kashif.');
+unset($GLOBALS['mc_identity_users'][54]);
 
 $columns = $plugin->add_agency_display_name_user_column(array('username' => 'Username'));
 identity_assert_same('Display Name / Agency Name', $columns['mc_admissions_agency_name'], 'WordPress Users must expose the agency display-name column.');
@@ -444,6 +497,74 @@ identity_assert_same(10, $selected_owner['id'], 'Administrator create must use t
 identity_assert_same('12th Study Abroad', $selected_owner['name'], 'Selected ownership must use the authoritative WP agency display name.');
 identity_assert_same('owner@example.invalid', $selected_owner['email'], 'Selected ownership must use the authoritative WP email.');
 
+$admissions_selected_owner = $resolve_owner->invoke(
+	$plugin,
+	array('id' => 23, 'username' => 'admissions-staff', 'name' => 'Admissions Staff', 'email' => 'admissions@example.invalid', 'roles' => array('admissions-officer')),
+	10
+);
+identity_assert_same(10, $admissions_selected_owner['id'], 'Admissions Officer create must use the selected external agent as owner.');
+$admissions_selected_contact = $contact->invoke($plugin, $admissions_selected_owner['id'], $admissions_selected_owner, true);
+identity_assert_true($admissions_selected_contact['profileComplete'], 'Admissions Officer create must require the selected external agent to have a complete Agency Profile.');
+
+try {
+	$resolve_owner->invoke(
+		$plugin,
+		array('id' => 10, 'username' => '12th-Study-Abroad', 'name' => '12th Study Abroad', 'email' => 'owner@example.invalid', 'roles' => array('mc_agent')),
+		11
+	);
+	throw new RuntimeException('An external agent must not be able to assign an application to another agent.');
+} catch (ReflectionException $error) {
+	throw $error;
+} catch (Throwable $error) {
+	identity_assert_contains('Only an administrator or Admissions Officer can assign', $error->getMessage(), 'Agent ownership tampering must be rejected explicitly.');
+}
+
+try {
+	$resolve_owner->invoke(
+		$plugin,
+		array('id' => 24, 'username' => 'finance-staff', 'name' => 'Finance Staff', 'email' => 'finance@example.invalid', 'roles' => array('finance-officer')),
+		0
+	);
+	throw new RuntimeException('Internal staff must not create a staff-owned application.');
+} catch (ReflectionException $error) {
+	throw $error;
+} catch (Throwable $error) {
+	identity_assert_contains('Only an external agent, administrator, or Admissions Officer can create', $error->getMessage(), 'Non-admissions staff-owned application creation must be rejected explicitly.');
+}
+
+try {
+	$resolve_owner->invoke(
+		$plugin,
+		array('id' => 23, 'username' => 'admissions-staff', 'name' => 'Admissions Staff', 'email' => 'admissions@example.invalid', 'roles' => array('admissions-officer')),
+		25
+	);
+	throw new RuntimeException('Internal dual-role staff must not be accepted as an external application owner.');
+} catch (ReflectionException $error) {
+	throw $error;
+} catch (Throwable $error) {
+	identity_assert_contains('not a valid agent', $error->getMessage(), 'Selected application owners must be external agents, not internal staff with an agent role.');
+}
+
+$GLOBALS['mc_identity_current_user_id'] = 13;
+$administrator_agent_list = $plugin->rest_list_agents();
+identity_assert_same(200, $administrator_agent_list->status, 'Administrators must be able to list agents for ownership selection.');
+$administrator_agent_ids = array_map(function ($agent) { return (int) $agent['id']; }, $administrator_agent_list->data['agents']);
+identity_assert_same(false, in_array(25, $administrator_agent_ids, true), 'The ownership selector must exclude internal staff even when they also have an agent role.');
+$GLOBALS['mc_identity_current_user_id'] = 23;
+$admissions_agent_list = $plugin->rest_list_agents();
+identity_assert_same(200, $admissions_agent_list->status, 'Admissions Officers must be able to list agents for ownership selection.');
+$GLOBALS['mc_identity_current_user_id'] = 10;
+$external_agent_list = $plugin->rest_list_agents();
+identity_assert_same(403, $external_agent_list->status, 'External agents must not be able to list other agents.');
+$GLOBALS['mc_identity_current_user_id'] = 24;
+$finance_agent_list = $plugin->rest_list_agents();
+identity_assert_same(403, $finance_agent_list->status, 'Other internal roles must not be able to list agents for ownership selection.');
+$GLOBALS['mc_identity_current_user_id'] = 23;
+$admissions_agent_create = $plugin->rest_create_agent(new WP_REST_Request(array('draft' => array())));
+identity_assert_same(403, $admissions_agent_create->status, 'Admissions Officers must not gain administrator-only agent-account creation access.');
+unset($GLOBALS['mc_identity_users'][25]);
+$GLOBALS['mc_identity_current_user_id'] = 10;
+
 $GLOBALS['wpdb']->updates = array();
 $application_updated_at = $GLOBALS['wpdb']->applications['case-10']['updatedAt'];
 $repaired_profile = $plugin->rest_get_profile();
@@ -454,6 +575,15 @@ identity_assert_same('owner@example.invalid', $GLOBALS['wpdb']->applications['ca
 identity_assert_same('Profile Consultant', $GLOBALS['wpdb']->applications['case-10']['consultantName'], 'Application snapshot must receive Agency Profile consultant name.');
 identity_assert_same('+357 99112233', $GLOBALS['wpdb']->applications['case-10']['consultantPhone'], 'Application snapshot must receive Agency Profile consultant phone.');
 identity_assert_same($application_updated_at, $GLOBALS['wpdb']->applications['case-10']['updatedAt'], 'Profile GET repair must not invalidate an open application version.');
+$application_sync_queries = array_values(array_filter($GLOBALS['wpdb']->queries, function ($query) {
+	return false !== strpos($query['query'], 'UPDATE mc_admission_applications SET');
+}));
+identity_assert_true(!empty($application_sync_queries), 'Identity synchronization must issue an explicit application snapshot query.');
+$application_sync_query = end($application_sync_queries);
+identity_assert_contains('updatedAt = updatedAt', $application_sync_query['query'], 'Application identity SQL must suppress the live ON UPDATE timestamp behavior.');
+foreach ($GLOBALS['wpdb']->updates as $update) {
+	identity_assert_same(false, 'mc_admission_applications' === $update['table'], 'Application identity synchronization must not use wpdb::update, which triggers the live ON UPDATE timestamp.');
+}
 foreach ($GLOBALS['wpdb']->updates as $update) {
 	identity_assert_same(false, array_key_exists('updatedAt', $update['data']), 'Identity synchronization must not invalidate open application versions.');
 }
@@ -505,6 +635,43 @@ identity_assert_contains("\$owner_identity['consultantName']", $save_source, 'Ap
 identity_assert_contains("\$owner_identity['consultantPhone']", $save_source, 'Application creates and updates must ignore per-application consultant phones.');
 identity_assert_contains('$assigned_agent_id', $save_source, 'Administrator create must resolve identity from the explicitly selected owner.');
 
+$continue_assigned_preparation = identity_method($reflection, 'can_continue_assigned_preparation');
+$submit_prepared_application = identity_method($reflection, 'can_submit_prepared_application');
+$admissions_user = array('roles' => array('admissions-officer'));
+$finance_user = array('roles' => array('finance-officer'));
+identity_assert_same(
+	true,
+	$continue_assigned_preparation->invoke($plugin, $admissions_user, 'profile-preparation'),
+	'Admissions must be able to resume the assigned draft after its first save.'
+);
+identity_assert_same(
+	true,
+	$submit_prepared_application->invoke($plugin, $admissions_user, 'profile-preparation'),
+	'Admissions must be able to submit the resumed assigned draft for review.'
+);
+identity_assert_same(
+	false,
+	$continue_assigned_preparation->invoke($plugin, $admissions_user, 'review-pending'),
+	'Admissions assigned-draft editing must end when the case leaves preparation.'
+);
+identity_assert_same(
+	false,
+	$submit_prepared_application->invoke($plugin, $admissions_user, 'review-pending'),
+	'Admissions must not replay preparation submission after the stage advances.'
+);
+identity_assert_same(
+	false,
+	$continue_assigned_preparation->invoke($plugin, $finance_user, 'profile-preparation'),
+	'Finance must not gain assigned application intake editing.'
+);
+identity_assert_contains('$can_continue_assigned_preparation', $save_source, 'Existing assigned draft saves must use the preparation-only permission gate.');
+identity_assert_contains('can_submit_prepared_application', $save_source, 'Review submission must use the preparation-only permission gate.');
+identity_assert_contains(
+	'$this->is_external_agent_user($user) || $can_continue_assigned_preparation',
+	$save_source,
+	'Admissions continuation must revalidate that the selected owner still has a complete Agency Profile.'
+);
+
 $create_agent_source = identity_method($reflection, 'rest_create_agent');
 $create_agent_source = implode('', array_slice($source_lines, $create_agent_source->getStartLine() - 1, $create_agent_source->getEndLine() - $create_agent_source->getStartLine() + 1));
 identity_assert_contains('$phone', $create_agent_source, 'Administrator-created agents must provide consultant phone.');
@@ -544,7 +711,7 @@ $GLOBALS['mc_identity_fail_table_write'] = null;
 $GLOBALS['mc_identity_current_user_id'] = 10;
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-identity_assert_contains('Version: 0.2.58', $plugin_source, 'The plugin header must advertise 0.2.58.');
+identity_assert_contains('Version: 0.2.59', $plugin_source, 'The plugin header must advertise 0.2.59.');
 identity_assert_contains("\$owner_identity['agencyName']", $plugin_source, 'Application saves must use authoritative agency identity.');
 identity_assert_contains("\$owner_identity['consultantName']", $plugin_source, 'Application saves must use the owning Agency Profile contact.');
 identity_assert_contains('$identity_safe_draft', $plugin_source, 'Test-data inference must use the authoritative identity overlay.');
@@ -572,7 +739,7 @@ for ($user_id = 1000; $user_id <= 1204; $user_id++) {
 $GLOBALS['wpdb']->applications['deleted-owner-case'] = array(
 	'id' => 'deleted-owner-case', 'wordpressUserId' => 9999, 'agencyName' => 'Deleted Legacy Owner', 'updatedAt' => '2026-08-13 09:00:00',
 );
-$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'] = '0.2.57';
+$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'] = '0.2.58';
 unset(
 	$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_agent_phase_complete'],
 	$GLOBALS['mc_identity_options']['mc_admissions_agency_identity_agent_cursor'],
@@ -583,7 +750,7 @@ $GLOBALS['mc_identity_owner_batches'] = array();
 $GLOBALS['mc_identity_wp_update_fail_ids'] = array(20);
 unset($GLOBALS['mc_identity_scheduled_events']['mc_admissions_agency_identity_backfill']);
 $plugin->run_authoritative_agency_identity_backfill();
-identity_assert_same('0.2.57', $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'], 'A transient WordPress display-name failure must not mark the identity migration complete.');
+identity_assert_same('0.2.58', $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'], 'A transient WordPress display-name failure must not mark the identity migration complete.');
 identity_assert_same(19, $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_agent_cursor'], 'A failed agent migration must preserve the last successful ordered ID cursor.');
 identity_assert_same(0, count($GLOBALS['mc_identity_owner_batches']), 'Snapshot backfill must not overlap the agent display-name phase.');
 identity_assert_true(!empty($GLOBALS['mc_identity_scheduled_events']['mc_admissions_agency_identity_backfill']), 'A failed cron batch must schedule a retry.');
@@ -609,12 +776,12 @@ foreach ($GLOBALS['mc_identity_agent_batches'] as $agent_batch) {
 $GLOBALS['mc_identity_fail_table_write'] = 'mc_admission_applications';
 unset($GLOBALS['mc_identity_scheduled_events']['mc_admissions_agency_identity_backfill']);
 $plugin->run_authoritative_agency_identity_backfill();
-identity_assert_same('0.2.57', $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'], 'A snapshot synchronization failure must not complete the migration.');
+identity_assert_same('0.2.58', $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'], 'A snapshot synchronization failure must not complete the migration.');
 identity_assert_same(0, $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_cursor'], 'A failed first owner must preserve the owner cursor for retry.');
 $GLOBALS['mc_identity_fail_table_write'] = null;
 unset($GLOBALS['mc_identity_scheduled_events']['mc_admissions_agency_identity_backfill']);
 $plugin->run_authoritative_agency_identity_backfill();
-identity_assert_same('0.2.58', $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'], 'A later owner-phase retry must complete the migration.');
+identity_assert_same('0.2.59', $GLOBALS['mc_identity_options']['mc_admissions_agency_identity_version'], 'A later owner-phase retry must complete the migration.');
 identity_assert_same('Retry Agency', $GLOBALS['mc_identity_users'][20]->display_name, 'The retried username fallback migration must update the display name.');
 identity_assert_true(in_array(9999, end($GLOBALS['mc_identity_owner_batches']), true), 'The bounded owner phase must observe deleted legacy owners.');
 identity_assert_same(false, isset($GLOBALS['mc_identity_options']['mc_admissions_agency_identity_agent_phase_complete']), 'Completed migration must clean up its phase marker.');

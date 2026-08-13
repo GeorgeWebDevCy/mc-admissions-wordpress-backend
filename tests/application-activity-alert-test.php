@@ -471,6 +471,7 @@ $boot_source = alert_method_source($reflection, 'boot');
 $activate_source = alert_method_source($reflection, 'activate');
 $test_data_schema_source = alert_method_source($reflection, 'ensure_application_test_data_schema');
 $save_source = alert_method_source($reflection, 'save_admission_application');
+$submit_prepared_source = alert_method_source($reflection, 'can_submit_prepared_application');
 $upload_source = alert_method_source($reflection, 'upload_admission_document');
 $operations_source = alert_method_source($reflection, 'update_admission_application_operations');
 $delete_source = alert_method_source($reflection, 'delete_admission_document');
@@ -480,7 +481,8 @@ alert_assert_contains('ensure_application_test_data_schema', $boot_source, 'Ever
 alert_assert_contains('isTestData BOOLEAN NOT NULL DEFAULT 0', $activate_source, 'Fresh installations must create the test-data classification column.');
 alert_assert_contains('ADD COLUMN isTestData BOOLEAN NOT NULL DEFAULT 0', $test_data_schema_source, 'Existing installations must add the test-data column before requests use it.');
 alert_assert_contains("'isTestData' => \$next_is_test_data ? 1 : 0", $save_source, 'Server-classified test applications must be persisted before alert evaluation.');
-alert_assert_contains("'profile-preparation' === \$this->canonical_status_key", $save_source, 'Review submission must recognize every canonical preparation status.');
+alert_assert_contains('can_submit_prepared_application', $save_source, 'Application save must use the centralized preparation submission gate.');
+alert_assert_contains("'profile-preparation' === \$this->canonical_status_key", $submit_prepared_source, 'Review submission must recognize every canonical preparation status.');
 alert_assert_contains("false === \$wpdb->query('START TRANSACTION')", $save_source, 'The application save transaction start must be checked.');
 alert_assert_contains('false === $updated', $save_source, 'The primary application update must be checked.');
 alert_assert_contains('false === $inserted || 0 === $inserted', $save_source, 'The primary application insert must be checked.');
@@ -514,6 +516,6 @@ alert_assert_not_contains('send_application_activity_alert', $rest_email_source,
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
 alert_assert_not_contains('should_send_draft_creation_alert', $plugin_source, 'The obsolete first-draft email gate must be absent from the plugin.');
 alert_assert_not_contains("'new-application-created'", $plugin_source, 'The obsolete first-draft email event must be absent from the plugin.');
-alert_assert_contains('Version: 0.2.58', $plugin_source, 'The plugin header must advertise version 0.2.58.');
+alert_assert_contains('Version: 0.2.59', $plugin_source, 'The plugin header must advertise version 0.2.59.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;

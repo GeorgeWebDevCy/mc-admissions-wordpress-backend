@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.58
+ * Version: 0.2.59
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -380,24 +380,28 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return true;
 			}
 
-			$agent_roles = array('mc_agent', 'mc-agent', 'agency', 'agent', 'consultant', 'admissions-agent', 'subscriber');
-			if (empty($wp_user->roles) || !array_intersect($agent_roles, (array) $wp_user->roles)) {
+			if (!$this->is_external_agent_user(array('roles' => array_values((array) $wp_user->roles)))) {
 				return true;
 			}
 
 			$current_display_name = trim((string) $wp_user->display_name);
 			$username = trim((string) $wp_user->user_login);
-			$legacy_agency_name = $this->legacy_agency_name_for_user((int) $user_id);
-			if ('' !== $legacy_agency_name) {
-				$target_display_name = 0 === strcasecmp($legacy_agency_name, $username)
-					? trim((string) preg_replace('/[-_]+/', ' ', $legacy_agency_name))
-					: $legacy_agency_name;
+			$normalized_username = trim((string) preg_replace('/[-_]+/', ' ', $username));
+			if (preg_match('/[-_]/', $username)) {
+				// Agency usernames commonly encode the agency name with separators.
+				// Treat that convention as authoritative even when WordPress was
+				// originally provisioned with an individual's display name.
+				$target_display_name = $normalized_username;
 			} elseif ('' !== $current_display_name && 0 !== strcasecmp($current_display_name, $username)) {
-				// No legacy agency snapshot exists, so preserve an intentional custom
-				// WordPress display name rather than guessing a replacement.
-				return true;
+				$legacy_agency_name = $this->legacy_agency_name_for_user((int) $user_id);
+				$target_display_name = '' !== $legacy_agency_name
+					? $legacy_agency_name
+					: $current_display_name;
 			} else {
-				$target_display_name = trim((string) preg_replace('/[-_]+/', ' ', $username));
+				$legacy_agency_name = $this->legacy_agency_name_for_user((int) $user_id);
+				$target_display_name = '' !== $legacy_agency_name
+					? $legacy_agency_name
+					: $normalized_username;
 			}
 
 			if ('' === $target_display_name || $target_display_name === $current_display_name) {
@@ -488,12 +492,25 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'agencyName'        => $identity['agencyName'],
 				'consultantEmail'   => $identity['consultantEmail'],
 			);
-			$application_data = $profile_data;
+			$application_assignments = array(
+				'wordpressUsername = %s',
+				'wordpressEmail = %s',
+				'agencyName = %s',
+				'consultantEmail = %s',
+			);
+			$application_args = array(
+				$identity['wordpressUsername'],
+				$identity['wordpressEmail'],
+				$identity['agencyName'],
+				$identity['consultantEmail'],
+			);
 			if (!empty($identity['profileComplete'])) {
 				$profile_data['consultantName'] = $identity['consultantName'];
 				$profile_data['consultantPhone'] = $identity['consultantPhone'];
-				$application_data['consultantName'] = $identity['consultantName'];
-				$application_data['consultantPhone'] = $identity['consultantPhone'];
+				$application_assignments[] = 'consultantName = %s';
+				$application_assignments[] = 'consultantPhone = %s';
+				$application_args[] = $identity['consultantName'];
+				$application_args[] = $identity['consultantPhone'];
 			}
 
 			// Identity snapshots deliberately do not touch updatedAt. A WordPress
@@ -504,10 +521,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$profile_data,
 				array('wordpressUserId' => (int) $user_id)
 			);
-			$applications_written = $wpdb->update(
-				$this->applications_table,
-				$application_data,
-				array('wordpressUserId' => (int) $user_id)
+			// This column has ON UPDATE CURRENT_TIMESTAMP in the live schema.
+			// Explicitly assigning it to itself prevents identity-only snapshot
+			// repairs from changing the application's optimistic-lock version.
+			$application_assignments[] = 'updatedAt = updatedAt';
+			$application_args[] = (int) $user_id;
+			$applications_written = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$this->applications_table} SET " . implode(', ', $application_assignments) . ' WHERE wordpressUserId = %d',
+					$application_args
+				)
 			);
 
 			if (false === $profile_written || false === $applications_written) {
@@ -524,7 +547,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		public function schedule_authoritative_agency_identity_backfill() {
-			if ('0.2.58' === get_option('mc_admissions_agency_identity_version')) {
+			if ('0.2.59' === get_option('mc_admissions_agency_identity_version')) {
 				return;
 			}
 			if (!function_exists('wp_next_scheduled') || !function_exists('wp_schedule_single_event')) {
@@ -570,7 +593,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private function ensure_authoritative_agency_identity_backfill() {
 			global $wpdb;
 
-			if ('0.2.58' === get_option('mc_admissions_agency_identity_version')) {
+			if ('0.2.59' === get_option('mc_admissions_agency_identity_version')) {
 				return;
 			}
 
@@ -634,7 +657,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			if (count((array) $user_ids) < $batch_size) {
-				update_option('mc_admissions_agency_identity_version', '0.2.58', false);
+				update_option('mc_admissions_agency_identity_version', '0.2.59', false);
 				delete_option('mc_admissions_agency_identity_cursor');
 				delete_option('mc_admissions_agency_identity_agent_cursor');
 				delete_option('mc_admissions_agency_identity_agent_phase_complete');
@@ -3863,11 +3886,18 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function rest_list_agents() {
 			global $wpdb;
 			$user = $this->current_session_user();
-			if (!$this->is_admin_user($user)) {
-				return $this->json_error_response('Administrator access required.', 403);
+			if (!$this->can_assign_application_owner($user)) {
+				return $this->json_error_response('Administrator or Admissions Officer access required.', 403);
 			}
 
-			$agents = get_users(array('role__in' => array('mc_agent'), 'orderby' => 'display_name', 'order' => 'ASC'));
+			$agents = array_values(array_filter(
+				get_users(array('role__in' => array('mc_agent'), 'orderby' => 'display_name', 'order' => 'ASC')),
+				function ($agent) {
+					return $this->is_external_agent_user(
+						array('roles' => array_values((array) $agent->roles))
+					);
+				}
+			));
 			$profiles_by_user = array();
 			if (!empty($agents)) {
 				$agent_ids = array_map('absint', wp_list_pluck($agents, 'ID'));
@@ -4415,6 +4445,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return !empty($user['roles']) && in_array('administrator', $user['roles'], true);
 		}
 
+		private function can_assign_application_owner($user) {
+			return $this->is_admin_user($user)
+				|| $this->user_has_any_role($user, array('admissions-officer'));
+		}
+
 		private function can_access_agent_media($user) {
 			if ($this->is_admin_user($user)) {
 				return true;
@@ -4442,14 +4477,27 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return !empty($user['roles']) && count(array_intersect($allowed_roles, (array) $user['roles'])) > 0;
 		}
 
+		private function can_continue_assigned_preparation($user, $status) {
+			return $this->can_assign_application_owner($user)
+				&& 'profile-preparation' === $this->canonical_status_key((string) $status);
+		}
+
+		private function can_submit_prepared_application($user, $status) {
+			return 'profile-preparation' === $this->canonical_status_key((string) $status)
+				&& ($this->is_agent_user($user) || $this->can_continue_assigned_preparation($user, $status));
+		}
+
 		private function resolve_application_owner($user, $assigned_agent_id) {
-			if ($this->is_admin_user($user)) {
+			if ($this->can_assign_application_owner($user)) {
 				if (!$assigned_agent_id) {
 					throw new Exception('Select an agent before creating the application.');
 				}
 
 				$agent = get_userdata((int) $assigned_agent_id);
-				if (!$agent || !$this->is_agent_user(array('roles' => array_values((array) $agent->roles)))) {
+				$agent_user = $agent
+					? array('roles' => array_values((array) $agent->roles))
+					: array('roles' => array());
+				if (!$agent || !$this->is_external_agent_user($agent_user)) {
 					throw new Exception('The selected application owner is not a valid agent.');
 				}
 
@@ -4463,7 +4511,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			if ($assigned_agent_id) {
-				throw new Exception('Only an administrator can assign an application to another agent.');
+				throw new Exception('Only an administrator or Admissions Officer can assign an application to another agent.');
+			}
+
+			if (!$this->is_external_agent_user($user)) {
+				throw new Exception('Only an external agent, administrator, or Admissions Officer can create an application.');
 			}
 
 			return $user;
@@ -6148,15 +6200,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			try {
 				if ($record_id) {
-					if (!$this->can_edit_application_data($user)) {
+					$existing_application = $this->get_authorized_application_base($record_id, $user);
+					$can_continue_assigned_preparation = $this->can_continue_assigned_preparation($user, $existing_application['status']);
+					if (!$this->can_edit_application_data($user) && !$can_continue_assigned_preparation) {
 						throw new Exception('You do not have permission to edit application data.');
 					}
 
-					$existing_application = $this->get_authorized_application_base($record_id, $user);
 					$owner_identity = $this->authoritative_agency_contact(
 						isset($existing_application['wordpressUserId']) ? (int) $existing_application['wordpressUserId'] : 0,
 						$existing_application,
-						$this->is_external_agent_user($user)
+						$this->is_external_agent_user($user) || $can_continue_assigned_preparation
 					);
 					$identity_safe_draft = array_merge(
 						$draft,
@@ -6167,8 +6220,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'consultantPhone' => $owner_identity['consultantPhone'],
 						)
 					);
-					$is_preparation_status = 'profile-preparation' === $this->canonical_status_key((string) $existing_application['status']);
-					$is_submitting_prepared_application = 'review' === $mode && ($this->is_agent_user($user) || $this->is_admin_user($user)) && $is_preparation_status;
+					$is_submitting_prepared_application = 'review' === $mode && $this->can_submit_prepared_application($user, $existing_application['status']);
 					$should_notify_review_submission = $is_submitting_prepared_application && $this->is_external_agent_user($user);
 					$next_is_test_data = $this->resolve_application_test_data(
 						$identity_safe_draft,
@@ -6178,7 +6230,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					);
 
 					if ('review' === $mode && !$is_submitting_prepared_application) {
-						throw new Exception('Only an agent or administrator can submit an application that is still in preparation.');
+						throw new Exception('Only an agent, administrator, or Admissions Officer can submit an application that is still in preparation.');
 					}
 
 					$update_sql = "
