@@ -106,6 +106,14 @@ function register_activation_hook(...$args) {
 	return true;
 }
 
+function is_email($email) {
+	return false !== filter_var((string) $email, FILTER_VALIDATE_EMAIL);
+}
+
+function get_userdata($user_id) {
+	return false;
+}
+
 require dirname(__DIR__) . '/mc-admissions-wordpress-backend.php';
 
 $plugin = mc_admissions_wordpress_backend();

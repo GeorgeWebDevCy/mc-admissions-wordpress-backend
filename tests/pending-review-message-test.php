@@ -376,6 +376,10 @@ function wp_mail($to, $subject, $message, $headers = array(), $attachments = arr
 	return (bool) $GLOBALS['mc_pending_mail_result'];
 }
 
+function get_userdata($user_id) {
+	return false;
+}
+
 require dirname(__DIR__) . '/mc-admissions-wordpress-backend.php';
 
 function pending_assert_same($expected, $actual, $message) {
