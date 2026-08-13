@@ -84,6 +84,8 @@ final class MC_Pending_Message_Test_Wpdb {
 	public $communications = array();
 	public $events = array();
 	public $force_stale = false;
+	public $fail_authoritative_read_after_commit = false;
+	public $fail_rich_read_after_commit = false;
 	public $audit_insert_false_tables = array();
 	public $audit_insert_exception_tables = array();
 	private $committed = false;
@@ -112,6 +114,16 @@ final class MC_Pending_Message_Test_Wpdb {
 		$this->events[] = 'get_row:' . trim(preg_replace('/\s+/', ' ', $query));
 
 		if (false !== strpos($query, 'FROM mc_admission_applications')) {
+			if (
+				$this->fail_authoritative_read_after_commit
+				&& $this->committed
+				&& false !== strpos($query, 'SELECT id, referenceCode, wordpressUserId')
+			) {
+				throw new RuntimeException('Offline post-commit authoritative review read failure.');
+			}
+			if ($this->fail_rich_read_after_commit && $this->committed && false !== strpos($query, 'SELECT *')) {
+				throw new RuntimeException('Offline post-commit rich case read failure.');
+			}
 			if (false !== strpos($query, 'SELECT status, reviewerDecision, workflowNote')) {
 				return array(
 					'status' => $this->application['status'],
@@ -251,6 +263,8 @@ final class MC_Pending_Message_Test_Wpdb {
 		$this->communications = array();
 		$this->events = array();
 		$this->force_stale = false;
+		$this->fail_authoritative_read_after_commit = false;
+		$this->fail_rich_read_after_commit = false;
 		$this->audit_insert_false_tables = array();
 		$this->audit_insert_exception_tables = array();
 		$this->committed = false;
@@ -266,6 +280,7 @@ $GLOBALS['mc_pending_mail_result'] = true;
 $GLOBALS['mc_pending_mail_exception'] = null;
 $GLOBALS['mc_pending_uuid'] = 0;
 $GLOBALS['mc_pending_current_user'] = null;
+$GLOBALS['mc_pending_identity_exception'] = false;
 
 function __($text, $domain = null) {
 	return $text;
@@ -377,6 +392,9 @@ function wp_mail($to, $subject, $message, $headers = array(), $attachments = arr
 }
 
 function get_userdata($user_id) {
+	if (!empty($GLOBALS['mc_pending_identity_exception'])) {
+		throw new RuntimeException('Offline authoritative agency identity failure.');
+	}
 	return false;
 }
 
@@ -516,6 +534,7 @@ function reset_pending_case(array $overrides = array()) {
 	$GLOBALS['mc_pending_mail_calls'] = array();
 	$GLOBALS['mc_pending_mail_result'] = true;
 	$GLOBALS['mc_pending_mail_exception'] = null;
+	$GLOBALS['mc_pending_identity_exception'] = false;
 	$GLOBALS['mc_pending_current_user'] = pending_wp_user(array('admissions-officer'));
 }
 
@@ -531,10 +550,24 @@ function invoke_pending_command($method, $expected_updated_at = '2026-08-11T10:0
 	);
 }
 
+function invoke_rejection_command($method, $expected_updated_at = '2026-08-11T10:00:00.000Z', $reason = 'The entry requirements were not met.') {
+	return $method->invoke(
+		mc_admissions_wordpress_backend(),
+		array(
+			'applicationId' => 'app-pending-offline',
+			'reason' => $reason,
+			'expectedUpdatedAt' => $expected_updated_at,
+			'user' => pending_internal_user(),
+		)
+	);
+}
+
 $plugin = mc_admissions_wordpress_backend();
 $reflection = new ReflectionClass($plugin);
 $pending_command = $reflection->getMethod('send_pending_review_message');
 $pending_command->setAccessible(true);
+$rejection_command = $reflection->getMethod('reject_review_application');
+$rejection_command->setAccessible(true);
 $can_assess = $reflection->getMethod('can_assess_admission_documents');
 $can_assess->setAccessible(true);
 
@@ -553,6 +586,20 @@ $pending_route = $pending_routes[0]['args'];
 pending_assert_same(WP_REST_Server::CREATABLE, $pending_route['methods'], 'The pending-message route must use POST.');
 pending_assert_same(array($plugin, 'rest_send_pending_review_message'), $pending_route['callback'], 'The route must use the dedicated handler.');
 pending_assert_same(array($plugin, 'permission_authenticated'), $pending_route['permission_callback'], 'The route must require an authenticated session.');
+
+$rejection_routes = array_values(
+	array_filter(
+		$GLOBALS['mc_pending_routes'],
+		function ($route) {
+			return '/applications/(?P<application_id>[A-Za-z0-9_-]+)/rejection' === $route['route'];
+		}
+	)
+);
+pending_assert_same(1, count($rejection_routes), 'The rejection REST route must be registered exactly once.');
+$rejection_route = $rejection_routes[0]['args'];
+pending_assert_same(WP_REST_Server::CREATABLE, $rejection_route['methods'], 'The rejection route must use POST.');
+pending_assert_same(array($plugin, 'rest_reject_review_application'), $rejection_route['callback'], 'The rejection route must use the dedicated handler.');
+pending_assert_same(array($plugin, 'permission_authenticated'), $rejection_route['permission_callback'], 'The rejection route must require an authenticated session.');
 
 pending_assert_same(true, $can_assess->invoke($plugin, pending_internal_user(array('administrator'))), 'Administrators must be able to send pending-review messages.');
 pending_assert_same(true, $can_assess->invoke($plugin, pending_internal_user(array('admissions-officer'))), 'Admissions Officers must be able to send pending-review messages.');
@@ -743,4 +790,171 @@ pending_assert_true(
 	'The email must use an authoritative post-save application record.'
 );
 
-echo "Pending review message tests passed.\n";
+// Rejection uses its own required reason command. The reason is not copied into
+// assessment comments, document remarks, or the generic workflow note.
+$response = $plugin->rest_reject_review_application(
+	pending_request(array('reason' => '  ', 'expectedUpdatedAt' => 'version'))
+);
+pending_assert_same(400, $response->get_status(), 'An empty rejection reason must be rejected.');
+pending_assert_same('A rejection reason is required.', $response->get_data()['error'], 'The empty-reason error must be explicit.');
+
+$response = $plugin->rest_reject_review_application(
+	pending_request(array('reason' => str_repeat('x', 4001), 'expectedUpdatedAt' => 'version'))
+);
+pending_assert_same(400, $response->get_status(), 'A rejection reason over 4,000 characters must be rejected.');
+pending_assert_same('The rejection reason must be 4,000 characters or fewer.', $response->get_data()['error'], 'The rejection length error must state the limit.');
+
+$response = $plugin->rest_reject_review_application(
+	pending_request(array('reason' => 'The entry requirements were not met.'))
+);
+pending_assert_same(400, $response->get_status(), 'A missing rejection application version must be rejected.');
+pending_assert_same('Application version is required.', $response->get_data()['error'], 'The rejection version error must be explicit.');
+
+reset_pending_case();
+$GLOBALS['mc_pending_current_user'] = pending_wp_user(array('mc_agent'));
+$response = $plugin->rest_reject_review_application(
+	pending_request(array('reason' => 'Agent must not reject this.', 'expectedUpdatedAt' => '2026-08-11T10:00:00.000Z'))
+);
+pending_assert_same(403, $response->get_status(), 'An agent must not use the staff rejection action.');
+pending_assert_same('pending', $GLOBALS['wpdb']->application['reviewerDecision'], 'A denied rejection must not change the review decision.');
+pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A denied rejection must not call wp_mail.');
+
+reset_pending_case();
+$typed_reason = 'The submitted qualifications do not meet the programme entry requirements.';
+$response = $plugin->rest_reject_review_application(
+	pending_request(array('reason' => $typed_reason, 'expectedUpdatedAt' => '2026-08-11T10:00:00.000Z'))
+);
+pending_assert_same(200, $response->get_status(), 'A valid rejection request must succeed.');
+$rejection_data = $response->get_data();
+pending_assert_same(true, $rejection_data['ok'], 'The rejection response must mark the command successful.');
+pending_assert_same('rejected', $rejection_data['application']['stageKey'], 'The authoritative case must move to Rejected.');
+pending_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'The stored stage must be rejected.');
+pending_assert_same('rejected', $GLOBALS['wpdb']->application['reviewerDecision'], 'The stored review decision must be rejected.');
+pending_assert_same(null, $GLOBALS['wpdb']->application['reviewSummary'], 'The rejection reason must not become an assessment comment.');
+pending_assert_true($typed_reason !== $GLOBALS['wpdb']->application['workflowNote'], 'The rejection reason must not become the generic workflow note.');
+pending_assert_same(
+	array('ok' => true, 'skipped' => false, 'sentCount' => 1, 'failedCount' => 0, 'error' => null),
+	$rejection_data['delivery'],
+	'The rejection response must expose exact delivery results.'
+);
+pending_assert_same(1, count($GLOBALS['mc_pending_mail_calls']), 'A rejection must send exactly one email.');
+$rejection_mail = $GLOBALS['mc_pending_mail_calls'][0];
+pending_assert_same(array('consultant@example.invalid'), $rejection_mail['to'], 'The rejection email must target the originating consultant only.');
+pending_assert_same('Application closed after review for Offline Student (MC-PENDING1)', $rejection_mail['subject'], 'The rejection subject must identify the application.');
+pending_assert_contains($typed_reason, $rejection_mail['message'], 'The rejection email must contain the exact typed reason.');
+pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'The rejection delivery must create one separate communication audit.');
+pending_assert_same('app-pending-offline', $GLOBALS['wpdb']->communications[0]['applicationId'], 'The rejection audit must use the database application id, not the public reference code.');
+pending_assert_contains($typed_reason, $GLOBALS['wpdb']->communications[0]['detail'], 'The rejection audit must retain the distinct reason.');
+pending_assert_contains('Email delivery: sent to 1 recipient(s).', $GLOBALS['wpdb']->communications[0]['detail'], 'The rejection audit must record successful delivery.');
+$rejection_commit_index = array_search('query:COMMIT', $GLOBALS['wpdb']->events, true);
+$rejection_mail_index = array_search('mail:' . $rejection_mail['subject'], $GLOBALS['wpdb']->events, true);
+pending_assert_true(
+	false !== $rejection_commit_index && false !== $rejection_mail_index && $rejection_commit_index < $rejection_mail_index,
+	'The rejection must commit before wp_mail is called.'
+);
+
+// A post-commit rich case read failure must return the committed fallback case,
+// deliver the reason once, and never invite a duplicate retry.
+reset_pending_case();
+$GLOBALS['wpdb']->fail_rich_read_after_commit = true;
+$rich_read_response = $plugin->rest_reject_review_application(
+	pending_request(array('reason' => 'Rejected despite the offline reload failure.', 'expectedUpdatedAt' => '2026-08-11T10:00:00.000Z'))
+);
+pending_assert_same(200, $rich_read_response->get_status(), 'A committed rejection must survive a post-commit rich case read failure.');
+$rich_read_data = $rich_read_response->get_data();
+pending_assert_same('rejected', $rich_read_data['application']['stageKey'], 'The fallback case must expose the committed rejected stage.');
+pending_assert_same('rejected', $rich_read_data['application']['reviewerDecision'], 'The fallback case must expose the committed rejected decision.');
+pending_assert_same(1, count($GLOBALS['mc_pending_mail_calls']), 'A rich-read failure must not duplicate or suppress the rejection email.');
+pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'A rich-read failure must retain one delivery audit.');
+
+// A post-commit authoritative review reread failure must also return the
+// committed result instead of inviting the operator to submit the rejection
+// a second time.
+reset_pending_case();
+$GLOBALS['wpdb']->fail_authoritative_read_after_commit = true;
+$authoritative_read_response = $plugin->rest_reject_review_application(
+	pending_request(array('reason' => 'Rejected despite the authoritative reread failure.', 'expectedUpdatedAt' => '2026-08-11T10:00:00.000Z'))
+);
+pending_assert_same(200, $authoritative_read_response->get_status(), 'A committed rejection must survive a post-commit authoritative review reread failure.');
+$authoritative_read_data = $authoritative_read_response->get_data();
+pending_assert_same('rejected', $authoritative_read_data['application']['stageKey'], 'The authoritative reread fallback must expose the committed rejected stage.');
+pending_assert_same('rejected', $authoritative_read_data['application']['reviewerDecision'], 'The authoritative reread fallback must expose the committed rejected decision.');
+pending_assert_same(1, count($GLOBALS['mc_pending_mail_calls']), 'An authoritative reread failure must not duplicate or suppress the rejection email.');
+pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'An authoritative reread failure must retain one delivery audit.');
+
+// An exceptional authoritative owner lookup after commit is a delivery failure,
+// not a mutation failure. It must be audited while the response remains successful.
+reset_pending_case();
+$GLOBALS['mc_pending_identity_exception'] = true;
+$identity_response = $plugin->rest_reject_review_application(
+	pending_request(array('reason' => 'Rejected while owner lookup is unavailable.', 'expectedUpdatedAt' => '2026-08-11T10:00:00.000Z'))
+);
+pending_assert_same(200, $identity_response->get_status(), 'An owner lookup failure must not turn a committed rejection into a retryable response.');
+$identity_data = $identity_response->get_data();
+pending_assert_same('rejected', $identity_data['application']['stageKey'], 'The identity fallback must retain the committed stage.');
+pending_assert_same(false, $identity_data['delivery']['ok'], 'Owner lookup failure must not claim delivery success.');
+pending_assert_same(false, $identity_data['delivery']['skipped'], 'Owner lookup failure is an audited delivery failure, not a safe skip.');
+pending_assert_contains('originating agency identity could not be resolved', $identity_data['delivery']['error'], 'The delivery result must explain the owner lookup failure.');
+pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'No email may be attempted without an authoritative owner identity.');
+pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'Owner lookup failure must create one separate delivery audit.');
+pending_assert_contains('Email delivery failed:', $GLOBALS['wpdb']->communications[0]['detail'], 'The owner lookup audit must classify delivery as failed.');
+
+// A stale rejection rolls back without email or delivery audit.
+reset_pending_case();
+$GLOBALS['wpdb']->force_stale = true;
+$response = $plugin->rest_reject_review_application(
+	pending_request(array('reason' => 'This command is stale.', 'expectedUpdatedAt' => '2026-08-11T10:00:00.000Z'))
+);
+pending_assert_same(409, $response->get_status(), 'A stale rejection must be a conflict.');
+pending_assert_same('pending', $GLOBALS['wpdb']->application['reviewerDecision'], 'A stale rejection must roll back the decision.');
+pending_assert_same('review-pending', $GLOBALS['wpdb']->application['status'], 'A stale rejection must preserve the review stage.');
+pending_assert_same(0, count($GLOBALS['wpdb']->communications), 'A stale rejection must not create an email audit.');
+pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A stale rejection must not call wp_mail.');
+
+// A transport failure is reported after the rejection remains durably committed.
+reset_pending_case();
+$GLOBALS['mc_pending_mail_result'] = false;
+$failed_rejection = invoke_rejection_command($rejection_command);
+pending_assert_same(false, $failed_rejection['delivery']['ok'], 'A refused rejection email must not report delivery success.');
+pending_assert_same(false, $failed_rejection['delivery']['skipped'], 'A refused rejection email is a failure, not a skip.');
+pending_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'Mail failure must not roll back the committed rejection.');
+pending_assert_same('rejected', $GLOBALS['wpdb']->application['reviewerDecision'], 'Mail failure must not roll back the rejected decision.');
+pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'A failed rejection email must remain visible in the audit.');
+pending_assert_contains('Email delivery failed:', $GLOBALS['wpdb']->communications[0]['detail'], 'The rejection audit must classify failed delivery.');
+
+// Test-data rejection changes state but remains completely silent.
+reset_pending_case(array('isTestData' => 1));
+$test_rejection = invoke_rejection_command($rejection_command);
+pending_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'Test data may exercise the offline rejection state transition.');
+pending_assert_same(true, $test_rejection['delivery']['skipped'], 'Test-data rejection delivery must be safely skipped.');
+pending_assert_same('Test-data applications do not send email.', $test_rejection['delivery']['error'], 'The test-data skip reason must be explicit.');
+pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'Test-data rejection must never call wp_mail.');
+pending_assert_same(0, count($GLOBALS['wpdb']->communications), 'Test-data rejection must not create email-delivery audit noise.');
+
+// Wrong-stage rejection fails before a transaction or email.
+reset_pending_case(array('status' => 'offer-issued'));
+pending_assert_throws_message(
+	'Only an application awaiting review can be rejected.',
+	function () use ($rejection_command) {
+		invoke_rejection_command($rejection_command);
+	},
+	'Only review-pending applications may use the rejection action.'
+);
+pending_assert_same(false, in_array('query:START TRANSACTION', $GLOBALS['wpdb']->events, true), 'A wrong-stage rejection must fail before a transaction.');
+pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A wrong-stage rejection must not email anyone.');
+
+$rejection_method = $reflection->getMethod('reject_review_application');
+$rejection_lines = file($rejection_method->getFileName());
+$rejection_source = implode('', array_slice($rejection_lines, $rejection_method->getStartLine() - 1, $rejection_method->getEndLine() - $rejection_method->getStartLine() + 1));
+pending_assert_contains("'draft' => array('reviewerDecision' => 'rejected')", $rejection_source, 'The rejection command must change only the review decision.');
+pending_assert_contains("'suppressReviewRejectionNotification' => true", $rejection_source, 'The dedicated reason must replace the generic rejection email.');
+pending_assert_contains("'dedicatedReviewRejection' => true", $rejection_source, 'Only the dedicated rejection command may authorize the rejected decision transition.');
+pending_assert_contains("\$reason,\n\t\t\t\tfalse", $rejection_source, 'Each newly committed rejection must send its current reason even when an older rejection audit exists.');
+pending_assert_true(
+	strpos($rejection_source, '$this->update_admission_application_operations(') < strpos($rejection_source, '$this->send_review_rejection_notification('),
+	'The rejection command must save before attempting email.'
+);
+pending_assert_true(false === strpos($rejection_source, 'reviewSummary'), 'The rejection reason must not be coupled to review comments.');
+pending_assert_true(false === strpos($rejection_source, 'workflowNote'), 'The rejection reason must not be coupled to workflow notes.');
+
+echo "Pending and rejected review message tests passed.\n";

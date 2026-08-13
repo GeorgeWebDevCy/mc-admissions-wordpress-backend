@@ -39,6 +39,7 @@ final class MC_Alert_Test_Role {
 final class MC_Alert_Test_Wpdb {
 	public $insert_calls = array();
 	public $throw_on_insert = false;
+	public $throw_on_get_row = false;
 
 	public function prepare($query, ...$args) {
 		foreach ($args as $arg) {
@@ -56,6 +57,14 @@ final class MC_Alert_Test_Wpdb {
 			&& false !== strpos((string) $query, 'mc_admission_communications')
 		) {
 			return 'mc_admission_communications';
+		}
+
+		return null;
+	}
+
+	public function get_row($query, $output = null) {
+		if ($this->throw_on_get_row) {
+			throw new RuntimeException('Offline authoritative identity failure.');
 		}
 
 		return null;
@@ -90,6 +99,7 @@ $GLOBALS['mc_alert_users'] = array(
 	),
 	(object) array(
 		'ID' => 2,
+		'user_login' => 'external-agent',
 		'display_name' => 'Agent Actor',
 		'user_email' => 'actor@example.test',
 		'roles' => array('mc_agent'),
@@ -117,6 +127,18 @@ $GLOBALS['mc_alert_users'] = array(
 		'display_name' => 'Admissions Officer',
 		'user_email' => 'admissions@example.test',
 		'roles' => array('admissions-officer'),
+	),
+	(object) array(
+		'ID' => 7,
+		'display_name' => 'Migration Officer',
+		'user_email' => 'migration@example.test',
+		'roles' => array('migration-officer'),
+	),
+	(object) array(
+		'ID' => 8,
+		'display_name' => 'Registrar',
+		'user_email' => 'registrar@example.test',
+		'roles' => array('registrar'),
 	),
 );
 
@@ -263,6 +285,7 @@ function alert_reset_side_effects() {
 	$GLOBALS['mc_alert_mail_exceptions'] = array();
 	$GLOBALS['wpdb']->insert_calls = array();
 	$GLOBALS['wpdb']->throw_on_insert = false;
+	$GLOBALS['wpdb']->throw_on_get_row = false;
 }
 
 function alert_mail_addresses() {
@@ -289,11 +312,31 @@ $payload_method = $reflection->getMethod('application_activity_alert_payload');
 $payload_method->setAccessible(true);
 $send = $reflection->getMethod('send_application_activity_alert');
 $send->setAccessible(true);
+$workflow_definition = $reflection->getMethod('workflow_stage_notification_definition');
+$workflow_definition->setAccessible(true);
+$workflow_role_payload = $reflection->getMethod('workflow_role_notification_payload');
+$workflow_role_payload->setAccessible(true);
+$workflow_consultant_payload = $reflection->getMethod('workflow_stage_consultant_notification_payload');
+$workflow_consultant_payload->setAccessible(true);
+$workflow_note_targets = $reflection->getMethod('workflow_note_notification_targets');
+$workflow_note_targets->setAccessible(true);
+$send_role_notification = $reflection->getMethod('send_application_role_notification');
+$send_role_notification->setAccessible(true);
+$send_workflow_notifications = $reflection->getMethod('send_workflow_notifications');
+$send_workflow_notifications->setAccessible(true);
 
 $application = array(
 	'id' => 'application-1',
 	'referenceCode' => 'MC-10000001',
 	'fullName' => 'Offline Applicant',
+	'wordpressUserId' => 2,
+	'wordpressUsername' => 'external-agent',
+	'wordpressEmail' => 'actor@example.test',
+	'agencyName' => 'Offline Agency',
+	'consultantName' => 'Offline Consultant',
+	'consultantEmail' => 'actor@example.test',
+	'consultantPhone' => '+357 25000000',
+	'email' => 'student@example.test',
 	'status' => 'review-pending',
 	'isTestData' => 0,
 );
@@ -441,6 +484,176 @@ alert_assert_same(true, $bank_result['ok'], 'The combined bank confirmation aler
 alert_assert_same(5, count(alert_mail_addresses()), 'The bank alert must add one deduplicated Finance recipient.');
 alert_assert_same(1, count(array_keys(alert_mail_addresses(), 'finance@example.test', true)), 'Finance must receive one message, not a second alert.');
 
+$workflow_matrix = array(
+	'review-pending' => array('admissions-officer', 'administrator'),
+	'offer-issued' => array('admissions-officer', 'finance-officer'),
+	'prepayment-pending' => array('finance-officer', 'admissions-officer'),
+	'acceptance-issued' => array('migration-officer', 'admissions-officer'),
+	'migration-documents' => array('migration-officer'),
+	'entry-permit-processing' => array('migration-officer'),
+	'arrival-immigration' => array('immigration-officer', 'registrar'),
+	'enrollment-complete' => array('registrar'),
+	'rejected' => array('admissions-officer', 'administrator'),
+);
+foreach ($workflow_matrix as $workflow_status => $expected_roles) {
+	$definition = $workflow_definition->invoke($plugin, $workflow_status);
+	alert_assert_same($expected_roles, $definition['roles'], $workflow_status . ' must preserve the direct-Prisma role handoff matrix.');
+}
+alert_assert_same(null, $workflow_definition->invoke($plugin, 'profile-preparation'), 'Preparation has no workflow-stage handoff.');
+alert_assert_same(null, $workflow_definition->invoke($plugin, 'trashed'), 'Trash has no workflow-stage handoff.');
+
+$review_role_payload = $workflow_role_payload->invoke(
+	$plugin,
+	$application,
+	$internal_user,
+	'review-pending',
+	'Manual admissions review handoff.'
+);
+alert_assert_same(array('admissions-officer'), $review_role_payload['roles'], 'The actor role must be excluded from a workflow handoff.');
+alert_assert_contains('Workflow handoff: Pending assessment', $review_role_payload['subject'], 'The workflow subject must use the shared stage label.');
+alert_assert_contains('Owner: Admissions Office.', $review_role_payload['message'], 'The workflow message must name the shared stage owner.');
+
+$finance_user = array(
+	'id' => 5,
+	'name' => 'Finance Officer',
+	'email' => 'finance@example.test',
+	'roles' => array('finance-officer'),
+);
+$offer_role_payload = $workflow_role_payload->invoke(
+	$plugin,
+	$application,
+	$finance_user,
+	'offer-issued',
+	null
+);
+alert_assert_same(array('admissions-officer'), $offer_role_payload['roles'], 'Finance must not receive its own role handoff.');
+alert_assert_same(null, $workflow_consultant_payload->invoke($plugin, $application, 'review-pending'), 'Review entry has no separate consultant stage email.');
+foreach (array('offer-issued', 'acceptance-issued', 'rejected') as $consultant_status) {
+	alert_assert_same(
+		false,
+		null === $workflow_consultant_payload->invoke($plugin, $application, $consultant_status),
+		$consultant_status . ' must retain the originating-consultant stage notification.'
+	);
+}
+alert_assert_same(
+	array('roles' => array('finance-officer', 'admissions-officer'), 'notifyAgent' => true),
+	$workflow_note_targets->invoke($plugin, 'prepayment-pending'),
+	'Prepayment workflow notes must preserve agent and internal-role routing.'
+);
+alert_assert_same(
+	false,
+	$workflow_note_targets->invoke($plugin, 'arrival-immigration')['notifyAgent'],
+	'Arrival workflow notes must remain internal.'
+);
+
+alert_reset_side_effects();
+$role_result = $send_role_notification->invoke(
+	$plugin,
+	$application,
+	$internal_user,
+	array_merge($offer_role_payload, array('roles' => array('admissions-officer', 'finance-officer')))
+);
+alert_assert_same(true, $role_result['ok'], 'A workflow-role handoff must deliver through wp_mail.');
+$role_addresses = alert_mail_addresses();
+sort($role_addresses);
+alert_assert_same(array('admissions@example.test', 'finance@example.test'), $role_addresses, 'Each resolved role mailbox must receive exactly one email regardless of WordPress user-query order.');
+alert_assert_same(2, count($GLOBALS['wpdb']->insert_calls), 'A workflow-role delivery must write communication and activity audits.');
+
+alert_reset_side_effects();
+$review_results = $send_workflow_notifications->invoke(
+	$plugin,
+	$application,
+	$internal_user,
+	true,
+	true,
+	'review-pending',
+	'Manual admissions review handoff.'
+);
+alert_assert_same(array('roleHandoff', 'consultantNote'), array_keys($review_results), 'Review entry must send one internal handoff and one external workflow-note notification.');
+alert_assert_same(array('admissions@example.test', 'actor@example.test'), alert_mail_addresses(), 'Administrator review entry must notify Admissions and the owning agent, not the actor role.');
+alert_assert_same(4, count($GLOBALS['wpdb']->insert_calls), 'Both review-entry emails must have separate communication and activity audits.');
+
+alert_reset_side_effects();
+$note_only_results = $send_workflow_notifications->invoke(
+	$plugin,
+	$application,
+	$finance_user,
+	false,
+	true,
+	'prepayment-pending',
+	'Updated payment follow-up.'
+);
+alert_assert_same(array('consultantNote', 'roleNote'), array_keys($note_only_results), 'A note-only workflow update must notify the eligible consultant and operational role.');
+alert_assert_same(array('actor@example.test', 'admissions@example.test'), alert_mail_addresses(), 'A Finance-authored payment note must exclude Finance and notify the agent plus Admissions.');
+
+alert_reset_side_effects();
+$noop_results = $send_workflow_notifications->invoke(
+	$plugin,
+	$application,
+	$internal_user,
+	false,
+	false,
+	'review-pending',
+	'No change.'
+);
+alert_assert_same(array(), $noop_results, 'A stale or no-op workflow command must not dispatch email.');
+alert_assert_same(array(), $GLOBALS['mc_alert_mail_calls'], 'A stale or no-op workflow command must never call wp_mail.');
+alert_assert_same(array(), $GLOBALS['wpdb']->insert_calls, 'A stale or no-op workflow command must not add email audit rows.');
+
+alert_reset_side_effects();
+$test_workflow_results = $send_workflow_notifications->invoke(
+	$plugin,
+	array_merge($application, array('isTestData' => 1)),
+	$internal_user,
+	true,
+	true,
+	'review-pending',
+	'Test-only note.'
+);
+alert_assert_same(array(), $test_workflow_results, 'Test-data workflow changes must remain silent.');
+alert_assert_same(array(), $GLOBALS['mc_alert_mail_calls'], 'Test-data workflow changes must never call wp_mail.');
+alert_assert_same(array(), $GLOBALS['wpdb']->insert_calls, 'Test-data workflow changes must not add delivery audit noise.');
+
+alert_reset_side_effects();
+$GLOBALS['wpdb']->throw_on_get_row = true;
+$identity_failure_results = $send_workflow_notifications->invoke(
+	$plugin,
+	array_merge(
+		$application,
+		array(
+			'wordpressUserId' => 999,
+			'wordpressUsername' => 'missing-owner',
+			'wordpressEmail' => null,
+			'consultantEmail' => null,
+		)
+	),
+	$internal_user,
+	true,
+	true,
+	'review-pending',
+	'Identity lookup failure must not undo the workflow.'
+);
+alert_assert_same(false, $identity_failure_results['consultantNote']['ok'], 'A consultant identity failure must be contained after the workflow save.');
+alert_assert_same(true, $identity_failure_results['roleHandoff']['ok'], 'A consultant failure must not prevent the independent internal handoff.');
+alert_assert_same(array('admissions@example.test'), alert_mail_addresses(), 'The unaffected internal handoff must still deliver after consultant lookup failure.');
+
+alert_reset_side_effects();
+$GLOBALS['mc_alert_mail_failures'] = array('finance@example.test');
+$partial_role = $send_role_notification->invoke(
+	$plugin,
+	$application,
+	$internal_user,
+	array_merge($offer_role_payload, array('roles' => array('admissions-officer', 'finance-officer')))
+);
+alert_assert_same(false, $partial_role['ok'], 'A partial workflow-role delivery must report failure without throwing.');
+alert_assert_same(1, count($partial_role['sent']), 'Successful workflow-role recipients must remain recorded.');
+alert_assert_same(1, count($partial_role['failed']), 'Failed workflow-role recipients must remain recorded.');
+alert_assert_contains(
+	'Email delivery: partially sent to 1 recipient(s); 1 failed.',
+	$GLOBALS['wpdb']->insert_calls[0]['data']['detail'],
+	'Partial workflow-role delivery must be recorded in the communication audit.'
+);
+
 alert_reset_side_effects();
 $skipped = $send->invoke(
 	$plugin,
@@ -474,6 +687,9 @@ $save_source = alert_method_source($reflection, 'save_admission_application');
 $submit_prepared_source = alert_method_source($reflection, 'can_submit_prepared_application');
 $upload_source = alert_method_source($reflection, 'upload_admission_document');
 $operations_source = alert_method_source($reflection, 'update_admission_application_operations');
+$workflow_source = alert_method_source($reflection, 'update_admission_application_workflow');
+$workflow_delivery_source = alert_method_source($reflection, 'send_workflow_notifications');
+$workflow_delivery_guard_source = alert_method_source($reflection, 'run_workflow_notification_delivery');
 $delete_source = alert_method_source($reflection, 'delete_admission_document');
 $rest_email_source = alert_method_source($reflection, 'rest_send_email');
 alert_assert_contains("array_key_exists('isTestData', \$params)", $rest_save_source, 'The WordPress save route must preserve the test-data flag.');
@@ -513,10 +729,23 @@ alert_assert_same(2, substr_count($upload_source, 'should_send_post_submission_a
 alert_assert_not_contains('send_application_activity_alert', $operations_source, 'General operational edits must not emit the urgent upload alert.');
 alert_assert_not_contains('send_application_activity_alert', $delete_source, 'Document deletion must not emit the urgent upload alert.');
 alert_assert_not_contains('send_application_activity_alert', $rest_email_source, 'The ordinary /email endpoint must remain independent.');
+alert_assert_contains('if (!$stale_command_ignored && ($status_changed || $note_changed))', $workflow_source, 'Workflow notification delivery must exclude stale and no-op commands.');
+alert_assert_contains('$this->send_workflow_notifications(', $workflow_source, 'The WordPress workflow path must dispatch the same notification classes as the direct-Prisma path.');
+alert_assert_same(
+	true,
+	strpos($workflow_source, "throw new Exception('The admissions workflow stage was not saved. Refresh and try again.')") < strpos($workflow_source, '$this->send_workflow_notifications('),
+	'Workflow notification delivery must run only after the authoritative persisted stage is verified.'
+);
+alert_assert_contains("!empty(\$application['isTestData'])", $workflow_delivery_source, 'Test-data workflow mutations must be excluded before any notification helper runs.');
+alert_assert_contains("\$results['roleHandoff']", $workflow_delivery_source, 'Workflow stage changes must include the internal role handoff.');
+alert_assert_contains("\$results['consultantStage']", $workflow_delivery_source, 'Eligible stage changes must retain the originating-consultant notification.');
+alert_assert_contains("\$results['consultantNote']", $workflow_delivery_source, 'Eligible workflow-note changes must retain the originating-consultant notification.');
+alert_assert_contains("\$results['roleNote']", $workflow_delivery_source, 'Note-only workflow changes must retain operational-role notification.');
+alert_assert_contains('catch (Throwable $error)', $workflow_delivery_guard_source, 'Post-save workflow notification errors must be contained instead of failing the saved mutation.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
 alert_assert_not_contains('should_send_draft_creation_alert', $plugin_source, 'The obsolete first-draft email gate must be absent from the plugin.');
 alert_assert_not_contains("'new-application-created'", $plugin_source, 'The obsolete first-draft email event must be absent from the plugin.');
-alert_assert_contains('Version: 0.2.59', $plugin_source, 'The plugin header must advertise version 0.2.59.');
+alert_assert_contains('Version: 0.2.60', $plugin_source, 'The plugin header must advertise version 0.2.60.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;
