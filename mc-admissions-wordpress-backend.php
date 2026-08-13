@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.58
+ * Version: 0.2.59
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -488,12 +488,25 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'agencyName'        => $identity['agencyName'],
 				'consultantEmail'   => $identity['consultantEmail'],
 			);
-			$application_data = $profile_data;
+			$application_assignments = array(
+				'wordpressUsername = %s',
+				'wordpressEmail = %s',
+				'agencyName = %s',
+				'consultantEmail = %s',
+			);
+			$application_args = array(
+				$identity['wordpressUsername'],
+				$identity['wordpressEmail'],
+				$identity['agencyName'],
+				$identity['consultantEmail'],
+			);
 			if (!empty($identity['profileComplete'])) {
 				$profile_data['consultantName'] = $identity['consultantName'];
 				$profile_data['consultantPhone'] = $identity['consultantPhone'];
-				$application_data['consultantName'] = $identity['consultantName'];
-				$application_data['consultantPhone'] = $identity['consultantPhone'];
+				$application_assignments[] = 'consultantName = %s';
+				$application_assignments[] = 'consultantPhone = %s';
+				$application_args[] = $identity['consultantName'];
+				$application_args[] = $identity['consultantPhone'];
 			}
 
 			// Identity snapshots deliberately do not touch updatedAt. A WordPress
@@ -504,10 +517,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$profile_data,
 				array('wordpressUserId' => (int) $user_id)
 			);
-			$applications_written = $wpdb->update(
-				$this->applications_table,
-				$application_data,
-				array('wordpressUserId' => (int) $user_id)
+			// This column has ON UPDATE CURRENT_TIMESTAMP in the live schema.
+			// Explicitly assigning it to itself prevents identity-only snapshot
+			// repairs from changing the application's optimistic-lock version.
+			$application_assignments[] = 'updatedAt = updatedAt';
+			$application_args[] = (int) $user_id;
+			$applications_written = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$this->applications_table} SET " . implode(', ', $application_assignments) . ' WHERE wordpressUserId = %d',
+					$application_args
+				)
 			);
 
 			if (false === $profile_written || false === $applications_written) {
@@ -524,7 +543,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		public function schedule_authoritative_agency_identity_backfill() {
-			if ('0.2.58' === get_option('mc_admissions_agency_identity_version')) {
+			if ('0.2.59' === get_option('mc_admissions_agency_identity_version')) {
 				return;
 			}
 			if (!function_exists('wp_next_scheduled') || !function_exists('wp_schedule_single_event')) {
@@ -570,7 +589,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private function ensure_authoritative_agency_identity_backfill() {
 			global $wpdb;
 
-			if ('0.2.58' === get_option('mc_admissions_agency_identity_version')) {
+			if ('0.2.59' === get_option('mc_admissions_agency_identity_version')) {
 				return;
 			}
 
@@ -634,7 +653,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			if (count((array) $user_ids) < $batch_size) {
-				update_option('mc_admissions_agency_identity_version', '0.2.58', false);
+				update_option('mc_admissions_agency_identity_version', '0.2.59', false);
 				delete_option('mc_admissions_agency_identity_cursor');
 				delete_option('mc_admissions_agency_identity_agent_cursor');
 				delete_option('mc_admissions_agency_identity_agent_phase_complete');
