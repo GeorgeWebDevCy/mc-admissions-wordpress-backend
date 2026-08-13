@@ -108,6 +108,13 @@ final class MC_Agency_Identity_Wpdb {
 		return null;
 	}
 
+	public function get_results($query, $output = null) {
+		if (false !== strpos((string) $query, 'FROM mc_agency_profiles')) {
+			return array_values($this->profiles);
+		}
+		return array();
+	}
+
 	public function update($table, $data, $where) {
 		if (!empty($GLOBALS['mc_identity_fail_table_write']) && $GLOBALS['mc_identity_fail_table_write'] === $table) return false;
 		$this->updates[] = array('table' => $table, 'data' => $data, 'where' => $where);
@@ -226,6 +233,9 @@ $GLOBALS['mc_identity_users'] = array(
 	20 => (object) array('ID' => 20, 'user_login' => 'Retry_Agency', 'display_name' => 'Retry_Agency', 'user_email' => 'retry@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	21 => (object) array('ID' => 21, 'user_login' => 'html-agency', 'display_name' => '<b>Agency & Co</b>', 'user_email' => 'html@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	22 => (object) array('ID' => 22, 'user_login' => 'Whitespace_Agency', 'display_name' => 'Whitespace Agency', 'user_email' => 'whitespace@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
+	23 => (object) array('ID' => 23, 'user_login' => 'admissions-staff', 'display_name' => 'Admissions Staff', 'user_email' => 'admissions@example.invalid', 'roles' => array('admissions-officer'), 'allcaps' => array()),
+	24 => (object) array('ID' => 24, 'user_login' => 'finance-staff', 'display_name' => 'Finance Staff', 'user_email' => 'finance@example.invalid', 'roles' => array('finance-officer'), 'allcaps' => array()),
+	25 => (object) array('ID' => 25, 'user_login' => 'dual-role-staff', 'display_name' => 'Dual Role Staff', 'user_email' => 'dual-role@example.invalid', 'roles' => array('mc_agent', 'admissions-officer'), 'allcaps' => array()),
 	54 => (object) array('ID' => 54, 'user_login' => 'OnePoint-Education', 'display_name' => 'Kashif', 'user_email' => 'onepoint@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 );
 $GLOBALS['wpdb']->profiles[10] = array(
@@ -300,15 +310,24 @@ function get_userdata($user_id) {
 	return $GLOBALS['mc_identity_users'][(int) $user_id] ?? false;
 }
 function get_users($args = array()) {
-	if (isset($args['fields']) && 'ids' === $args['fields']) {
-		return array_keys(array_filter($GLOBALS['mc_identity_users'], function ($user) { return in_array('mc_agent', (array) $user->roles, true); }));
+	$users = $GLOBALS['mc_identity_users'];
+	if (!empty($args['role__in'])) {
+		$roles = array_map('strval', (array) $args['role__in']);
+		$users = array_filter($users, function ($user) use ($roles) {
+			return count(array_intersect($roles, (array) $user->roles)) > 0;
+		});
 	}
-	return array_values($GLOBALS['mc_identity_users']);
+	if (isset($args['fields']) && 'ids' === $args['fields']) {
+		return array_keys($users);
+	}
+	return array_values($users);
 }
 function wp_get_current_user() { return get_userdata($GLOBALS['mc_identity_current_user_id']); }
 function get_current_user_id() { return (int) $GLOBALS['mc_identity_current_user_id']; }
 function get_avatar_url($user_id, $args = array()) { return ''; }
 function current_time($type, $gmt = false) { return '2026-08-13 10:00:00'; }
+function absint($value) { return abs((int) $value); }
+function wp_list_pluck($list, $field) { return array_map(function ($item) use ($field) { return $item->{$field}; }, $list); }
 function sanitize_email($value) { return trim((string) $value); }
 function sanitize_user($value, $strict = false) { return trim((string) $value); }
 function sanitize_text_field($value) { return trim(strip_tags((string) $value)); }
@@ -475,6 +494,74 @@ $selected_owner = $resolve_owner->invoke(
 identity_assert_same(10, $selected_owner['id'], 'Administrator create must use the selected agent as owner.');
 identity_assert_same('12th Study Abroad', $selected_owner['name'], 'Selected ownership must use the authoritative WP agency display name.');
 identity_assert_same('owner@example.invalid', $selected_owner['email'], 'Selected ownership must use the authoritative WP email.');
+
+$admissions_selected_owner = $resolve_owner->invoke(
+	$plugin,
+	array('id' => 23, 'username' => 'admissions-staff', 'name' => 'Admissions Staff', 'email' => 'admissions@example.invalid', 'roles' => array('admissions-officer')),
+	10
+);
+identity_assert_same(10, $admissions_selected_owner['id'], 'Admissions Officer create must use the selected external agent as owner.');
+$admissions_selected_contact = $contact->invoke($plugin, $admissions_selected_owner['id'], $admissions_selected_owner, true);
+identity_assert_true($admissions_selected_contact['profileComplete'], 'Admissions Officer create must require the selected external agent to have a complete Agency Profile.');
+
+try {
+	$resolve_owner->invoke(
+		$plugin,
+		array('id' => 10, 'username' => '12th-Study-Abroad', 'name' => '12th Study Abroad', 'email' => 'owner@example.invalid', 'roles' => array('mc_agent')),
+		11
+	);
+	throw new RuntimeException('An external agent must not be able to assign an application to another agent.');
+} catch (ReflectionException $error) {
+	throw $error;
+} catch (Throwable $error) {
+	identity_assert_contains('Only an administrator or Admissions Officer can assign', $error->getMessage(), 'Agent ownership tampering must be rejected explicitly.');
+}
+
+try {
+	$resolve_owner->invoke(
+		$plugin,
+		array('id' => 24, 'username' => 'finance-staff', 'name' => 'Finance Staff', 'email' => 'finance@example.invalid', 'roles' => array('finance-officer')),
+		0
+	);
+	throw new RuntimeException('Internal staff must not create a staff-owned application.');
+} catch (ReflectionException $error) {
+	throw $error;
+} catch (Throwable $error) {
+	identity_assert_contains('Only an external agent, administrator, or Admissions Officer can create', $error->getMessage(), 'Non-admissions staff-owned application creation must be rejected explicitly.');
+}
+
+try {
+	$resolve_owner->invoke(
+		$plugin,
+		array('id' => 23, 'username' => 'admissions-staff', 'name' => 'Admissions Staff', 'email' => 'admissions@example.invalid', 'roles' => array('admissions-officer')),
+		25
+	);
+	throw new RuntimeException('Internal dual-role staff must not be accepted as an external application owner.');
+} catch (ReflectionException $error) {
+	throw $error;
+} catch (Throwable $error) {
+	identity_assert_contains('not a valid agent', $error->getMessage(), 'Selected application owners must be external agents, not internal staff with an agent role.');
+}
+
+$GLOBALS['mc_identity_current_user_id'] = 13;
+$administrator_agent_list = $plugin->rest_list_agents();
+identity_assert_same(200, $administrator_agent_list->status, 'Administrators must be able to list agents for ownership selection.');
+$administrator_agent_ids = array_map(function ($agent) { return (int) $agent['id']; }, $administrator_agent_list->data['agents']);
+identity_assert_same(false, in_array(25, $administrator_agent_ids, true), 'The ownership selector must exclude internal staff even when they also have an agent role.');
+$GLOBALS['mc_identity_current_user_id'] = 23;
+$admissions_agent_list = $plugin->rest_list_agents();
+identity_assert_same(200, $admissions_agent_list->status, 'Admissions Officers must be able to list agents for ownership selection.');
+$GLOBALS['mc_identity_current_user_id'] = 10;
+$external_agent_list = $plugin->rest_list_agents();
+identity_assert_same(403, $external_agent_list->status, 'External agents must not be able to list other agents.');
+$GLOBALS['mc_identity_current_user_id'] = 24;
+$finance_agent_list = $plugin->rest_list_agents();
+identity_assert_same(403, $finance_agent_list->status, 'Other internal roles must not be able to list agents for ownership selection.');
+$GLOBALS['mc_identity_current_user_id'] = 23;
+$admissions_agent_create = $plugin->rest_create_agent(new WP_REST_Request(array('draft' => array())));
+identity_assert_same(403, $admissions_agent_create->status, 'Admissions Officers must not gain administrator-only agent-account creation access.');
+unset($GLOBALS['mc_identity_users'][25]);
+$GLOBALS['mc_identity_current_user_id'] = 10;
 
 $GLOBALS['wpdb']->updates = array();
 $application_updated_at = $GLOBALS['wpdb']->applications['case-10']['updatedAt'];

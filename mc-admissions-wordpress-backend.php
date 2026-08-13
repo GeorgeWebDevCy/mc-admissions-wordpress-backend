@@ -3887,11 +3887,18 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function rest_list_agents() {
 			global $wpdb;
 			$user = $this->current_session_user();
-			if (!$this->is_admin_user($user)) {
-				return $this->json_error_response('Administrator access required.', 403);
+			if (!$this->can_assign_application_owner($user)) {
+				return $this->json_error_response('Administrator or Admissions Officer access required.', 403);
 			}
 
-			$agents = get_users(array('role__in' => array('mc_agent'), 'orderby' => 'display_name', 'order' => 'ASC'));
+			$agents = array_values(array_filter(
+				get_users(array('role__in' => array('mc_agent'), 'orderby' => 'display_name', 'order' => 'ASC')),
+				function ($agent) {
+					return $this->is_external_agent_user(
+						array('roles' => array_values((array) $agent->roles))
+					);
+				}
+			));
 			$profiles_by_user = array();
 			if (!empty($agents)) {
 				$agent_ids = array_map('absint', wp_list_pluck($agents, 'ID'));
@@ -4439,6 +4446,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return !empty($user['roles']) && in_array('administrator', $user['roles'], true);
 		}
 
+		private function can_assign_application_owner($user) {
+			return $this->is_admin_user($user)
+				|| $this->user_has_any_role($user, array('admissions-officer'));
+		}
+
 		private function can_access_agent_media($user) {
 			if ($this->is_admin_user($user)) {
 				return true;
@@ -4467,13 +4479,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		private function resolve_application_owner($user, $assigned_agent_id) {
-			if ($this->is_admin_user($user)) {
+			if ($this->can_assign_application_owner($user)) {
 				if (!$assigned_agent_id) {
 					throw new Exception('Select an agent before creating the application.');
 				}
 
 				$agent = get_userdata((int) $assigned_agent_id);
-				if (!$agent || !$this->is_agent_user(array('roles' => array_values((array) $agent->roles)))) {
+				$agent_user = $agent
+					? array('roles' => array_values((array) $agent->roles))
+					: array('roles' => array());
+				if (!$agent || !$this->is_external_agent_user($agent_user)) {
 					throw new Exception('The selected application owner is not a valid agent.');
 				}
 
@@ -4487,7 +4502,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			if ($assigned_agent_id) {
-				throw new Exception('Only an administrator can assign an application to another agent.');
+				throw new Exception('Only an administrator or Admissions Officer can assign an application to another agent.');
+			}
+
+			if (!$this->is_external_agent_user($user)) {
+				throw new Exception('Only an external agent, administrator, or Admissions Officer can create an application.');
 			}
 
 			return $user;
