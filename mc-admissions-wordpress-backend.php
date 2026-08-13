@@ -4479,11 +4479,19 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function can_continue_assigned_preparation($user, $status) {
 			return $this->can_assign_application_owner($user)
-				&& 'profile-preparation' === $this->canonical_status_key((string) $status);
+				&& in_array(
+					trim((string) $status),
+					array('profile-preparation', 'Draft', 'Application in progress'),
+					true
+				);
 		}
 
 		private function can_submit_prepared_application($user, $status) {
-			return 'profile-preparation' === $this->canonical_status_key((string) $status)
+			return in_array(
+				trim((string) $status),
+				array('profile-preparation', 'Draft', 'Application in progress'),
+				true
+			)
 				&& ($this->is_agent_user($user) || $this->can_continue_assigned_preparation($user, $status));
 		}
 

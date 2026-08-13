@@ -656,6 +656,16 @@ identity_assert_same(
 );
 identity_assert_same(
 	false,
+	$continue_assigned_preparation->invoke($plugin, $admissions_user, 'future-unknown-status'),
+	'Unknown or future statuses must never inherit preparation-stage editing permission.'
+);
+identity_assert_same(
+	false,
+	$submit_prepared_application->invoke($plugin, array('roles' => array('mc_agent')), 'future-unknown-status'),
+	'Unknown or future statuses must never inherit agent submission permission.'
+);
+identity_assert_same(
+	false,
 	$submit_prepared_application->invoke($plugin, $admissions_user, 'review-pending'),
 	'Admissions must not replay preparation submission after the stage advances.'
 );
