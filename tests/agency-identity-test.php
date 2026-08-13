@@ -215,17 +215,18 @@ $GLOBALS['mc_identity_transients'] = array();
 $GLOBALS['mc_identity_users'] = array(
 	10 => (object) array('ID' => 10, 'user_login' => '12th-Study-Abroad', 'display_name' => '12th-Study-Abroad', 'user_email' => 'owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	11 => (object) array('ID' => 11, 'user_login' => 'Atlas_Bridge', 'display_name' => '', 'user_email' => 'atlas@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
-	12 => (object) array('ID' => 12, 'user_login' => 'machine-agent', 'display_name' => 'Intentional Agency Ltd', 'user_email' => 'custom@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
+	12 => (object) array('ID' => 12, 'user_login' => 'machineagent', 'display_name' => 'Intentional Agency Ltd', 'user_email' => 'custom@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	13 => (object) array('ID' => 13, 'user_login' => 'staff-account', 'display_name' => 'staff-account', 'user_email' => 'staff@example.invalid', 'roles' => array('administrator'), 'allcaps' => array()),
 	14 => (object) array('ID' => 14, 'user_login' => 'incomplete-agent', 'display_name' => 'Incomplete Agency', 'user_email' => 'incomplete@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	15 => (object) array('ID' => 15, 'user_login' => '', 'display_name' => '', 'user_email' => 'nameless@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	16 => (object) array('ID' => 16, 'user_login' => 'invalid-email-agent', 'display_name' => 'Invalid Email Agency', 'user_email' => 'not-an-email', 'roles' => array('mc_agent'), 'allcaps' => array()),
-	17 => (object) array('ID' => 17, 'user_login' => 'profile-owner', 'display_name' => 'Old Custom Name', 'user_email' => 'profile-owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
-	18 => (object) array('ID' => 18, 'user_login' => 'application-owner', 'display_name' => 'Another Custom Name', 'user_email' => 'application-owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
+	17 => (object) array('ID' => 17, 'user_login' => 'profileowner', 'display_name' => 'Old Custom Name', 'user_email' => 'profile-owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
+	18 => (object) array('ID' => 18, 'user_login' => 'applicationowner', 'display_name' => 'Another Custom Name', 'user_email' => 'application-owner@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	19 => (object) array('ID' => 19, 'user_login' => 'Fallback_Agency', 'display_name' => 'Fallback_Agency', 'user_email' => 'fallback@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	20 => (object) array('ID' => 20, 'user_login' => 'Retry_Agency', 'display_name' => 'Retry_Agency', 'user_email' => 'retry@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	21 => (object) array('ID' => 21, 'user_login' => 'html-agency', 'display_name' => '<b>Agency & Co</b>', 'user_email' => 'html@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 	22 => (object) array('ID' => 22, 'user_login' => 'Whitespace_Agency', 'display_name' => 'Whitespace Agency', 'user_email' => 'whitespace@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
+	54 => (object) array('ID' => 54, 'user_login' => 'OnePoint-Education', 'display_name' => 'Kashif', 'user_email' => 'onepoint@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 );
 $GLOBALS['wpdb']->profiles[10] = array(
 	'id' => 'profile-10', 'wordpressUserId' => 10, 'wordpressUsername' => 'stale-user',
@@ -442,6 +443,9 @@ identity_assert_true($migrate_display_name->invoke($plugin, 19), 'Username fallb
 identity_assert_same('Fallback Agency', $GLOBALS['mc_identity_users'][19]->display_name, 'Username separators must be replaced when no legacy agency name exists.');
 identity_assert_true($migrate_display_name->invoke($plugin, 12), 'A custom display name without a legacy agency snapshot is a successful no-op.');
 identity_assert_same('Intentional Agency Ltd', $GLOBALS['mc_identity_users'][12]->display_name, 'Migration must preserve a custom display name when no legacy agency snapshot exists.');
+identity_assert_true($migrate_display_name->invoke($plugin, 54), 'A separator-based agency username must override an individual display name.');
+identity_assert_same('OnePoint Education', $GLOBALS['mc_identity_users'][54]->display_name, 'OnePoint-Education must become the WordPress agency display name even when the previous display name was Kashif.');
+unset($GLOBALS['mc_identity_users'][54]);
 
 $columns = $plugin->add_agency_display_name_user_column(array('username' => 'Username'));
 identity_assert_same('Display Name / Agency Name', $columns['mc_admissions_agency_name'], 'WordPress Users must expose the agency display-name column.');

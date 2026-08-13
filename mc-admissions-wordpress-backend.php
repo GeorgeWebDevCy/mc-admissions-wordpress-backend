@@ -387,17 +387,22 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$current_display_name = trim((string) $wp_user->display_name);
 			$username = trim((string) $wp_user->user_login);
-			$legacy_agency_name = $this->legacy_agency_name_for_user((int) $user_id);
-			if ('' !== $legacy_agency_name) {
-				$target_display_name = 0 === strcasecmp($legacy_agency_name, $username)
-					? trim((string) preg_replace('/[-_]+/', ' ', $legacy_agency_name))
-					: $legacy_agency_name;
+			$normalized_username = trim((string) preg_replace('/[-_]+/', ' ', $username));
+			if (preg_match('/[-_]/', $username)) {
+				// Agency usernames commonly encode the agency name with separators.
+				// Treat that convention as authoritative even when WordPress was
+				// originally provisioned with an individual's display name.
+				$target_display_name = $normalized_username;
 			} elseif ('' !== $current_display_name && 0 !== strcasecmp($current_display_name, $username)) {
-				// No legacy agency snapshot exists, so preserve an intentional custom
-				// WordPress display name rather than guessing a replacement.
-				return true;
+				$legacy_agency_name = $this->legacy_agency_name_for_user((int) $user_id);
+				$target_display_name = '' !== $legacy_agency_name
+					? $legacy_agency_name
+					: $current_display_name;
 			} else {
-				$target_display_name = trim((string) preg_replace('/[-_]+/', ' ', $username));
+				$legacy_agency_name = $this->legacy_agency_name_for_user((int) $user_id);
+				$target_display_name = '' !== $legacy_agency_name
+					? $legacy_agency_name
+					: $normalized_username;
 			}
 
 			if ('' === $target_display_name || $target_display_name === $current_display_name) {
