@@ -259,6 +259,7 @@ $GLOBALS['mc_rejection_roles'] = array();
 $GLOBALS['mc_rejection_mail_calls'] = array();
 $GLOBALS['mc_rejection_mail_result'] = true;
 $GLOBALS['mc_rejection_uuid'] = 0;
+$GLOBALS['mc_rejection_users'] = array();
 
 function __($text, $domain = null) {
 	return $text;
@@ -343,6 +344,10 @@ function wp_mail($to, $subject, $message, $headers = array(), $attachments = arr
 	);
 	$GLOBALS['wpdb']->events[] = 'mail:' . $subject;
 	return (bool) $GLOBALS['mc_rejection_mail_result'];
+}
+
+function get_userdata($user_id) {
+	return $GLOBALS['mc_rejection_users'][(int) $user_id] ?? false;
 }
 
 require dirname(__DIR__) . '/mc-admissions-wordpress-backend.php';
@@ -488,6 +493,13 @@ $operations->setAccessible(true);
 // committed first, and exactly the originating consultant receives the email.
 $GLOBALS['wpdb']->reset(rejection_application());
 $GLOBALS['mc_rejection_mail_calls'] = array();
+$GLOBALS['mc_rejection_users'][42] = (object) array(
+	'ID' => 42,
+	'user_login' => 'origin-agent',
+	'display_name' => 'Current WordPress Agency',
+	'user_email' => 'current-owner@example.com',
+	'roles' => array('mc_agent'),
+);
 $result = invoke_rejection_operations(
 	$operations,
 	array(
@@ -513,7 +525,7 @@ rejection_assert_contains('review pending -> rejected', $operations_activity['de
 rejection_assert_contains('stage review-pending -> rejected', $operations_activity['detail'], 'Operations activity must record the stage change.');
 rejection_assert_same(1, count($GLOBALS['mc_rejection_mail_calls']), 'The rejection must send exactly one email.');
 $mail = $GLOBALS['mc_rejection_mail_calls'][0];
-rejection_assert_same(array('consultant@example.invalid'), $mail['to'], 'Email must target only consultantEmail.');
+rejection_assert_same(array('current-owner@example.com'), $mail['to'], 'Email must target the owning WordPress account current email.');
 rejection_assert_same(
 	'Application closed after review for Offline Student (MC-OFFLINE01)',
 	$mail['subject'],
@@ -525,11 +537,12 @@ rejection_assert_true(
 );
 rejection_assert_contains('<strong>Application:</strong> MC-OFFLINE01 / Offline Student', $mail['message'], 'The HTML email must include case context.');
 rejection_assert_same(1, count($GLOBALS['wpdb']->communications), 'The delivery must create one communication audit.');
-rejection_assert_contains('Recipient: Origin Consultant (consultant@example.invalid).', $GLOBALS['wpdb']->communications[0]['detail'], 'The audit must identify the exact recipient.');
+rejection_assert_contains('Recipient: Origin Consultant (current-owner@example.com).', $GLOBALS['wpdb']->communications[0]['detail'], 'The audit must identify the current WordPress recipient.');
 rejection_assert_contains('Email delivery: sent to 1 recipient(s).', $GLOBALS['wpdb']->communications[0]['detail'], 'The audit must record delivery status.');
 $commit_index = array_search('query:COMMIT', $GLOBALS['wpdb']->events, true);
 $mail_index = array_search('mail:' . $mail['subject'], $GLOBALS['wpdb']->events, true);
 rejection_assert_true(false !== $commit_index && false !== $mail_index && $commit_index < $mail_index, 'Email delivery must happen only after commit.');
+unset($GLOBALS['mc_rejection_users'][42]);
 
 // Legacy/split repair: an old Under review row whose decision is already rejected
 // moves to the rejected stage and sends only when no audit exists for this cycle.

@@ -365,8 +365,6 @@ foreach (
 		array('fullName', 'MOBILE TEST Applicant'),
 		array('passportNumber', 'UAT-12345'),
 		array('email', 'student@local.invalid'),
-		array('agencyName', 'Codex Verification Agency'),
-		array('consultantEmail', 'consultant@example.test'),
 	) as $marker
 ) {
 	$marked_draft = array_merge($live_draft, array($marker[0] => $marker[1]));
@@ -516,6 +514,6 @@ alert_assert_not_contains('send_application_activity_alert', $rest_email_source,
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
 alert_assert_not_contains('should_send_draft_creation_alert', $plugin_source, 'The obsolete first-draft email gate must be absent from the plugin.');
 alert_assert_not_contains("'new-application-created'", $plugin_source, 'The obsolete first-draft email event must be absent from the plugin.');
-alert_assert_contains('Version: 0.2.56', $plugin_source, 'The plugin header must advertise version 0.2.56.');
+alert_assert_contains('Version: 0.2.57', $plugin_source, 'The plugin header must advertise version 0.2.57.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;
