@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.57
+ * Version: 0.2.58
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -37,6 +37,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const RELEASE_NOTIFICATION_SECRET_SETTING = 'release_notification_secret';
 		const RELEASE_NOTIFICATION_STATE_PREFIX = 'release_notification_delivery_';
 		const RELEASE_NOTIFICATION_LOCK_PREFIX = 'mc_admissions_release_';
+		const AGENCY_IDENTITY_BACKFILL_HOOK = 'mc_admissions_agency_identity_backfill';
+		const AGENCY_IDENTITY_BACKFILL_LOCK = 'mc_admissions_agency_identity_backfill_lock';
 
 		/** @var string */
 		private $applications_table = 'mc_admission_applications';
@@ -211,7 +213,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$this->ensure_document_assessment_columns();
 			$this->ensure_resource_indexes();
 			$this->ensure_notification_activity_schema();
-			$this->ensure_authoritative_agency_identity_backfill();
 			$this->boot_update_checker();
 			// Run before Plugin Update Checker's source-selection callback. PUC also
 			// attempts to rename the extracted directory and returns puc-rename-failed
@@ -221,6 +222,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			add_action('rest_api_init', array($this, 'register_rest_routes'));
 			add_action('wp_set_password', array($this, 'advance_auth_epoch_after_password_change'), 10, 3);
 			add_action('profile_update', array($this, 'sync_authoritative_agency_identity'), 10, 3);
+			// Never execute the data migration while loading the plugin. Active plugin
+			// files load before pluggable user functions, and migration work must not
+			// add latency or failure risk to normal web and REST requests.
+			add_action(self::AGENCY_IDENTITY_BACKFILL_HOOK, array($this, 'run_authoritative_agency_identity_backfill'));
+			add_action('plugins_loaded', array($this, 'schedule_authoritative_agency_identity_backfill'), 20);
 			add_filter('manage_users_columns', array($this, 'add_agency_display_name_user_column'));
 			add_filter('manage_users_custom_column', array($this, 'render_agency_display_name_user_column'), 10, 3);
 			add_filter('jwt_auth_token_before_sign', array($this, 'add_jwt_auth_epoch_claim'), 10, 2);
@@ -517,10 +523,54 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return true;
 		}
 
+		public function schedule_authoritative_agency_identity_backfill() {
+			if ('0.2.58' === get_option('mc_admissions_agency_identity_version')) {
+				return;
+			}
+			if (!function_exists('wp_next_scheduled') || !function_exists('wp_schedule_single_event')) {
+				error_log('MC Admissions could not schedule the agency identity migration because WordPress cron functions are unavailable.');
+				return;
+			}
+			if (wp_next_scheduled(self::AGENCY_IDENTITY_BACKFILL_HOOK)) {
+				return;
+			}
+
+			$scheduled = wp_schedule_single_event(time() + 30, self::AGENCY_IDENTITY_BACKFILL_HOOK);
+			if (false === $scheduled || is_wp_error($scheduled)) {
+				error_log('MC Admissions could not schedule the agency identity migration.');
+			}
+		}
+
+		public function run_authoritative_agency_identity_backfill() {
+			if (get_transient(self::AGENCY_IDENTITY_BACKFILL_LOCK)) {
+				$this->schedule_authoritative_agency_identity_backfill();
+				return;
+			}
+			set_transient(self::AGENCY_IDENTITY_BACKFILL_LOCK, 1, 5 * MINUTE_IN_SECONDS);
+
+			if (!function_exists('get_userdata') || !function_exists('wp_update_user')) {
+				error_log('MC Admissions deferred the agency identity migration because WordPress user functions are not available yet.');
+				delete_transient(self::AGENCY_IDENTITY_BACKFILL_LOCK);
+				$this->schedule_authoritative_agency_identity_backfill();
+				return;
+			}
+
+			try {
+				$this->ensure_authoritative_agency_identity_backfill();
+			} catch (Throwable $error) {
+				// A one-time data migration must never take the entire WordPress site or
+				// admissions REST API offline. Leave its cursors untouched for retry.
+				error_log('MC Admissions agency identity migration failed: ' . $error->getMessage());
+			}
+
+			delete_transient(self::AGENCY_IDENTITY_BACKFILL_LOCK);
+			$this->schedule_authoritative_agency_identity_backfill();
+		}
+
 		private function ensure_authoritative_agency_identity_backfill() {
 			global $wpdb;
 
-			if ('0.2.57' === get_option('mc_admissions_agency_identity_version')) {
+			if ('0.2.58' === get_option('mc_admissions_agency_identity_version')) {
 				return;
 			}
 
@@ -531,7 +581,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return;
 			}
 
-			$batch_size = 200;
+			$batch_size = 25;
 			$agent_phase_complete = '1' === get_option('mc_admissions_agency_identity_agent_phase_complete', '0');
 			if (!$agent_phase_complete) {
 				$agent_cursor = max(0, (int) get_option('mc_admissions_agency_identity_agent_cursor', 0));
@@ -546,6 +596,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						return;
 					}
 					$agent_cursor = max($agent_cursor, (int) $agent_id);
+					update_option('mc_admissions_agency_identity_agent_cursor', $agent_cursor, false);
 				}
 
 				if (count($agent_ids) < $batch_size) {
@@ -579,10 +630,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					return;
 				}
 				$cursor = max($cursor, (int) $user_id);
+				update_option('mc_admissions_agency_identity_cursor', $cursor, false);
 			}
 
 			if (count((array) $user_ids) < $batch_size) {
-				update_option('mc_admissions_agency_identity_version', '0.2.57', false);
+				update_option('mc_admissions_agency_identity_version', '0.2.58', false);
 				delete_option('mc_admissions_agency_identity_cursor');
 				delete_option('mc_admissions_agency_identity_agent_cursor');
 				delete_option('mc_admissions_agency_identity_agent_phase_complete');
