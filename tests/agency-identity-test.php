@@ -454,6 +454,8 @@ identity_assert_true($migrate_display_name->invoke($plugin, 11), 'A blank displa
 identity_assert_same('Atlas Bridge', $GLOBALS['mc_identity_users'][11]->display_name, 'Underscore runs must become spaces.');
 identity_assert_true($migrate_display_name->invoke($plugin, 13), 'Internal staff must be a successful migration no-op.');
 identity_assert_same('staff-account', $GLOBALS['mc_identity_users'][13]->display_name, 'Internal staff display names must not be changed by agency migration.');
+identity_assert_true($migrate_display_name->invoke($plugin, 25), 'Internal dual-role staff must be a successful migration no-op.');
+identity_assert_same('Dual Role Staff', $GLOBALS['mc_identity_users'][25]->display_name, 'Agency migration must preserve dual-role internal staff display names even when their username uses separators.');
 identity_assert_true($migrate_display_name->invoke($plugin, 17), 'Legacy profile agency name migration must succeed.');
 identity_assert_same('Legacy Profile Agency', $GLOBALS['mc_identity_users'][17]->display_name, 'Agency Profile name must take migration precedence.');
 identity_assert_true($migrate_display_name->invoke($plugin, 18), 'Legacy application agency name migration must succeed.');
@@ -632,6 +634,43 @@ identity_assert_contains("\$owner_identity['consultantEmail']", $save_source, 'A
 identity_assert_contains("\$owner_identity['consultantName']", $save_source, 'Application creates and updates must ignore per-application consultant names.');
 identity_assert_contains("\$owner_identity['consultantPhone']", $save_source, 'Application creates and updates must ignore per-application consultant phones.');
 identity_assert_contains('$assigned_agent_id', $save_source, 'Administrator create must resolve identity from the explicitly selected owner.');
+
+$continue_assigned_preparation = identity_method($reflection, 'can_continue_assigned_preparation');
+$submit_prepared_application = identity_method($reflection, 'can_submit_prepared_application');
+$admissions_user = array('roles' => array('admissions-officer'));
+$finance_user = array('roles' => array('finance-officer'));
+identity_assert_same(
+	true,
+	$continue_assigned_preparation->invoke($plugin, $admissions_user, 'profile-preparation'),
+	'Admissions must be able to resume the assigned draft after its first save.'
+);
+identity_assert_same(
+	true,
+	$submit_prepared_application->invoke($plugin, $admissions_user, 'profile-preparation'),
+	'Admissions must be able to submit the resumed assigned draft for review.'
+);
+identity_assert_same(
+	false,
+	$continue_assigned_preparation->invoke($plugin, $admissions_user, 'review-pending'),
+	'Admissions assigned-draft editing must end when the case leaves preparation.'
+);
+identity_assert_same(
+	false,
+	$submit_prepared_application->invoke($plugin, $admissions_user, 'review-pending'),
+	'Admissions must not replay preparation submission after the stage advances.'
+);
+identity_assert_same(
+	false,
+	$continue_assigned_preparation->invoke($plugin, $finance_user, 'profile-preparation'),
+	'Finance must not gain assigned application intake editing.'
+);
+identity_assert_contains('$can_continue_assigned_preparation', $save_source, 'Existing assigned draft saves must use the preparation-only permission gate.');
+identity_assert_contains('can_submit_prepared_application', $save_source, 'Review submission must use the preparation-only permission gate.');
+identity_assert_contains(
+	'$this->is_external_agent_user($user) || $can_continue_assigned_preparation',
+	$save_source,
+	'Admissions continuation must revalidate that the selected owner still has a complete Agency Profile.'
+);
 
 $create_agent_source = identity_method($reflection, 'rest_create_agent');
 $create_agent_source = implode('', array_slice($source_lines, $create_agent_source->getStartLine() - 1, $create_agent_source->getEndLine() - $create_agent_source->getStartLine() + 1));

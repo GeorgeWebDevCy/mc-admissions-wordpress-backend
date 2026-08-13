@@ -380,8 +380,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return true;
 			}
 
-			$agent_roles = array('mc_agent', 'mc-agent', 'agency', 'agent', 'consultant', 'admissions-agent', 'subscriber');
-			if (empty($wp_user->roles) || !array_intersect($agent_roles, (array) $wp_user->roles)) {
+			if (!$this->is_external_agent_user(array('roles' => array_values((array) $wp_user->roles)))) {
 				return true;
 			}
 
@@ -4478,6 +4477,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return !empty($user['roles']) && count(array_intersect($allowed_roles, (array) $user['roles'])) > 0;
 		}
 
+		private function can_continue_assigned_preparation($user, $status) {
+			return $this->can_assign_application_owner($user)
+				&& 'profile-preparation' === $this->canonical_status_key((string) $status);
+		}
+
+		private function can_submit_prepared_application($user, $status) {
+			return 'profile-preparation' === $this->canonical_status_key((string) $status)
+				&& ($this->is_agent_user($user) || $this->can_continue_assigned_preparation($user, $status));
+		}
+
 		private function resolve_application_owner($user, $assigned_agent_id) {
 			if ($this->can_assign_application_owner($user)) {
 				if (!$assigned_agent_id) {
@@ -6191,15 +6200,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			try {
 				if ($record_id) {
-					if (!$this->can_edit_application_data($user)) {
+					$existing_application = $this->get_authorized_application_base($record_id, $user);
+					$can_continue_assigned_preparation = $this->can_continue_assigned_preparation($user, $existing_application['status']);
+					if (!$this->can_edit_application_data($user) && !$can_continue_assigned_preparation) {
 						throw new Exception('You do not have permission to edit application data.');
 					}
 
-					$existing_application = $this->get_authorized_application_base($record_id, $user);
 					$owner_identity = $this->authoritative_agency_contact(
 						isset($existing_application['wordpressUserId']) ? (int) $existing_application['wordpressUserId'] : 0,
 						$existing_application,
-						$this->is_external_agent_user($user)
+						$this->is_external_agent_user($user) || $can_continue_assigned_preparation
 					);
 					$identity_safe_draft = array_merge(
 						$draft,
@@ -6210,8 +6220,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'consultantPhone' => $owner_identity['consultantPhone'],
 						)
 					);
-					$is_preparation_status = 'profile-preparation' === $this->canonical_status_key((string) $existing_application['status']);
-					$is_submitting_prepared_application = 'review' === $mode && ($this->is_agent_user($user) || $this->is_admin_user($user)) && $is_preparation_status;
+					$is_submitting_prepared_application = 'review' === $mode && $this->can_submit_prepared_application($user, $existing_application['status']);
 					$should_notify_review_submission = $is_submitting_prepared_application && $this->is_external_agent_user($user);
 					$next_is_test_data = $this->resolve_application_test_data(
 						$identity_safe_draft,
@@ -6221,7 +6230,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					);
 
 					if ('review' === $mode && !$is_submitting_prepared_application) {
-						throw new Exception('Only an agent or administrator can submit an application that is still in preparation.');
+						throw new Exception('Only an agent, administrator, or Admissions Officer can submit an application that is still in preparation.');
 					}
 
 					$update_sql = "
