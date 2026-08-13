@@ -463,15 +463,21 @@ function rejection_user() {
 	);
 }
 
-function invoke_rejection_operations($method, array $draft, $expected_updated_at = '2026-07-31T10:00:00.000Z') {
+
+function invoke_rejection_operations($method, array $draft, $expected_updated_at = '2026-07-31T10:00:00.000Z', $dedicated_rejection = true) {
+	$params = array(
+		'applicationId' => 'app-rejection-offline',
+		'draft' => $draft,
+		'expectedUpdatedAt' => $expected_updated_at,
+		'user' => rejection_user(),
+	);
+	if ($dedicated_rejection) {
+		$params['dedicatedReviewRejection'] = true;
+	}
+
 	return $method->invoke(
 		mc_admissions_wordpress_backend(),
-		array(
-			'applicationId' => 'app-rejection-offline',
-			'draft' => $draft,
-			'expectedUpdatedAt' => $expected_updated_at,
-			'user' => rejection_user(),
-		)
+		$params
 	);
 }
 
@@ -488,6 +494,51 @@ $plugin = mc_admissions_wordpress_backend();
 $reflection = new ReflectionClass($plugin);
 $operations = $reflection->getMethod('update_admission_application_operations');
 $operations->setAccessible(true);
+
+// The generic operations endpoint must not create a new rejection without the
+// dedicated command's standalone reason context.
+$GLOBALS['wpdb']->reset(rejection_application());
+$GLOBALS['mc_rejection_mail_calls'] = array();
+rejection_assert_throws_message(
+	'Use the Rejected assessment action and enter the required standalone rejection reason.',
+	function () use ($operations) {
+		invoke_rejection_operations(
+			$operations,
+			array('reviewerDecision' => 'rejected'),
+			'2026-07-31T10:00:00.000Z',
+			false
+		);
+	},
+	'A generic operations mutation must not bypass the required rejection reason.'
+);
+rejection_assert_same('review-pending', $GLOBALS['wpdb']->application['status'], 'A blocked generic rejection must preserve the stage.');
+rejection_assert_same('pending', $GLOBALS['wpdb']->application['reviewerDecision'], 'A blocked generic rejection must preserve the decision.');
+rejection_assert_same(0, count($GLOBALS['mc_rejection_mail_calls']), 'A blocked generic rejection must not send email.');
+
+// The legacy endpoint may not smuggle the rejected value back as a no-op
+// either. Callers must omit that field or use the dedicated reason command.
+$GLOBALS['wpdb']->reset(
+	rejection_application(
+		array(
+			'status' => 'rejected',
+			'reviewerDecision' => 'rejected',
+		)
+	)
+);
+rejection_assert_throws_message(
+	'Use the Rejected assessment action and enter the required standalone rejection reason.',
+	function () use ($operations) {
+		invoke_rejection_operations(
+			$operations,
+			array('reviewerDecision' => 'rejected'),
+			'2026-07-31T10:00:00.000Z',
+			false
+		);
+	},
+	'A generic operations payload must never carry the rejected decision without the dedicated reason context.'
+);
+rejection_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'A blocked rejected no-op must preserve the stage.');
+rejection_assert_same('rejected', $GLOBALS['wpdb']->application['reviewerDecision'], 'A blocked rejected no-op must preserve the decision.');
 
 // Canonical rejection: decision and stage are persisted atomically, activities are
 // committed first, and exactly the originating consultant receives the email.
@@ -709,19 +760,16 @@ rejection_assert_same(1, count($GLOBALS['mc_rejection_mail_calls']), 'A failed d
 rejection_assert_same(array('replacement-consultant@example.invalid'), $GLOBALS['mc_rejection_mail_calls'][0]['to'], 'The retry must use the current exact consultantEmail.');
 rejection_assert_same(2, count($GLOBALS['wpdb']->communications), 'A successful retry must append a delivery audit.');
 
-// The minimal authoritative row sends and audits before a fragile rich case read.
+// A fragile post-commit rich case read falls back to the committed snapshot. It
+// must return success instead of inviting a duplicate retry after email delivery.
 $GLOBALS['wpdb']->reset(rejection_application());
 $GLOBALS['wpdb']->fail_rich_read_after_commit = true;
 $GLOBALS['mc_rejection_mail_calls'] = array();
 $GLOBALS['mc_rejection_mail_result'] = true;
-rejection_assert_throws_message(
-	'Offline rich read failure.',
-	function () use ($operations) {
-		invoke_rejection_operations($operations, array('reviewerDecision' => 'rejected'));
-	},
-	'A post-commit rich-read failure must surface after notification delivery.'
-);
+$rich_read_fallback = invoke_rejection_operations($operations, array('reviewerDecision' => 'rejected'));
 rejection_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'The committed rejection must remain authoritative after rich-read failure.');
+rejection_assert_same('rejected', $rich_read_fallback['stageKey'], 'The fallback response must report the committed rejected stage.');
+rejection_assert_same('rejected', $rich_read_fallback['reviewerDecision'], 'The fallback response must report the committed rejected decision.');
 rejection_assert_same(1, count($GLOBALS['mc_rejection_mail_calls']), 'Rich-read failure must not prevent the rejection email.');
 rejection_assert_same(1, count($GLOBALS['wpdb']->communications), 'Rich-read failure must not prevent the delivery audit.');
 rejection_assert_contains('Email delivery: sent to 1 recipient(s).', $GLOBALS['wpdb']->communications[0]['detail'], 'Rich-read failure must leave a successful durable audit.');

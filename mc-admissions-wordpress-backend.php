@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.59
+ * Version: 0.2.60
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -1571,6 +1571,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			register_rest_route(
 				self::API_NAMESPACE,
+				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/rejection',
+				array(
+					'methods' => WP_REST_Server::CREATABLE,
+					'callback' => array($this, 'rest_reject_review_application'),
+					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
 				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/documents',
 				array(
 					array(
@@ -2820,6 +2830,194 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
+		private function workflow_stage_notification_definition($status) {
+			$definitions = array(
+				'review-pending' => array(
+					'label' => 'Pending assessment',
+					'owner' => 'Admissions Office',
+					'roles' => array('admissions-officer', 'administrator'),
+				),
+				'offer-issued' => array(
+					'label' => 'Offer letter issued',
+					'owner' => 'Admissions Office',
+					'roles' => array('admissions-officer', 'finance-officer'),
+				),
+				'prepayment-pending' => array(
+					'label' => 'Prepayment pending',
+					'owner' => 'Admissions and Accounts',
+					'roles' => array('finance-officer', 'admissions-officer'),
+				),
+				'acceptance-issued' => array(
+					'label' => 'Acceptance package issued',
+					'owner' => 'Admissions Office',
+					'roles' => array('migration-officer', 'admissions-officer'),
+				),
+				'migration-documents' => array(
+					'label' => 'Migration documents in progress',
+					'owner' => 'Migration Office',
+					'roles' => array('migration-officer'),
+				),
+				'entry-permit-processing' => array(
+					'label' => 'Entry permit processing',
+					'owner' => 'Migration Office',
+					'roles' => array('migration-officer'),
+				),
+				'arrival-immigration' => array(
+					'label' => 'Arrival and immigration',
+					'owner' => 'Immigration and Registrar',
+					'roles' => array('immigration-officer', 'registrar'),
+				),
+				'enrollment-complete' => array(
+					'label' => 'Enrollment complete',
+					'owner' => 'Registrar',
+					'roles' => array('registrar'),
+				),
+				'rejected' => array(
+					'label' => 'Rejected / closed',
+					'owner' => 'Admissions Office',
+					'roles' => array('admissions-officer', 'administrator'),
+				),
+			);
+			$status = $this->canonical_status_key((string) $status);
+
+			return isset($definitions[$status]) ? $definitions[$status] : null;
+		}
+
+		private function filter_workflow_actor_roles($roles, $user) {
+			$actor_roles = array_values(array_unique(array_map('sanitize_key', (array) ($user['roles'] ?? array()))));
+			$roles = array_values(array_unique(array_map('sanitize_key', (array) $roles)));
+
+			return array_values(
+				array_filter(
+					$roles,
+					static function ($role) use ($actor_roles) {
+						return !in_array($role, $actor_roles, true);
+					}
+				)
+			);
+		}
+
+		private function workflow_notification_application_context($application) {
+			return array(
+				'id' => isset($application['id']) ? (string) $application['id'] : null,
+				'referenceCode' => isset($application['referenceCode']) ? trim((string) $application['referenceCode']) : '',
+				'fullName' => isset($application['fullName']) ? trim((string) $application['fullName']) : '',
+			);
+		}
+
+		private function workflow_role_notification_payload($application, $user, $status, $note = null) {
+			$definition = $this->workflow_stage_notification_definition($status);
+			if (!$definition) {
+				return null;
+			}
+
+			$roles = $this->filter_workflow_actor_roles($definition['roles'], $user);
+			if (empty($roles)) {
+				return null;
+			}
+
+			$context = $this->workflow_notification_application_context($application);
+			$student_label = $context['fullName'] . ' (' . $context['referenceCode'] . ')';
+			$stage_note = $this->trim_to_null($note);
+			if (!$stage_note) {
+				$stage_note = $this->workflow_note_for_status($this->canonical_status_key((string) $status));
+			}
+
+			return array(
+				'roles' => $roles,
+				'subject' => sanitize_text_field('Workflow handoff: ' . $definition['label'] . ' for ' . $student_label),
+				'message' => implode(
+					"\n",
+					array_filter(
+						array(
+							'The admissions case is now in ' . $definition['label'] . '.',
+							'Owner: ' . $definition['owner'] . '.',
+							$stage_note,
+						)
+					)
+				),
+				'application' => $context,
+			);
+		}
+
+		private function workflow_stage_consultant_notification_payload($application, $status) {
+			$context = $this->workflow_notification_application_context($application);
+			$student_label = $context['fullName'] . ' (' . $context['referenceCode'] . ')';
+
+			switch ($this->canonical_status_key((string) $status)) {
+				case 'offer-issued':
+					$subject = 'Offer issued for ' . $student_label;
+					$message = 'The offer stage is now active. Review the case for offer details, deadlines, and next payment steps.';
+					break;
+				case 'acceptance-issued':
+					$subject = 'Acceptance approved for ' . $student_label;
+					$message = 'The acceptance package is approved and the case is moving into migration preparation.';
+					break;
+				case 'rejected':
+					$subject = 'Application closed for ' . $student_label;
+					$message = 'The application has been moved into the closed queue. Check the case record for the final review outcome and notes.';
+					break;
+				default:
+					return null;
+			}
+
+			return array(
+				'roles' => array(),
+				'subject' => sanitize_text_field($subject),
+				'message' => $message,
+				'application' => $context,
+			);
+		}
+
+		private function workflow_note_notification_targets($status) {
+			$definition = $this->workflow_stage_notification_definition($status);
+			$roles = $definition ? $definition['roles'] : array('admissions-officer', 'administrator');
+			$status = $this->canonical_status_key((string) $status);
+
+			return array(
+				'roles' => $roles,
+				'notifyAgent' => in_array(
+					$status,
+					array(
+						'review-pending',
+						'offer-issued',
+						'prepayment-pending',
+						'acceptance-issued',
+						'migration-documents',
+						'entry-permit-processing',
+						'rejected',
+					),
+					true
+				),
+			);
+		}
+
+		private function workflow_note_notification_payload($application, $user, $note, $roles = array()) {
+			$note = $this->trim_to_null($note);
+			if (!$note) {
+				return null;
+			}
+
+			$context = $this->workflow_notification_application_context($application);
+			$student_label = $context['fullName'] . ' (' . $context['referenceCode'] . ')';
+
+			return array(
+				'roles' => $this->filter_workflow_actor_roles($roles, $user),
+				'subject' => sanitize_text_field('Workflow note added for ' . $student_label),
+				'message' => implode(
+					"\n",
+					array(
+						(isset($user['name']) ? (string) $user['name'] : 'An admissions user') . ' added or updated Workflow note.',
+						'',
+						$note,
+						'',
+						'Please review the case record for the full context.',
+					)
+				),
+				'application' => $context,
+			);
+		}
+
 		private function record_application_activity_alert($application_id, $user, $payload, $sent, $failed, $error = null) {
 			global $wpdb;
 
@@ -3007,15 +3205,217 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
-		private function review_rejection_notification_payload($application) {
+		private function send_application_role_notification($application, $user, $payload) {
+			if (!empty($application['isTestData'])) {
+				return array(
+					'ok' => false,
+					'skipped' => true,
+					'sent' => array(),
+					'failed' => array(),
+					'error' => 'Test-data applications do not send email.',
+					'audit' => array(
+						'ok' => true,
+						'skipped' => true,
+						'communicationRecorded' => false,
+						'activityRecorded' => false,
+						'error' => null,
+					),
+				);
+			}
+
+			if (empty($payload['roles'])) {
+				return array(
+					'ok' => false,
+					'skipped' => true,
+					'sent' => array(),
+					'failed' => array(),
+					'error' => null,
+					'audit' => array(
+						'ok' => true,
+						'skipped' => true,
+						'communicationRecorded' => false,
+						'activityRecorded' => false,
+						'error' => null,
+					),
+				);
+			}
+
+			$application_id = isset($application['id']) ? (string) $application['id'] : '';
+			$sent = array();
+			$failed = array();
+			$error_message = null;
+
+			try {
+				$recipients = $this->resolve_email_recipients($payload);
+				if (empty($recipients)) {
+					$payload['deliverySkipped'] = true;
+					$error_message = 'No valid workflow-role email recipients were found.';
+				} else {
+					$headers = array('Content-Type: text/html; charset=UTF-8');
+					if (!empty($user['email']) && is_email($user['email'])) {
+						$headers[] = sprintf(
+							'Reply-To: %s <%s>',
+							$this->sanitize_mail_header_name($user['name']),
+							sanitize_email($user['email'])
+						);
+					}
+					$html_message = $this->build_email_message($payload['message'], $payload['application']);
+
+					foreach ($recipients as $recipient) {
+						try {
+							$delivered = wp_mail(
+								array($recipient['email']),
+								$payload['subject'],
+								$html_message,
+								$headers
+							);
+						} catch (Throwable $mail_error) {
+							$delivered = false;
+							$error_message = $mail_error->getMessage();
+						}
+
+						if ($delivered) {
+							$sent[] = $recipient;
+						} else {
+							$failed[] = $recipient;
+						}
+					}
+				}
+			} catch (Throwable $delivery_error) {
+				$error_message = $delivery_error->getMessage();
+			}
+
+			$audit_result = $this->record_application_activity_alert(
+				$application_id,
+				$user,
+				$payload,
+				$sent,
+				$failed,
+				$error_message
+			);
+
+			return array(
+				'ok' => !empty($sent) && empty($failed),
+				'skipped' => empty($sent) && empty($failed),
+				'sent' => $sent,
+				'failed' => $failed,
+				'error' => $error_message,
+				'audit' => $audit_result,
+			);
+		}
+
+		private function run_workflow_notification_delivery($application, $label, $callback) {
+			try {
+				return call_user_func($callback);
+			} catch (Throwable $error) {
+				error_log(
+					'MC Admissions workflow notification failed after the case was saved for application '
+					. (isset($application['id']) ? (string) $application['id'] : 'unknown')
+					. ' (' . (string) $label . '): '
+					. $error->getMessage()
+				);
+
+				return array(
+					'ok' => false,
+					'skipped' => false,
+					'sent' => array(),
+					'failed' => array(),
+					'error' => $error->getMessage(),
+				);
+			}
+		}
+
+		private function send_workflow_notifications($application, $user, $status_changed, $note_changed, $status, $note) {
+			if ((!$status_changed && !$note_changed) || !empty($application['isTestData'])) {
+				return array();
+			}
+
+			$results = array();
+			if ($status_changed) {
+				$consultant_payload = $this->workflow_stage_consultant_notification_payload($application, $status);
+				if ($consultant_payload) {
+					$results['consultantStage'] = $this->run_workflow_notification_delivery(
+						$application,
+						'originating-consultant stage notification',
+						function () use ($application, $user, $consultant_payload) {
+							return $this->send_originating_consultant_notification(
+								$application,
+								$user,
+								$consultant_payload,
+								false
+							);
+						}
+					);
+				}
+
+				$role_payload = $this->workflow_role_notification_payload($application, $user, $status, $note);
+				if ($role_payload) {
+					$results['roleHandoff'] = $this->run_workflow_notification_delivery(
+						$application,
+						'internal role handoff',
+						function () use ($application, $user, $role_payload) {
+							return $this->send_application_role_notification($application, $user, $role_payload);
+						}
+					);
+				}
+			}
+
+			$note_payload = $this->workflow_note_notification_payload($application, $user, $note);
+			if ($note_changed && $note_payload) {
+				$targets = $this->workflow_note_notification_targets($status);
+				if (!empty($targets['notifyAgent'])) {
+					$results['consultantNote'] = $this->run_workflow_notification_delivery(
+						$application,
+						'originating-consultant workflow note',
+						function () use ($application, $user, $note_payload) {
+							return $this->send_originating_consultant_notification(
+								$application,
+								$user,
+								$note_payload,
+								false
+							);
+						}
+					);
+				}
+
+				// A stage handoff already covers the responsible internal roles. A
+				// note-only update gets its own operational-role notification, with
+				// Administrators excluded from routine note email.
+				if (!$status_changed) {
+					$note_roles = array_values(array_diff((array) $targets['roles'], array('administrator')));
+					$role_note_payload = $this->workflow_note_notification_payload(
+						$application,
+						$user,
+						$note,
+						$note_roles
+					);
+					if ($role_note_payload && !empty($role_note_payload['roles'])) {
+						$results['roleNote'] = $this->run_workflow_notification_delivery(
+							$application,
+							'internal workflow note',
+							function () use ($application, $user, $role_note_payload) {
+								return $this->send_application_role_notification($application, $user, $role_note_payload);
+							}
+						);
+					}
+				}
+			}
+
+			return $results;
+		}
+
+		private function review_rejection_notification_payload($application, $reason = null) {
 			$reference = isset($application['referenceCode']) ? trim((string) $application['referenceCode']) : '';
 			$full_name = isset($application['fullName']) ? trim((string) $application['fullName']) : '';
 			$student_label = $full_name . ' (' . $reference . ')';
+			$rejection_reason = $this->trim_to_null($reason);
 
 			return array(
 				'roles' => array(),
 				'subject' => sanitize_text_field('Application closed after review for ' . $student_label),
-				'message' => 'Admissions review has concluded and the application has been closed as rejected.',
+				'message' => $rejection_reason
+					? $rejection_reason
+					: 'Admissions review has concluded and the application has been closed as rejected.',
 				'application' => array(
 					'id' => isset($application['id']) ? (string) $application['id'] : null,
 					'referenceCode' => $reference,
@@ -3062,8 +3462,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		private function send_originating_consultant_notification($application, $user, $payload, $deduplicate = false) {
-			$application = $this->application_with_authoritative_agency_identity($application);
-
 			if (!empty($application['isTestData'])) {
 				return array(
 					'ok' => false,
@@ -3082,6 +3480,33 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			$application_id = isset($application['id']) ? (string) $application['id'] : '';
+			try {
+				$application = $this->application_with_authoritative_agency_identity($application);
+			} catch (Throwable $identity_error) {
+				$error_message = 'The originating agency identity could not be resolved: ' . $identity_error->getMessage();
+				$payload['recipientLabel'] = 'Originating agency or consultant';
+				$audit_result = $this->record_application_activity_alert(
+					$application_id,
+					$user,
+					$payload,
+					array(),
+					array(),
+					$error_message
+				);
+				error_log(
+					'MC Admissions originating agency identity lookup failed after the case was saved for application '
+					. ($application_id ? $application_id : 'unknown') . ': ' . $identity_error->getMessage()
+				);
+
+				return array(
+					'ok' => false,
+					'skipped' => false,
+					'sent' => array(),
+					'failed' => array(),
+					'error' => $error_message,
+					'audit' => $audit_result,
+				);
+			}
 
 			if ($deduplicate && $this->has_application_email_audit($application_id, $payload['subject'])) {
 				return array(
@@ -3188,12 +3613,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
-		private function send_review_rejection_notification($application, $user) {
+		private function send_review_rejection_notification($application, $user, $reason = null, $deduplicate = true) {
 			return $this->send_originating_consultant_notification(
 				$application,
 				$user,
-				$this->review_rejection_notification_payload($application),
-				true
+				$this->review_rejection_notification_payload($application, $reason),
+				$deduplicate
 			);
 		}
 
@@ -4180,6 +4605,59 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		public function rest_reject_review_application(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+			$reason = isset($params['reason'])
+				? trim(sanitize_textarea_field((string) $params['reason']))
+				: '';
+			$expected_updated_at = isset($params['expectedUpdatedAt'])
+				? trim((string) $params['expectedUpdatedAt'])
+				: '';
+
+			if ('' === $reason) {
+				return $this->json_error_response('A rejection reason is required.', 400);
+			}
+			$reason_length = function_exists('mb_strlen') ? mb_strlen($reason) : strlen($reason);
+			if ($reason_length > 4000) {
+				return $this->json_error_response('The rejection reason must be 4,000 characters or fewer.', 400);
+			}
+			if ('' === $expected_updated_at) {
+				return $this->json_error_response('Application version is required.', 400);
+			}
+
+			try {
+				$user = $this->current_session_user();
+				if (!$this->can_assess_admission_documents($user)) {
+					return $this->json_error_response(
+						'Only an administrator or Admissions Officer can reject an application.',
+						403
+					);
+				}
+
+				$result = $this->reject_review_application(
+					array(
+						'applicationId' => (string) $request['application_id'],
+						'reason' => $reason,
+						'expectedUpdatedAt' => $expected_updated_at,
+						'user' => $user,
+					)
+				);
+
+				return new WP_REST_Response(
+					array(
+						'ok' => true,
+						'application' => $result['application'],
+						'delivery' => $result['delivery'],
+						'audit' => $result['audit'],
+					),
+					200
+				);
+			} catch (Exception $error) {
+				$status = self::STALE_APPLICATION_ERROR === $error->getMessage() ? 409 : 400;
+				return $this->json_error_response($error->getMessage(), $status);
+			}
+		}
+
 		public function rest_upload_document(WP_REST_Request $request) {
 			$file_params = $request->get_file_params();
 			$document_type = $request->get_param('documentType');
@@ -4359,13 +4837,17 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if (!is_array($params) || empty($params['generated']) || !is_array($params['generated'])) {
 				return $this->json_error_response('Generated letter payload is required.', 400);
 			}
+			if (empty($params['expectedUpdatedAt'])) {
+				return $this->json_error_response('The current application version is required.', 400);
+			}
 
 			try {
 				$user = $this->current_session_user();
 				$result = $this->persist_generated_admission_letter(
 					(string) $request['application_id'],
 					(array) $params['generated'],
-					$user
+					$user,
+					(string) $params['expectedUpdatedAt']
 				);
 
 				return new WP_REST_Response(
@@ -4377,7 +4859,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					200
 				);
 			} catch (Exception $error) {
-				$status = false !== stripos($error->getMessage(), 'permission') ? 403 : 400;
+				$status = self::STALE_APPLICATION_ERROR === $error->getMessage()
+					? 409
+					: (false !== stripos($error->getMessage(), 'permission') ? 403 : 400);
 				return $this->json_error_response($error->getMessage(), $status);
 			}
 		}
@@ -4957,6 +5441,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						: 'Submit the case into review.';
 				case 'review-pending':
 				case 'Under review':
+					if ('hold' === $application['reviewerDecision']) {
+						return 'Wait for the agency response to the Pending review message, then reassess the case.';
+					}
+
 					return $missing_docs > 0
 						? 'Request the outstanding documents before confirming the review outcome.'
 						: ('pending' === $application['reviewerDecision']
@@ -5171,8 +5659,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return array_map(array($this, 'to_board_application'), is_array($rows) ? $rows : array());
 		}
 
-		private function to_board_application($application) {
-			$application = $this->application_with_authoritative_agency_identity($application);
+		private function to_board_application($application, $refresh_agency_identity = true) {
+			if ($refresh_agency_identity) {
+				$application = $this->application_with_authoritative_agency_identity($application);
+			}
 			$status = $this->normalize_status($application['status']);
 			$intake_total = isset($application['applicationRoute']) && 'postgraduate' === $application['applicationRoute'] ? 8 : 6;
 			$migration_total = 4;
@@ -5203,6 +5693,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'semester' => trim($application['semester'] . ' ' . $application['year']),
 				'stage' => $status,
 				'stageKey' => isset($application['status']) ? (string) $application['status'] : $status,
+				'reviewerDecision' => isset($application['reviewerDecision']) ? (string) $application['reviewerDecision'] : 'pending',
 				'permitStatus' => isset($application['permitStatus']) ? $application['permitStatus'] : 'not-started',
 				'permitPackSubmittedDate' => !empty($application['permitPackSubmittedDate']) ? $application['permitPackSubmittedDate'] : null,
 				'permitPaymentReference' => !empty($application['permitPaymentReference']) ? $application['permitPaymentReference'] : null,
@@ -5240,7 +5731,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$lock_sql = $for_update ? ' FOR UPDATE' : '';
 			$application = $wpdb->get_row(
 				$wpdb->prepare(
-					"SELECT id, wordpressUserId, wordpressUsername, wordpressEmail, agencyName, consultantName, consultantEmail, consultantPhone, status, isTestData FROM {$this->applications_table} WHERE id = %s LIMIT 1{$lock_sql}",
+					"SELECT id, wordpressUserId, wordpressUsername, wordpressEmail, agencyName, consultantName, consultantEmail, consultantPhone, status, isTestData, updatedAt FROM {$this->applications_table} WHERE id = %s LIMIT 1{$lock_sql}",
 					$application_id
 				),
 				ARRAY_A
@@ -5257,61 +5748,155 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return $application;
 		}
 
-		private function persist_generated_admission_letter($application_id, $generated, $user) {
+		private function generated_admission_letter_template_labels() {
+			return array(
+				'offer-letter' => 'Offer letter',
+				'payment-receipt' => 'Payment receipt',
+				'acceptance-letter' => 'Acceptance letter',
+				'letter-of-assurance' => 'Letter of assurance',
+				'late-arrival-affirmation-letter' => 'Late arrival affirmation letter',
+			);
+		}
+
+		private function can_generate_admission_letter($user, $template_id) {
+			if ($this->is_admin_user($user)) {
+				return true;
+			}
+
+			switch ($template_id) {
+				case 'offer-letter':
+					return $this->user_has_any_role($user, array('admissions-officer'));
+				case 'payment-receipt':
+					return $this->user_has_any_role($user, array('finance-officer'));
+				case 'acceptance-letter':
+				case 'letter-of-assurance':
+				case 'late-arrival-affirmation-letter':
+					return $this->user_has_any_role(
+						$user,
+						array('admissions-officer', 'migration-officer', 'immigration-officer')
+					);
+				default:
+					return false;
+			}
+		}
+
+		private function assert_admission_letter_generation_available($application, $template_id) {
+			$case = $this->to_admission_case($application);
+			$payment_status = isset($case['paymentStatus']) ? (string) $case['paymentStatus'] : 'awaiting-invoice';
+			$payment_amount = isset($case['paymentAmount']) ? $this->trim_to_null($case['paymentAmount']) : null;
+
+			switch ($template_id) {
+				case 'offer-letter':
+					if ($this->workflow_status_rank($case['stageKey']) < $this->workflow_status_rank('review-pending')) {
+						throw new Exception('Move the case into assessment before generating an offer.');
+					}
+					if (!in_array((string) $case['reviewerDecision'], array('academically-cleared', 'conditional-offer'), true)) {
+						throw new Exception('Record a cleared or conditional review decision first.');
+					}
+					if (empty($case['classesStartDate'])) {
+						throw new Exception('Set the classes start date in operations first.');
+					}
+					if (empty($case['tuitionFeeFirstYear'])) {
+						throw new Exception('Set the first-year tuition fee before generating the offer.');
+					}
+					break;
+				case 'acceptance-letter':
+					if (!in_array($payment_status, array('receipt-received', 'cleared'), true)) {
+						throw new Exception('Finance must record payment received before generating the acceptance letter.');
+					}
+					if (null === $payment_amount) {
+						throw new Exception('Record the received payment amount before generating the acceptance letter.');
+					}
+					if (empty($case['classesStartDate'])) {
+						throw new Exception('Set the classes start date in operations first.');
+					}
+					break;
+				case 'payment-receipt':
+					if (!in_array($payment_status, array('receipt-received', 'cleared'), true)) {
+						throw new Exception('Record a receipt or finance-cleared payment status first.');
+					}
+					if (null === $payment_amount) {
+						throw new Exception('Record the payment amount before generating the receipt.');
+					}
+					break;
+				case 'letter-of-assurance':
+					if ('cleared' !== $payment_status) {
+						throw new Exception('The assurance letter requires a finance-cleared payment.');
+					}
+					if (null === $payment_amount) {
+						throw new Exception('Record the cleared payment amount before generating the assurance letter.');
+					}
+					break;
+				case 'late-arrival-affirmation-letter':
+					if ($this->workflow_status_rank($case['stageKey']) < $this->workflow_status_rank('arrival-immigration')) {
+						throw new Exception('Move the case into arrival and immigration before generating this letter.');
+					}
+					if ('enrolled' !== (string) $case['enrollmentStatus']) {
+						throw new Exception('Confirm the student is enrolled before generating the late-arrival letter.');
+					}
+					if (
+						empty($case['lateArrivalReason'])
+						&& empty($case['permitNote'])
+						&& empty($case['workflowNote'])
+					) {
+						throw new Exception('Add a late-arrival explanation or permit note first.');
+					}
+					break;
+			}
+
+			return $case;
+		}
+
+		private function persist_generated_admission_letter($application_id, $generated, $user, $expected_updated_at) {
 			global $wpdb;
 
 			$application_id = sanitize_text_field((string) $application_id);
+			$expected_version = $this->iso_to_mysql_datetime($expected_updated_at);
 			$this->get_authorized_application_base($application_id, $user);
-
-			if (!$this->is_admin_user($user) && !$this->user_has_any_role($user, array('admissions-officer'))) {
-				throw new Exception('You do not have permission to generate an offer letter.');
-			}
-
-			$application = $this->get_detailed_application_record($application_id);
 			$template_id = isset($generated['templateId']) ? sanitize_key((string) $generated['templateId']) : '';
-			if ('offer-letter' !== $template_id) {
-				throw new Exception('Mobile web generation currently supports the Offer Letter only.');
+			$template_labels = $this->generated_admission_letter_template_labels();
+			if (!isset($template_labels[$template_id])) {
+				throw new Exception('A valid generated letter template is required.');
 			}
-
-			$reviewer_decision = isset($application['reviewerDecision']) ? (string) $application['reviewerDecision'] : 'pending';
-			if (!in_array($reviewer_decision, array('academically-cleared', 'conditional-offer'), true)) {
-				throw new Exception('Record a cleared or conditional review decision first.');
-			}
-			if (empty($application['classesStartDate'])) {
-				throw new Exception('Set the classes start date in operations first.');
-			}
-			if (empty($application['tuitionFeeFirstYear'])) {
-				throw new Exception('Set the first-year tuition fee before generating the offer.');
+			if (!$this->can_generate_admission_letter($user, $template_id)) {
+				throw new Exception('You do not have permission to generate this letter.');
 			}
 
 			$content_base64 = isset($generated['contentBase64']) ? (string) $generated['contentBase64'] : '';
 			$content = base64_decode($content_base64, true);
 			if (false === $content || strlen($content) < 5 || '%PDF-' !== substr($content, 0, 5)) {
-				throw new Exception('Generated Offer Letter PDF is invalid.');
+				throw new Exception('Generated letter PDF is invalid.');
 			}
 			if (strlen($content) > 15 * 1024 * 1024) {
-				throw new Exception('Generated Offer Letter PDF exceeds the 15 MB limit.');
+				throw new Exception('Generated letter PDF exceeds the 15 MB limit.');
 			}
 
-			$template_label = 'Offer letter';
+			$template_label = $template_labels[$template_id];
 			$template_version = isset($generated['templateVersion'])
 				? sanitize_text_field((string) $generated['templateVersion'])
 				: '';
 			$file_name = isset($generated['fileName']) ? sanitize_file_name((string) $generated['fileName']) : '';
 			if ('' === $template_version || '' === $file_name || 'pdf' !== strtolower((string) ($generated['outputFormat'] ?? ''))) {
-				throw new Exception('Generated Offer Letter metadata is incomplete.');
+				throw new Exception('Generated letter metadata is incomplete.');
 			}
 			$input_snapshot = wp_json_encode(isset($generated['inputSnapshot']) ? $generated['inputSnapshot'] : array());
 			if (false === $input_snapshot) {
-				throw new Exception('Generated Offer Letter input snapshot is invalid.');
+				throw new Exception('Generated letter input snapshot is invalid.');
 			}
 
 			$letter_id = wp_generate_uuid4();
 			if (false === $wpdb->query('START TRANSACTION')) {
-				throw new Exception('Unable to start Offer Letter generation.');
+				throw new Exception('Unable to start generated letter persistence.');
 			}
 
 			try {
+				$locked_application = $this->get_authorized_application_base($application_id, $user, true);
+				if ((string) $locked_application['updatedAt'] !== (string) $expected_version) {
+					throw new Exception(self::STALE_APPLICATION_ERROR);
+				}
+				$application = $this->get_detailed_application_record($application_id);
+				$this->assert_admission_letter_generation_available($application, $template_id);
+
 				$letter_written = $wpdb->insert(
 					'mc_generated_letters',
 					array(
@@ -5330,7 +5915,25 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
 				);
 				if (false === $letter_written || 0 === $letter_written) {
-					throw new Exception('Unable to save the generated Offer Letter.');
+					throw new Exception('Unable to save the generated letter.');
+				}
+
+				$acceptance_stage_advanced = false;
+				if ('acceptance-letter' === $template_id) {
+					$acceptance_stage_result = $wpdb->query(
+						$wpdb->prepare(
+							"UPDATE {$this->applications_table}
+							 SET status = 'acceptance-issued', workflowNote = %s, lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3)
+							 WHERE id = %s AND status IN ('offer-issued', 'prepayment-pending', 'Offer letter issued', 'Payment pending')",
+							$this->workflow_note_for_status('acceptance-issued'),
+							$user['name'],
+							$application_id
+						)
+					);
+					if (false === $acceptance_stage_result) {
+						throw new Exception('Unable to update the workflow after Acceptance Letter generation.');
+					}
+					$acceptance_stage_advanced = 0 < (int) $acceptance_stage_result;
 				}
 
 				$application_written = $wpdb->query(
@@ -5340,39 +5943,128 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						$application_id
 					)
 				);
-				if (false === $application_written || 0 === $application_written) {
-					throw new Exception('Unable to update the application after Offer Letter generation.');
+				if (false === $application_written) {
+					throw new Exception('Unable to update the application after generated letter persistence.');
 				}
 
 				$this->create_required_activity(
 					$application_id,
 					$user,
 					'letter',
-					'Offer letter generated',
+					$template_label . ' generated',
 					$file_name . ' created from template version ' . $template_version . '.',
-					'Unable to record the Offer Letter activity.'
+					'Unable to record the generated letter activity.'
 				);
+				if ($acceptance_stage_advanced) {
+					$this->create_required_activity(
+						$application_id,
+						$user,
+						'workflow',
+						'Stage moved to Acceptance issued',
+						$this->workflow_note_for_status('acceptance-issued'),
+						'Unable to record the acceptance workflow activity.'
+					);
+				}
 
 				if (false === $wpdb->query('COMMIT')) {
-					throw new Exception('Unable to commit Offer Letter generation.');
+					throw new Exception('Unable to commit generated letter persistence.');
 				}
 			} catch (Exception $error) {
 				$wpdb->query('ROLLBACK');
 				throw $error;
 			}
 
-			$this->send_generated_offer_letter_email($application, $user, $file_name, $content_base64);
-
-			$refreshed = $this->get_detailed_application_record($application_id);
-			$saved_letter = null;
-			foreach ((array) $refreshed['generatedLetters'] as $letter) {
-				if ((string) $letter['id'] === $letter_id) {
-					$saved_letter = $letter;
-					break;
+			$this->run_workflow_notification_delivery(
+				$application,
+				'generated-letter email and audit',
+				function () use ($application, $user, $template_id, $template_label, $file_name, $content_base64) {
+					return $this->send_generated_admission_letter_email(
+						$application,
+						$user,
+						$template_id,
+						$template_label,
+						$file_name,
+						$content_base64
+					);
+				}
+			);
+			$post_commit_application = $application;
+			if ($acceptance_stage_advanced) {
+				$post_commit_application['status'] = 'acceptance-issued';
+				$post_commit_application['workflowNote'] = $this->workflow_note_for_status('acceptance-issued');
+				$role_payload = $this->workflow_role_notification_payload(
+					$post_commit_application,
+					$user,
+					'acceptance-issued',
+					$post_commit_application['workflowNote']
+				);
+				if ($role_payload) {
+					$this->run_workflow_notification_delivery(
+						$post_commit_application,
+						'acceptance generated internal role handoff',
+						function () use ($post_commit_application, $user, $role_payload) {
+							return $this->send_application_role_notification($post_commit_application, $user, $role_payload);
+						}
+					);
 				}
 			}
-			if (!$saved_letter) {
-				throw new Exception('Generated Offer Letter could not be reloaded.');
+
+			$refreshed = null;
+			$saved_letter = null;
+			try {
+				$refreshed = $this->get_detailed_application_record($application_id);
+				foreach ((array) $refreshed['generatedLetters'] as $letter) {
+					if ((string) $letter['id'] === $letter_id) {
+						$saved_letter = $letter;
+						break;
+					}
+				}
+			} catch (Throwable $reload_error) {
+				error_log(
+					'MC Admissions could not reload generated letter ' . $letter_id
+					. ' after it committed for application ' . $application_id . ': '
+					. $reload_error->getMessage()
+				);
+				try {
+					$fresh_base = $this->get_authorized_application_base($application_id, $user);
+					$post_commit_application['status'] = (string) $fresh_base['status'];
+					$post_commit_application['updatedAt'] = (string) $fresh_base['updatedAt'];
+				} catch (Throwable $base_reload_error) {
+					error_log(
+						'MC Admissions could not reload the generated-letter application version for '
+						. $application_id . ': ' . $base_reload_error->getMessage()
+					);
+				}
+			}
+
+			if (!$refreshed || !$saved_letter) {
+				// Persistence already committed. Return the submitted canonical metadata
+				// instead of throwing a retryable error that could duplicate the PDF/email.
+				$fallback_letter = array(
+					'id' => $letter_id,
+					'applicationId' => $application_id,
+					'templateId' => $template_id,
+					'templateLabel' => $template_label,
+					'templateVersion' => $template_version,
+					'stageKeySnapshot' => (string) $application['status'],
+					'fileName' => $file_name,
+					'outputFormat' => 'pdf',
+					'generatedByName' => $user['name'],
+					'createdAt' => current_time('mysql', true),
+				);
+				if ($refreshed) {
+					$post_commit_application = $refreshed;
+				}
+				$post_commit_application['lastUpdatedByName'] = $user['name'];
+				if (empty($post_commit_application['updatedAt'])) {
+					$post_commit_application['updatedAt'] = current_time('mysql', true);
+				}
+				$post_commit_application['generatedLetters'][] = $fallback_letter;
+
+				return array(
+					'application' => $this->to_admission_case($post_commit_application),
+					'letter' => $this->map_generated_letter($fallback_letter),
+				);
 			}
 
 			return array(
@@ -5381,42 +6073,60 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
-		private function send_generated_offer_letter_email($application, $user, $file_name, $content_base64) {
+		private function send_generated_admission_letter_email($application, $user, $template_id, $template_label, $file_name, $content_base64) {
 			global $wpdb;
 			$application = $this->application_with_authoritative_agency_identity($application);
 
 			$application_id = (string) $application['id'];
 			$reference = !empty($application['referenceCode']) ? (string) $application['referenceCode'] : $application_id;
 			$full_name = !empty($application['fullName']) ? (string) $application['fullName'] : 'Applicant';
-			$subject = 'Offer letter for ' . $full_name . ' (' . $reference . ')';
-			$message = "An official offer letter has been generated for {$full_name}.\nApplication reference: {$reference}.\nThe generated document is attached.";
+			$subject = $template_label . ' for ' . $full_name . ' (' . $reference . ')';
+			$message = 'An official ' . strtolower($template_label) . " has been generated for {$full_name}.\nApplication reference: {$reference}.\nThe generated document is attached.";
+			$student_email = sanitize_email(isset($application['email']) ? (string) $application['email'] : '');
+			$agency_email = sanitize_email(
+				!empty($application['consultantEmail'])
+					? (string) $application['consultantEmail']
+					: (!empty($application['wordpressEmail']) ? (string) $application['wordpressEmail'] : '')
+			);
+			$agency_email_is_student = is_email($student_email)
+				&& is_email($agency_email)
+				&& strtolower($student_email) === strtolower($agency_email);
 			$to = array();
-			if (!empty($application['consultantEmail'])) {
-				$to[] = array('email' => $application['consultantEmail'], 'name' => $application['consultantName'] ?? $application['agencyName'] ?? null);
-			} elseif (!empty($application['wordpressEmail'])) {
-				$to[] = array('email' => $application['wordpressEmail'], 'name' => $application['consultantName'] ?? $application['agencyName'] ?? null);
+			if (is_email($agency_email) && !$agency_email_is_student) {
+				$to[] = array('email' => $agency_email, 'name' => $application['consultantName'] ?? $application['agencyName'] ?? null);
 			}
-			$to[] = array('email' => self::PRESIDENT_ACTIVITY_ALERT_EMAIL, 'name' => self::PRESIDENT_ACTIVITY_ALERT_NAME);
 			$payload = array('to' => $to);
 			$sent = array();
 			$failed = array();
 			$error_message = null;
 			$attachments = array();
+			$delivery_skipped = false;
 
 			if (empty($application['isTestData'])) {
 				try {
-					$recipients = $this->resolve_email_recipients($payload);
-					$attachments = $this->create_email_attachments(array(array('fileName' => $file_name, 'contentBase64' => $content_base64)));
-					$headers = array('Content-Type: text/html; charset=UTF-8');
-					if (!empty($user['email']) && is_email($user['email'])) {
-						$headers[] = sprintf('Reply-To: %s <%s>', $this->sanitize_mail_header_name($user['name']), $user['email']);
+					$recipients = array();
+					if ($agency_email_is_student) {
+						$delivery_skipped = true;
+						$error_message = 'The agency email matches the student email, so delivery was skipped.';
+					} else {
+						$recipients = $this->resolve_email_recipients($payload);
 					}
-					$html_message = $this->build_email_message($message, array('referenceCode' => $reference, 'fullName' => $full_name));
-					foreach ($recipients as $recipient) {
-						if (wp_mail(array($recipient['email']), $subject, $html_message, $headers, $attachments)) {
-							$sent[] = $recipient;
-						} else {
-							$failed[] = $recipient;
+					if (!$delivery_skipped && empty($recipients)) {
+						$delivery_skipped = true;
+						$error_message = 'No valid originating agency email is recorded.';
+					} elseif (!$delivery_skipped) {
+						$attachments = $this->create_email_attachments(array(array('fileName' => $file_name, 'contentBase64' => $content_base64)));
+						$headers = array('Content-Type: text/html; charset=UTF-8');
+						if (!empty($user['email']) && is_email($user['email'])) {
+							$headers[] = sprintf('Reply-To: %s <%s>', $this->sanitize_mail_header_name($user['name']), $user['email']);
+						}
+						$html_message = $this->build_email_message($message, array('referenceCode' => $reference, 'fullName' => $full_name));
+						foreach ($recipients as $recipient) {
+							if (wp_mail(array($recipient['email']), $subject, $html_message, $headers, $attachments)) {
+								$sent[] = $recipient;
+							} else {
+								$failed[] = $recipient;
+							}
 						}
 					}
 				} catch (Throwable $error) {
@@ -5425,41 +6135,30 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$this->delete_temp_files($attachments);
 				}
 			} else {
+				$delivery_skipped = true;
 				$error_message = 'Test-data application; email delivery disabled.';
 			}
 
-			if (!empty($sent) && empty($failed)) {
-				$delivery_status = 'Email delivery: sent to ' . count($sent) . ' recipient(s).';
-			} elseif (!empty($sent)) {
-				$delivery_status = 'Email delivery: partially sent to ' . count($sent) . ' recipient(s); ' . count($failed) . ' failed.';
-			} elseif (!empty($application['isTestData'])) {
-				$delivery_status = 'Email delivery skipped: ' . $error_message;
-			} else {
-				$delivery_status = 'Email delivery failed: ' . ($error_message ?: 'WordPress did not accept the message.');
-			}
-
-			if ($this->table_exists($this->communications_table)) {
-				$wpdb->insert(
-					$this->communications_table,
-					array(
-						'id' => wp_generate_uuid4(),
-						'applicationId' => $application_id,
-						'direction' => 'outbound',
-						'channel' => 'email',
-						'subject' => $subject,
-						'detail' => $message . "\nRecipients: " . count($sent) . " sent, " . count($failed) . " failed.\n" . $delivery_status,
-						'actorName' => $user['name'],
-						'createdAt' => current_time('mysql', true),
-					),
-					array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
-				);
-			}
-			$this->create_activity(
+			$this->record_application_activity_alert(
 				$application_id,
 				$user,
-				'communication',
-				!empty($sent) ? 'Offer letter emailed' : 'Offer letter email delivery not completed',
-				$delivery_status
+				array(
+					'subject' => $subject,
+					'message' => $message,
+					'recipientLabel' => 'Originating agency or consultant',
+					'deliverySkipped' => $delivery_skipped,
+				),
+				$sent,
+				$failed,
+				$error_message
+			);
+
+			return array(
+				'ok' => !empty($sent) && empty($failed),
+				'skipped' => $delivery_skipped,
+				'sent' => $sent,
+				'failed' => $failed,
+				'error' => $error_message,
 			);
 		}
 
@@ -5742,8 +6441,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
-		private function to_admission_case($application) {
-			$application = $this->application_with_authoritative_agency_identity($application);
+		private function to_admission_case($application, $refresh_agency_identity = true) {
+			if ($refresh_agency_identity) {
+				$application = $this->application_with_authoritative_agency_identity($application);
+			}
 			$board = $this->to_board_application(
 				array_merge(
 					$application,
@@ -5758,7 +6459,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							)
 						),
 					)
-				)
+				),
+				false
 			);
 
 			$documents = array_map(array($this, 'map_document'), $application['documents']);
@@ -6487,7 +7189,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if (!$existing) {
 				throw new Exception('Application not found.');
 			}
-
 			if (('trashed' === $status || 'trashed' === $existing['status']) && !$this->is_admin_user($user)) {
 				throw new Exception('Only an administrator can move applications to or restore them from Trash.');
 			}
@@ -6498,6 +7199,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			if (!$this->can_manage_workflow_status($user, $status)) {
 				throw new Exception('You do not have permission to move this application to the requested stage.');
+			}
+			if ('rejected' === $status) {
+				throw new Exception('Use the Rejected assessment action and enter the required standalone rejection reason.');
 			}
 
 			$next_note = $this->trim_to_null($params['note']);
@@ -6572,6 +7276,25 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('The admissions workflow stage was not saved. Refresh and try again.');
 			}
 
+			if (!$stale_command_ignored && ($status_changed || $note_changed)) {
+				// Workflow email is a post-save side effect. Delivery or audit failure
+				// must never replay or roll back the authoritative stage transition.
+				$this->run_workflow_notification_delivery(
+					$application,
+					'workflow notification orchestration',
+					function () use ($application, $user, $status_changed, $note_changed, $status, $next_note) {
+						return $this->send_workflow_notifications(
+							$application,
+							$user,
+							$status_changed,
+							$note_changed,
+							$status,
+							$next_note
+						);
+					}
+				);
+			}
+
 			return array(
 				'id' => $application_id,
 				'application' => $this->to_board_application(
@@ -6625,6 +7348,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				&& !in_array($draft['reviewerDecision'], $this->reviewer_decisions, true)
 			) {
 				throw new Exception('Invalid reviewer decision.');
+			}
+			if (
+				array_key_exists('reviewerDecision', $draft)
+				&& 'rejected' === (string) $draft['reviewerDecision']
+				&& empty($params['dedicatedReviewRejection'])
+			) {
+				throw new Exception('Use the Rejected assessment action and enter the required standalone rejection reason.');
 			}
 			$existing_status = $this->canonical_status_key((string) $existing['status']);
 			$normalized = $this->normalize_operations_draft($draft, $existing_status);
@@ -6724,7 +7454,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 				$written_state = $wpdb->get_row(
 					$wpdb->prepare(
-						"SELECT status, reviewerDecision, workflowNote FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+						"SELECT status, reviewerDecision, workflowNote, updatedAt FROM {$this->applications_table} WHERE id = %s LIMIT 1",
 						$application_id
 					),
 					ARRAY_A
@@ -6768,34 +7498,104 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw $write_error;
 			}
 
-			$authoritative_review = $wpdb->get_row(
-				$wpdb->prepare(
-					"SELECT id, referenceCode, wordpressUserId, wordpressUsername, wordpressEmail, fullName, email, agencyName, consultantName, consultantEmail, consultantPhone, isTestData, status, reviewerDecision FROM {$this->applications_table} WHERE id = %s LIMIT 1",
-					$application_id
-				),
-				ARRAY_A
-			);
+			$authoritative_review = null;
+			try {
+				$authoritative_review = $wpdb->get_row(
+					$wpdb->prepare(
+						"SELECT id, referenceCode, wordpressUserId, wordpressUsername, wordpressEmail, fullName, email, agencyName, consultantName, consultantEmail, consultantPhone, isTestData, status, reviewerDecision, workflowNote, lastUpdatedByName, updatedAt FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+						$application_id
+					),
+					ARRAY_A
+				);
+			} catch (Throwable $authoritative_read_error) {
+				if (empty($params['dedicatedReviewRejection'])) {
+					throw $authoritative_read_error;
+				}
+				error_log(
+					'MC Admissions could not reload the committed review state for application '
+					. $application_id . ': ' . $authoritative_read_error->getMessage()
+				);
+			}
 			if (
 				!$authoritative_review
 				|| $next_status !== $this->canonical_status_key((string) $authoritative_review['status'])
 				|| $next_reviewer_decision !== (string) $authoritative_review['reviewerDecision']
 			) {
-				throw new Exception('The application review outcome was not saved. Refresh and try again.');
+				if (empty($params['dedicatedReviewRejection'])) {
+					throw new Exception('The application review outcome was not saved. Refresh and try again.');
+				}
+				$authoritative_review = array_merge(
+					$existing,
+					$normalized,
+					(array) $written_state,
+					array(
+						'id' => $application_id,
+						'status' => $next_status,
+						'reviewerDecision' => $next_reviewer_decision,
+						'lastUpdatedByName' => $user['name'],
+					)
+				);
 			}
 
-			if ('rejected' === $next_status && 'rejected' === $next_reviewer_decision) {
+			if (
+				'rejected' === $next_status
+				&& 'rejected' === $next_reviewer_decision
+				&& empty($params['suppressReviewRejectionNotification'])
+			) {
 				$this->send_review_rejection_notification($authoritative_review, $user);
 			}
 
-			$application = $this->get_detailed_application_record($application_id);
-			if (
-				$next_status !== $this->canonical_status_key((string) $application['status'])
-				|| $next_reviewer_decision !== (string) $application['reviewerDecision']
-			) {
-				throw new Exception('The application review outcome was not saved. Refresh and try again.');
+			$fallback_application = array_merge(
+				$existing,
+				$normalized,
+				$authoritative_review,
+				array(
+					'status' => $next_status,
+					'reviewerDecision' => $next_reviewer_decision,
+					'documents' => array(),
+					'activities' => array(),
+					'communications' => array(),
+					'generatedLetters' => array(),
+					'letterDrafts' => array(),
+					'commissionRecords' => array(),
+					'refundRecords' => array(),
+					'paymentTransactions' => array(),
+					'migrationCase' => null,
+					'immigrationCase' => null,
+				)
+			);
+			$application = null;
+			try {
+				$application = $this->get_detailed_application_record($application_id);
+				if (
+					$next_status !== $this->canonical_status_key((string) $application['status'])
+					|| $next_reviewer_decision !== (string) $application['reviewerDecision']
+				) {
+					throw new Exception('The post-commit case read did not match the committed review outcome.');
+				}
+			} catch (Throwable $reload_error) {
+				if (empty($params['dedicatedReviewRejection'])) {
+					throw $reload_error;
+				}
+				error_log(
+					'MC Admissions could not reload the committed operations result for application '
+					. $application_id . ': ' . $reload_error->getMessage()
+				);
+				$application = $fallback_application;
 			}
 
-			return $this->to_admission_case($application);
+			try {
+				return $this->to_admission_case($application);
+			} catch (Throwable $identity_error) {
+				if (empty($params['dedicatedReviewRejection'])) {
+					throw $identity_error;
+				}
+				error_log(
+					'MC Admissions could not refresh agency identity while returning the committed operations result for application '
+					. $application_id . ': ' . $identity_error->getMessage()
+				);
+				return $this->to_admission_case($fallback_application, false);
+			}
 		}
 
 		private function send_pending_review_message($params) {
@@ -6821,6 +7621,70 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$authoritative,
 				$user,
 				$message
+			);
+
+			return array(
+				'application' => $application,
+				'delivery' => array(
+					'ok' => !empty($delivery_result['ok']),
+					'skipped' => !empty($delivery_result['skipped']),
+					'sentCount' => count(isset($delivery_result['sent']) ? (array) $delivery_result['sent'] : array()),
+					'failedCount' => count(isset($delivery_result['failed']) ? (array) $delivery_result['failed'] : array()),
+					'error' => isset($delivery_result['error']) ? $delivery_result['error'] : null,
+				),
+				'audit' => isset($delivery_result['audit'])
+					? $delivery_result['audit']
+					: array(
+						'ok' => false,
+						'skipped' => false,
+						'communicationRecorded' => false,
+						'activityRecorded' => false,
+						'error' => 'Email delivery audit result is unavailable.',
+					),
+			);
+		}
+
+		private function reject_review_application($params) {
+			$user = $params['user'];
+			$application_id = (string) $params['applicationId'];
+			$reason = trim((string) $params['reason']);
+			$existing = $this->get_authorized_application_base($application_id, $user);
+
+			if ('review-pending' !== $this->canonical_status_key((string) $existing['status'])) {
+				throw new Exception('Only an application awaiting review can be rejected.');
+			}
+
+			$application = $this->update_admission_application_operations(
+				array(
+					'applicationId' => $application_id,
+					'draft' => array('reviewerDecision' => 'rejected'),
+					'expectedUpdatedAt' => $params['expectedUpdatedAt'],
+					'user' => $user,
+					'suppressReviewRejectionNotification' => true,
+					'dedicatedReviewRejection' => true,
+				)
+			);
+			if (
+				'rejected' !== $this->canonical_status_key((string) $application['stageKey'])
+				|| 'rejected' !== (string) $application['reviewerDecision']
+			) {
+				throw new Exception('The application rejection was not saved. Refresh and try again.');
+			}
+			$notification_application = array_merge(
+				$existing,
+				$application,
+				array(
+					'id' => $application_id,
+					'status' => 'rejected',
+					'isTestData' => !empty($existing['isTestData']) ? 1 : 0,
+				)
+			);
+
+			$delivery_result = $this->send_review_rejection_notification(
+				$notification_application,
+				$user,
+				$reason,
+				false
 			);
 
 			return array(

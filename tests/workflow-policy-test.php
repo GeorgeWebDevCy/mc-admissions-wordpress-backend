@@ -24,6 +24,7 @@ final class MC_Admissions_Test_Role {
 final class MC_Admissions_Test_Wpdb {
 	public $query_results = array();
 	public $get_var_result = null;
+	public $get_row_result = null;
 	public $update_result = 1;
 	public $insert_result = 1;
 	public $events = array();
@@ -37,6 +38,11 @@ final class MC_Admissions_Test_Wpdb {
 	public function get_var($query) {
 		$this->events[] = 'get_var:' . $query;
 		return $this->get_var_result;
+	}
+
+	public function get_row($query, $output = null) {
+		$this->events[] = 'get_row:' . $query;
+		return $this->get_row_result;
 	}
 
 	public function query($query) {
@@ -126,6 +132,8 @@ $allowed_operations = $reflection->getMethod('allowed_operations_fields_for_user
 $allowed_operations->setAccessible(true);
 $workflow_permission = $reflection->getMethod('can_manage_workflow_status');
 $workflow_permission->setAccessible(true);
+$update_workflow = $reflection->getMethod('update_admission_application_workflow');
+$update_workflow->setAccessible(true);
 $normalize_operations = $reflection->getMethod('normalize_operations_draft');
 $normalize_operations->setAccessible(true);
 $authorize_operations = $reflection->getMethod('assert_operations_patch_authorized');
@@ -214,6 +222,7 @@ $masters_board = $to_board_application->invoke(
 		'semester' => 'fall',
 		'year' => '2026',
 		'status' => 'prepayment-pending',
+		'reviewerDecision' => 'pending',
 		'paymentStatus' => 'cleared',
 		'updatedAt' => '2026-08-12 07:00:00.000',
 	)
@@ -222,6 +231,36 @@ assert_same(
 	"Business Administration (Master's)",
 	$masters_board['programme'],
 	'Board and case responses must expose the repaired Master\'s programme label.'
+);
+assert_same(
+	'pending',
+	$masters_board['reviewerDecision'],
+	'Board responses must expose reviewerDecision so New and Pending can be separated reliably.'
+);
+
+$held_review_board = $to_board_application->invoke(
+	$plugin,
+	array(
+		'id' => 'offline-held-record',
+		'referenceCode' => 'MC-OFFLINE-HOLD',
+		'fullName' => 'Offline Held Applicant',
+		'agencyName' => 'Offline Agency',
+		'applicationRoute' => 'bachelor-foundation',
+		'programmeCode' => 'business-administration',
+		'programmeLabel' => 'Business Administration',
+		'semester' => 'fall',
+		'year' => '2026',
+		'status' => 'review-pending',
+		'reviewerDecision' => 'hold',
+		'paymentStatus' => 'awaiting-invoice',
+		'updatedAt' => '2026-08-12 07:00:00.000',
+	)
+);
+assert_same('hold', $held_review_board['reviewerDecision'], 'A held review must remain identifiable on the board.');
+assert_same(
+	'Wait for the agency response to the Pending review message, then reassess the case.',
+	$held_review_board['nextAction'],
+	'A held review must describe the actual pending action instead of asking staff to issue an offer.'
 );
 
 function assert_throws_message($expected, $callback, $message) {
@@ -358,6 +397,32 @@ foreach ($workflow_matrix as $role => $allowed_targets) {
 		);
 	}
 }
+
+$GLOBALS['wpdb']->get_row_result = array(
+	'id' => 'application-review-pending',
+	'wordpressUserId' => 42,
+	'status' => 'review-pending',
+	'workflowNote' => 'Awaiting review.',
+	'updatedAt' => '2026-08-13 08:00:00.000',
+);
+$GLOBALS['wpdb']->events = array();
+assert_throws_message(
+	'Use the Rejected assessment action and enter the required standalone rejection reason.',
+	function () use ($update_workflow, $plugin, $users) {
+		$update_workflow->invoke(
+			$plugin,
+			array(
+				'applicationId' => 'application-review-pending',
+				'expectedUpdatedAt' => '2026-08-13T08:00:00.000Z',
+				'status' => 'rejected',
+				'note' => 'Legacy generic rejection.',
+				'user' => array_merge(array('id' => 7, 'name' => 'Admissions Officer'), $users['admissions']),
+			)
+		);
+	},
+	'Generic workflow updates must not bypass the standalone rejection reason.'
+);
+assert_same(1, count($GLOBALS['wpdb']->events), 'A blocked generic workflow rejection must stop after its read and before mutation.');
 
 $review_patch = $normalize_operations->invoke($plugin, array('reviewSummary' => 'Updated review'), 'offer-issued');
 assert_same(array('reviewSummary'), array_keys($review_patch), 'A partial review patch must not synthesize omitted finance or workflow fields.');
