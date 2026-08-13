@@ -482,7 +482,8 @@ alert_assert_contains('isTestData BOOLEAN NOT NULL DEFAULT 0', $activate_source,
 alert_assert_contains('ADD COLUMN isTestData BOOLEAN NOT NULL DEFAULT 0', $test_data_schema_source, 'Existing installations must add the test-data column before requests use it.');
 alert_assert_contains("'isTestData' => \$next_is_test_data ? 1 : 0", $save_source, 'Server-classified test applications must be persisted before alert evaluation.');
 alert_assert_contains('can_submit_prepared_application', $save_source, 'Application save must use the centralized preparation submission gate.');
-alert_assert_contains("'profile-preparation' === \$this->canonical_status_key", $submit_prepared_source, 'Review submission must recognize every canonical preparation status.');
+alert_assert_contains("array('profile-preparation', 'Draft', 'Application in progress')", $submit_prepared_source, 'Review submission must use the explicit preparation-status allowlist.');
+alert_assert_same(false, false !== strpos($submit_prepared_source, 'canonical_status_key'), 'A permission gate must not normalize unknown statuses into preparation.');
 alert_assert_contains("false === \$wpdb->query('START TRANSACTION')", $save_source, 'The application save transaction start must be checked.');
 alert_assert_contains('false === $updated', $save_source, 'The primary application update must be checked.');
 alert_assert_contains('false === $inserted || 0 === $inserted', $save_source, 'The primary application insert must be checked.');
