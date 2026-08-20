@@ -277,6 +277,7 @@ $GLOBALS['wpdb']->profiles[14] = array(
 $GLOBALS['wpdb']->profiles[17] = array(
 	'id' => 'profile-17', 'wordpressUserId' => 17, 'agencyName' => 'Legacy Profile Agency',
 	'consultantName' => 'Profile Owner', 'consultantPhone' => '111',
+	'agreementOnFile' => 1, 'authorizationOnFile' => 1,
 );
 $GLOBALS['wpdb']->profiles[22] = array(
 	'id' => 'profile-22', 'wordpressUserId' => 22, 'wordpressUsername' => 'Whitespace_Agency',
@@ -591,6 +592,16 @@ $administrator_agent_list = $plugin->rest_list_agents();
 identity_assert_same(200, $administrator_agent_list->status, 'Administrators must be able to list agents for ownership selection.');
 $administrator_agent_ids = array_map(function ($agent) { return (int) $agent['id']; }, $administrator_agent_list->data['agents']);
 identity_assert_same(false, in_array(25, $administrator_agent_ids, true), 'The ownership selector must exclude internal staff even when they also have an agent role.');
+$administrator_agents_by_id = array();
+foreach ($administrator_agent_list->data['agents'] as $agent_summary) {
+	$administrator_agents_by_id[(int) $agent_summary['id']] = $agent_summary;
+}
+identity_assert_same(true, $administrator_agents_by_id[17]['agreementOnFile'], 'Agent summaries must expose an agreement recorded on the Agency Profile.');
+identity_assert_same(true, $administrator_agents_by_id[17]['authorizationOnFile'], 'Agent summaries must expose an authorization recorded on the Agency Profile.');
+identity_assert_same(false, $administrator_agents_by_id[10]['agreementOnFile'], 'Agent summaries must preserve an explicit false agreement flag.');
+identity_assert_same(false, $administrator_agents_by_id[10]['authorizationOnFile'], 'Agent summaries must preserve an explicit false authorization flag.');
+identity_assert_same(false, $administrator_agents_by_id[11]['agreementOnFile'], 'Agent summaries without a profile must default agreementOnFile to false.');
+identity_assert_same(false, $administrator_agents_by_id[11]['authorizationOnFile'], 'Agent summaries without a profile must default authorizationOnFile to false.');
 $GLOBALS['mc_identity_current_user_id'] = 23;
 $admissions_agent_list = $plugin->rest_list_agents();
 identity_assert_same(200, $admissions_agent_list->status, 'Admissions Officers must be able to list agents for ownership selection.');
@@ -762,7 +773,7 @@ $GLOBALS['mc_identity_fail_table_write'] = null;
 $GLOBALS['mc_identity_current_user_id'] = 10;
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-identity_assert_contains('Version: 0.2.61', $plugin_source, 'The plugin header must advertise 0.2.61.');
+identity_assert_contains('Version: 0.2.62', $plugin_source, 'The plugin header must advertise 0.2.62.');
 identity_assert_contains("\$owner_identity['agencyName']", $plugin_source, 'Application saves must use authoritative agency identity.');
 identity_assert_contains("\$owner_identity['consultantName']", $plugin_source, 'Application saves must use the owning Agency Profile contact.');
 identity_assert_contains('$identity_safe_draft', $plugin_source, 'Test-data inference must use the authoritative identity overlay.');
