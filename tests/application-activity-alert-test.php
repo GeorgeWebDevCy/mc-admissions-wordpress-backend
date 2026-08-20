@@ -746,6 +746,6 @@ alert_assert_contains('catch (Throwable $error)', $workflow_delivery_guard_sourc
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
 alert_assert_not_contains('should_send_draft_creation_alert', $plugin_source, 'The obsolete first-draft email gate must be absent from the plugin.');
 alert_assert_not_contains("'new-application-created'", $plugin_source, 'The obsolete first-draft email event must be absent from the plugin.');
-alert_assert_contains('Version: 0.2.61', $plugin_source, 'The plugin header must advertise version 0.2.61.');
+alert_assert_contains('Version: 0.2.62', $plugin_source, 'The plugin header must advertise version 0.2.62.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;

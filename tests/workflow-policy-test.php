@@ -182,12 +182,12 @@ function assert_throws($callback, $message) {
 }
 
 assert_same(
-	"Business Administration (Master's)",
+	"Master's degree in Business Administration (MBA)",
 	$programme_label_from_code->invoke($plugin, 'business-administration-masters'),
 	'The WordPress backend must recognize the canonical Master\'s programme code.'
 );
 assert_same(
-	"Business Administration (Master's)",
+	"Master's degree in Business Administration (MBA)",
 	$resolve_programme_label->invoke(
 		$plugin,
 		array(
@@ -228,7 +228,7 @@ $masters_board = $to_board_application->invoke(
 	)
 );
 assert_same(
-	"Business Administration (Master's)",
+	"Master's degree in Business Administration (MBA)",
 	$masters_board['programme'],
 	'Board and case responses must expose the repaired Master\'s programme label.'
 );

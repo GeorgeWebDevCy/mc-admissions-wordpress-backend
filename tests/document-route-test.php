@@ -199,6 +199,10 @@ function sanitize_file_name($value) {
 	return preg_replace('/[^A-Za-z0-9._-]+/', '-', (string) $value);
 }
 
+function is_email($value) {
+	return false !== filter_var((string) $value, FILTER_VALIDATE_EMAIL);
+}
+
 function wp_generate_uuid4() {
 	$GLOBALS['mc_document_uuid_counter']++;
 	return 'offline-uuid-' . $GLOBALS['mc_document_uuid_counter'];
@@ -288,11 +292,122 @@ function document_test_user($roles, $id = 1) {
 	);
 }
 
-function document_application_base($wordpress_user_id = 1) {
-	return array(
-		'id' => 'application-1',
-		'wordpressUserId' => $wordpress_user_id,
-		'status' => 'review-pending',
+function document_application_base($wordpress_user_id = 1, array $overrides = array()) {
+	if (is_array($wordpress_user_id)) {
+		$overrides = $wordpress_user_id;
+		$wordpress_user_id = 1;
+	}
+
+	return array_merge(
+		array(
+			'id' => 'application-1',
+			'wordpressUserId' => $wordpress_user_id,
+			'status' => 'review-pending',
+			'updatedAt' => '2026-07-29 10:11:12.345',
+		),
+		$overrides
+	);
+}
+
+function document_detailed_application(array $overrides = array()) {
+	return array_merge(
+		array(
+			'id' => 'application-1',
+			'referenceCode' => 'MC-DOC1',
+			'wordpressUserId' => 0,
+			'wordpressUsername' => null,
+			'wordpressEmail' => null,
+			'fullName' => 'Offline Applicant',
+			'passportNumber' => 'OFFLINE',
+			'email' => 'student@example.test',
+			'phone' => '+357000000',
+			'birthday' => '01/01/2000',
+			'address' => 'Offline address',
+			'city' => 'Nicosia',
+			'postalCode' => '1000',
+			'country' => 'Cyprus',
+			'gender' => 'Other',
+			'semester' => 'fall',
+			'year' => '2026',
+			'applicationRoute' => 'standard',
+			'programmeCode' => 'english-foundation',
+			'programmeLabel' => 'English Foundation Year',
+			'agencyName' => 'Offline Agency',
+			'consultantName' => 'Offline Consultant',
+			'consultantEmail' => 'offline-agency@example.test',
+			'consultantPhone' => '+357111111',
+			'submissionDate' => '29/07/2026',
+			'tuitionAcknowledged' => 1,
+			'offerTermsAcknowledged' => 1,
+			'gdprAcknowledged' => 1,
+			'isTestData' => 1,
+			'status' => 'review-pending',
+			'workflowNote' => 'Under review',
+			'reviewSummary' => null,
+			'reviewerDecision' => 'academically-cleared',
+			'decisionDueDate' => null,
+			'offerIssuedDate' => null,
+			'offerExpiryDate' => null,
+			'offerConditionNote' => null,
+			'classesStartDate' => '01/09/2026',
+			'tuitionFeeFirstYear' => '7000.00',
+			'tuitionFeeFollowingYears' => null,
+			'termBalanceApplies' => 0,
+			'paymentStatus' => 'awaiting-invoice',
+			'paymentAmount' => null,
+			'paymentCurrency' => 'EUR',
+			'paymentReference' => null,
+			'paymentConfirmedDate' => null,
+			'financeNote' => null,
+			'permitStatus' => 'not-started',
+			'permitReference' => null,
+			'permitSubmittedDate' => null,
+			'permitDecisionDate' => null,
+			'permitNote' => null,
+			'arrivalStatus' => 'planning',
+			'travelDate' => null,
+			'accommodationStatus' => null,
+			'enrollmentStatus' => 'pending',
+			'orientationDate' => null,
+			'enrollmentNote' => null,
+			'lateArrivalReason' => null,
+			'lastUpdatedByName' => 'Offline User',
+			'source' => 'offline',
+			'createdAt' => '2026-07-29 09:00:00.000',
+			'updatedAt' => '2026-07-29 10:11:13.345',
+		),
+		$overrides
+	);
+}
+
+function document_uploaded_record(array $overrides = array()) {
+	return array_merge(
+		array(
+			'id' => 'passport-document',
+			'applicationId' => 'application-1',
+			'type' => 'passport',
+			'label' => 'Copy of passport',
+			'isReady' => 1,
+			'assessmentStatus' => 'pending',
+			'assessmentRemark' => null,
+			'assessedAt' => null,
+			'assessedByName' => null,
+			'uploadedUrl' => '/api/admissions/application-1/documents/passport-document/file',
+			'storedFilename' => 'passport-offline.pdf',
+			'storageProvider' => 'microsoft-365',
+			'storageDriveId' => 'drive-1',
+			'storageItemId' => 'new-storage-item',
+			'storagePath' => '/drive/root:/Admissions/application-1',
+			'storageWebUrl' => 'https://example.test/new-storage-item',
+			'originalName' => 'passport.pdf',
+			'mimeType' => 'application/pdf',
+			'fileSizeBytes' => 12,
+			'uploadedAt' => '2026-07-29T12:00:00+00:00',
+			'uploadedByName' => 'Offline User',
+			'createdAt' => '2026-07-29 12:00:00.000',
+			'updatedAt' => '2026-07-29 12:00:00.000',
+		),
+		$overrides
 	);
 }
 
@@ -427,6 +542,122 @@ if (false === $temp_file || false === file_put_contents($temp_file, '%PDF-offlin
 }
 
 try {
+	$GLOBALS['mc_document_remote_requests'] = array();
+	$legacy_upload_db = new MC_Document_Test_Wpdb();
+	$legacy_uploaded_document = document_uploaded_record();
+	$legacy_upload_db->row_results = array(
+		document_application_base(),
+		null,
+		document_application_base(),
+		$legacy_uploaded_document,
+		document_detailed_application(),
+		null,
+		null,
+	);
+	$legacy_upload_db->rows_results = array(
+		array($legacy_uploaded_document),
+		array(),
+		array(),
+	);
+	$legacy_upload_db->var_results = array('tenant-1', 'client-1', 'secret-1', 'drive-1', 'Admissions');
+	$legacy_upload_db->query_results = array(1, 1, 1, 1);
+	$GLOBALS['wpdb'] = $legacy_upload_db;
+	$GLOBALS['mc_document_current_user'] = document_test_user(array('administrator'));
+
+	$legacy_upload = $plugin->rest_upload_document(new WP_REST_Request(
+		array('application_id' => 'application-1'),
+		array(),
+		array('documentType' => 'passport'),
+		array('file' => array(
+			'tmp_name' => $temp_file,
+			'name' => 'passport.pdf',
+			'type' => 'application/pdf',
+			'size' => filesize($temp_file),
+		))
+	));
+	document_assert_same(200, $legacy_upload->get_status(), 'A legacy versionless upload must use a server-captured application revision.');
+	document_assert_same(array('PUT'), array_column($GLOBALS['mc_document_remote_requests'], 'method'), 'A successful legacy upload must store exactly one M365 object.');
+	document_assert_same(true, document_event_index($legacy_upload_db->events, 'AND updatedAt = %s') >= 0, 'A legacy upload must recheck the captured revision with a database CAS predicate.');
+	document_assert_same('2026-07-29T10:11:13.345Z', $legacy_upload->get_data()['application']['updatedAt'], 'A legacy upload must return the committed authoritative revision.');
+	document_assert_same('passport-document', $legacy_upload->get_data()['application']['documents'][0]['id'], 'A legacy upload response must expose the saved document.');
+
+	$invalid_upload_db = new MC_Document_Test_Wpdb();
+	$GLOBALS['wpdb'] = $invalid_upload_db;
+	$GLOBALS['mc_document_remote_requests'] = array();
+	$invalid_upload = $plugin->rest_upload_document(new WP_REST_Request(
+		array('application_id' => 'application-1'),
+		array(),
+		array(
+			'documentType' => 'passport',
+			'expectedUpdatedAt' => 'not-a-valid-version',
+		),
+		array('file' => array(
+			'tmp_name' => $temp_file,
+			'name' => 'passport.pdf',
+			'type' => 'application/pdf',
+			'size' => filesize($temp_file),
+		))
+	));
+	document_assert_same(400, $invalid_upload->get_status(), 'A supplied invalid upload revision must return HTTP 400.');
+	document_assert_same('Invalid application version.', $invalid_upload->get_data()['error'], 'An invalid upload revision must return the canonical validation error.');
+	document_assert_same(array(), $invalid_upload_db->events, 'An invalid upload revision must fail before database access.');
+	document_assert_same(array(), $GLOBALS['mc_document_remote_requests'], 'An invalid upload revision must fail before M365 storage.');
+
+	$legacy_race_db = new MC_Document_Test_Wpdb();
+	$legacy_race_db->row_results = array(
+		document_application_base(),
+		array('id' => 'passport-document', 'storageDriveId' => 'drive-1', 'storageItemId' => 'old-storage-item'),
+		document_application_base(array('updatedAt' => '2026-07-29 10:11:13.345')),
+	);
+	$legacy_race_db->var_results = array(
+		'tenant-1', 'client-1', 'secret-1', 'drive-1', 'Admissions',
+		'tenant-1', 'client-1', 'secret-1', 'drive-1', 'Admissions',
+	);
+	$legacy_race_db->query_results = array(1, 1);
+	$GLOBALS['wpdb'] = $legacy_race_db;
+	$GLOBALS['mc_document_remote_requests'] = array();
+	$legacy_race_upload = $plugin->rest_upload_document(new WP_REST_Request(
+		array('application_id' => 'application-1'),
+		array(),
+		array('documentType' => 'passport'),
+		array('file' => array(
+			'tmp_name' => $temp_file,
+			'name' => 'passport.pdf',
+			'type' => 'application/pdf',
+			'size' => filesize($temp_file),
+		))
+	));
+	document_assert_same(409, $legacy_race_upload->get_status(), 'A legacy upload must conflict when the captured revision changes during M365 storage.');
+	document_assert_same(MC_Admissions_WordPress_Backend::STALE_APPLICATION_ERROR, $legacy_race_upload->get_data()['error'], 'A legacy upload race must return the canonical stale error.');
+	document_assert_no_event_contains('INSERT INTO mc_admission_documents', $legacy_race_db->events, 'A losing legacy upload must not replace document metadata.');
+	document_assert_same(array('PUT', 'DELETE'), array_column($GLOBALS['mc_document_remote_requests'], 'method'), 'A losing legacy upload must clean up its newly stored M365 object.');
+	document_assert_contains('new-storage-item', $GLOBALS['mc_document_remote_requests'][1]['url'], 'Legacy upload cleanup must delete the new object by exact item ID.');
+	document_assert_same(false, false !== strpos($GLOBALS['mc_document_remote_requests'][1]['url'], 'old-storage-item'), 'Legacy upload cleanup must preserve the previously committed object.');
+
+	$preflight_stale_db = new MC_Document_Test_Wpdb();
+	$preflight_stale_db->row_results = array(document_application_base(array(
+		'updatedAt' => '2026-07-29 10:11:13.345',
+	)));
+	$GLOBALS['wpdb'] = $preflight_stale_db;
+	$GLOBALS['mc_document_remote_requests'] = array();
+	$GLOBALS['mc_document_current_user'] = document_test_user(array('administrator'));
+	$preflight_stale_upload = $plugin->rest_upload_document(new WP_REST_Request(
+		array('application_id' => 'application-1'),
+		array(),
+		array(
+			'documentType' => 'passport',
+			'expectedUpdatedAt' => '2026-07-29T10:11:12.345Z',
+		),
+		array('file' => array(
+			'tmp_name' => $temp_file,
+			'name' => 'passport.pdf',
+			'type' => 'application/pdf',
+			'size' => filesize($temp_file),
+		))
+	));
+	document_assert_same(409, $preflight_stale_upload->get_status(), 'A supplied stale upload revision must be rejected before remote storage.');
+	document_assert_same(array(), $GLOBALS['mc_document_remote_requests'], 'A preflight-stale upload must not create an M365 object.');
+
 	$stale_upload_db = new MC_Document_Test_Wpdb();
 	$stale_upload_db->row_results = array(
 		document_application_base(),
