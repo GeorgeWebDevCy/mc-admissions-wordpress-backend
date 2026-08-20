@@ -246,6 +246,22 @@ $GLOBALS['wpdb']->profiles[10] = array(
 	'agreementOnFile' => 0, 'authorizationOnFile' => 0, 'notes' => null,
 	'updatedAt' => '2026-08-13 08:00:00',
 );
+$GLOBALS['wpdb']->profiles[13] = array(
+	'id' => 'profile-13', 'wordpressUserId' => 13, 'wordpressUsername' => 'staff-account',
+	'wordpressEmail' => 'staff@example.invalid', 'agencyName' => 'staff-account',
+	'consultantName' => 'Staff Contact', 'consultantEmail' => 'staff@example.invalid',
+	'consultantPhone' => '+357 25000000', 'defaultApplicationRoute' => 'standard',
+	'agreementOnFile' => 0, 'authorizationOnFile' => 0, 'notes' => null,
+	'updatedAt' => '2026-08-13 08:00:00',
+);
+$GLOBALS['wpdb']->profiles[23] = array(
+	'id' => 'profile-23', 'wordpressUserId' => 23, 'wordpressUsername' => 'admissions-staff',
+	'wordpressEmail' => 'admissions@example.invalid', 'agencyName' => 'Admissions Staff',
+	'consultantName' => 'Admissions Contact', 'consultantEmail' => 'admissions@example.invalid',
+	'consultantPhone' => '+357 25000001', 'defaultApplicationRoute' => 'standard',
+	'agreementOnFile' => 0, 'authorizationOnFile' => 0, 'notes' => null,
+	'updatedAt' => '2026-08-13 08:00:00',
+);
 $GLOBALS['wpdb']->applications['case-10'] = array(
 	'id' => 'case-10', 'wordpressUserId' => 10, 'wordpressUsername' => 'stale-user',
 	'wordpressEmail' => 'stale@example.invalid', 'agencyName' => 'Spoofed Agency',
@@ -486,6 +502,31 @@ identity_assert_same(false, $incomplete_saved_profile->data['profile']['profileC
 $GLOBALS['mc_identity_current_user_id'] = 22;
 $whitespace_saved_profile = $plugin->rest_get_profile();
 identity_assert_same(false, $whitespace_saved_profile->data['profile']['profileComplete'], 'Whitespace-only consultant contact fields must remain incomplete.');
+
+$GLOBALS['mc_identity_current_user_id'] = 13;
+$administrator_profile = $plugin->rest_get_profile();
+identity_assert_same(200, $administrator_profile->status, 'Administrator profile GET must use the authenticated WordPress profile endpoint.');
+identity_assert_same('staff-account', $administrator_profile->data['profile']['agencyName'], 'Administrator profile GET must retain current WordPress identity.');
+$administrator_profile_saved = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array(
+	'agencyName' => 'Forged Administrator Name',
+	'consultantName' => 'Updated Staff Contact',
+	'consultantEmail' => 'forged-admin@example.invalid',
+	'consultantPhone' => '+357 25111111',
+))));
+identity_assert_same(200, $administrator_profile_saved->status, 'Administrator profile PUT must persist through WordPress.');
+identity_assert_same('staff-account', $administrator_profile_saved->data['profile']['agencyName'], 'Administrator profile PUT must ignore client identity fields.');
+identity_assert_same('staff@example.invalid', $administrator_profile_saved->data['profile']['consultantEmail'], 'Administrator profile PUT must preserve the authenticated WordPress email.');
+identity_assert_same('Updated Staff Contact', $administrator_profile_saved->data['profile']['consultantName'], 'Administrator profile PUT must persist editable profile fields.');
+
+$GLOBALS['mc_identity_current_user_id'] = 23;
+$admissions_profile = $plugin->rest_get_profile();
+identity_assert_same(200, $admissions_profile->status, 'Admissions Officer profile GET must not be restricted to external agents.');
+$admissions_profile_saved = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array(
+	'consultantName' => 'Updated Admissions Contact',
+	'consultantPhone' => '+357 25222222',
+))));
+identity_assert_same(200, $admissions_profile_saved->status, 'Admissions Officer profile PUT must persist through WordPress.');
+identity_assert_same('Updated Admissions Contact', $admissions_profile_saved->data['profile']['consultantName'], 'Admissions Officer profile PUT must return the persisted internal profile.');
 $GLOBALS['mc_identity_current_user_id'] = 10;
 
 $selected_owner = $resolve_owner->invoke(
@@ -721,7 +762,7 @@ $GLOBALS['mc_identity_fail_table_write'] = null;
 $GLOBALS['mc_identity_current_user_id'] = 10;
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-identity_assert_contains('Version: 0.2.60', $plugin_source, 'The plugin header must advertise 0.2.60.');
+identity_assert_contains('Version: 0.2.61', $plugin_source, 'The plugin header must advertise 0.2.61.');
 identity_assert_contains("\$owner_identity['agencyName']", $plugin_source, 'Application saves must use authoritative agency identity.');
 identity_assert_contains("\$owner_identity['consultantName']", $plugin_source, 'Application saves must use the owning Agency Profile contact.');
 identity_assert_contains('$identity_safe_draft', $plugin_source, 'Test-data inference must use the authoritative identity overlay.');
