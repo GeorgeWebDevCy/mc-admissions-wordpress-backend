@@ -430,7 +430,7 @@ notification_assert_not_contains('$this->create_activity(', $save_source, 'Appli
 notification_assert_not_contains('$this->create_activity(', $upload_source, 'Document uploads must not use unchecked event inserts.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-notification_assert_contains('Version: 0.2.60', $plugin_source, 'The plugin header must advertise version 0.2.60.');
+notification_assert_contains('Version: 0.2.61', $plugin_source, 'The plugin header must advertise version 0.2.61.');
 notification_assert_same(0, $GLOBALS['mc_notification_event_mail_calls'], 'Offline event tests must never call wp_mail.');
 notification_assert_same(0, $GLOBALS['mc_notification_event_network_calls'], 'Offline event tests must never access the network.');
 

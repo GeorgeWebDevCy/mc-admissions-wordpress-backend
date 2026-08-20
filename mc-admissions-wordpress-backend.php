@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.60
+ * Version: 0.2.61
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -211,6 +211,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$this->ensure_offer_detail_columns();
 			$this->ensure_case_detail_columns();
 			$this->ensure_document_assessment_columns();
+			$this->ensure_finance_workspace_schema();
 			$this->ensure_resource_indexes();
 			$this->ensure_notification_activity_schema();
 			$this->boot_update_checker();
@@ -889,6 +890,112 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			update_option('mc_admissions_document_assessment_schema_version', '1', false);
 		}
 
+		private function ensure_finance_workspace_schema() {
+			global $wpdb;
+
+			if ('0.2.61' === get_option('mc_admissions_finance_workspace_schema_version')) {
+				return;
+			}
+			if (!is_object($wpdb) || !method_exists($wpdb, 'get_charset_collate')) {
+				// WordPress always provides this method. Keeping the guard makes plugin
+				// bootstrap fail closed in incomplete maintenance/test environments.
+				return;
+			}
+
+			$charset = $wpdb->get_charset_collate();
+			$statements = array(
+				"
+				CREATE TABLE IF NOT EXISTS {$this->communications_table} (
+					id VARCHAR(191) NOT NULL,
+					applicationId VARCHAR(191) NOT NULL,
+					direction VARCHAR(32) NOT NULL,
+					channel VARCHAR(32) NOT NULL,
+					subject VARCHAR(191) NULL,
+					detail TEXT NOT NULL,
+					actorName VARCHAR(191) NOT NULL,
+					createdAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+					PRIMARY KEY (id),
+					KEY mc_admission_communications_application_created_idx (applicationId, createdAt)
+				) {$charset}
+				",
+				"
+				CREATE TABLE IF NOT EXISTS {$this->commission_records_table} (
+					id VARCHAR(191) NOT NULL,
+					applicationId VARCHAR(191) NOT NULL,
+					status VARCHAR(32) NOT NULL DEFAULT 'not-applicable',
+					baseAmount VARCHAR(191) NULL,
+					amount VARCHAR(191) NULL,
+					currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
+					dueDate VARCHAR(10) NULL,
+					paidDate VARCHAR(10) NULL,
+					note TEXT NULL,
+					createdAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+					updatedAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+					PRIMARY KEY (id),
+					KEY mc_commission_records_application_created_idx (applicationId, createdAt)
+				) {$charset}
+				",
+				"
+				CREATE TABLE IF NOT EXISTS {$this->refund_records_table} (
+					id VARCHAR(191) NOT NULL,
+					applicationId VARCHAR(191) NOT NULL,
+					status VARCHAR(32) NOT NULL DEFAULT 'none',
+					requestedDate VARCHAR(10) NULL,
+					amount VARCHAR(191) NULL,
+					currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
+					paidDate VARCHAR(10) NULL,
+					paymentReference VARCHAR(191) NULL,
+					reason TEXT NULL,
+					note TEXT NULL,
+					createdAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+					updatedAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+					PRIMARY KEY (id),
+					KEY mc_refund_records_application_created_idx (applicationId, createdAt)
+				) {$charset}
+				",
+			);
+
+			foreach ($statements as $statement) {
+				// All identifiers are fixed plugin-owned table and column names.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.NotPrepared
+				if (false === $wpdb->query($statement)) {
+					return;
+				}
+			}
+
+			// CREATE TABLE IF NOT EXISTS does not evolve an already-installed table.
+			// Add the settlement reference safely for sites upgrading from 0.2.60.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$payment_reference = $wpdb->get_var("SHOW COLUMNS FROM {$this->refund_records_table} LIKE 'paymentReference'");
+			if (!$payment_reference) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$added = $wpdb->query("ALTER TABLE {$this->refund_records_table} ADD COLUMN paymentReference VARCHAR(191) NULL AFTER paidDate");
+				if (false === $added) {
+					return;
+				}
+			}
+
+			// Record the version only after every required table and column is present.
+			$required_tables = array(
+				$this->communications_table,
+				$this->commission_records_table,
+				$this->refund_records_table,
+			);
+			foreach ($required_tables as $table) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				if ($table !== $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table))) {
+					return;
+				}
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			if (!$wpdb->get_var("SHOW COLUMNS FROM {$this->refund_records_table} LIKE 'paymentReference'")) {
+				return;
+			}
+
+			update_option('mc_admissions_finance_workspace_schema_version', '0.2.61', false);
+		}
+
 		public function activate() {
 			$this->ensure_roles();
 			global $wpdb;
@@ -1081,6 +1188,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			foreach ($statements as $statement) {
 				$wpdb->query($statement); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 			}
+
+			$this->ensure_finance_workspace_schema();
 		}
 
 		private function admissions_role_definitions() {
@@ -1561,6 +1670,26 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			register_rest_route(
 				self::API_NAMESPACE,
+				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/finance',
+				array(
+					'methods' => WP_REST_Server::CREATABLE,
+					'callback' => array($this, 'rest_record_finance_workspace'),
+					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
+				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/communications',
+				array(
+					'methods' => WP_REST_Server::CREATABLE,
+					'callback' => array($this, 'rest_record_finance_communication'),
+					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
 				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/pending-message',
 				array(
 					'methods' => WP_REST_Server::CREATABLE,
@@ -1615,9 +1744,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				self::API_NAMESPACE,
 				'/applications/(?P<application_id>[A-Za-z0-9_-]+)/letters',
 				array(
-					'methods' => WP_REST_Server::CREATABLE,
-					'callback' => array($this, 'rest_generate_admission_letter'),
-					'permission_callback' => array($this, 'permission_authenticated'),
+					array(
+						'methods' => WP_REST_Server::CREATABLE,
+						'callback' => array($this, 'rest_generate_admission_letter'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
+					array(
+						'methods' => 'PATCH',
+						'callback' => array($this, 'rest_update_admission_letter_draft'),
+						'permission_callback' => array($this, 'permission_authenticated'),
+					),
 				)
 			);
 
@@ -4552,6 +4688,113 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		public function rest_record_finance_workspace(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+			if (!is_array($params)) {
+				return $this->json_error_response('Finance payload is required.', 400);
+			}
+
+			$action = isset($params['action']) ? sanitize_key((string) $params['action']) : '';
+			$expected_updated_at = isset($params['expectedUpdatedAt'])
+				? trim((string) $params['expectedUpdatedAt'])
+				: '';
+			$draft = isset($params['draft']) && is_array($params['draft'])
+				? $params['draft']
+				: array();
+
+			if (!in_array($action, array('commission', 'refund-request', 'refund-payment'), true)) {
+				return $this->json_error_response('Finance action is invalid.', 400);
+			}
+			if ('' === $expected_updated_at) {
+				return $this->json_error_response('Application version is required.', 400);
+			}
+			if (empty($draft)) {
+				return $this->json_error_response('Finance details are required.', 400);
+			}
+
+			try {
+				$user = $this->current_session_user();
+				if (!$this->can_manage_finance_workspace($user)) {
+					return $this->json_error_response(
+						'Only an administrator or Finance Officer can update commission and refund records.',
+						403
+					);
+				}
+
+				$application = $this->record_finance_workspace_action(
+					array(
+						'applicationId' => (string) $request['application_id'],
+						'action' => $action,
+						'draft' => $draft,
+						'expectedUpdatedAt' => $expected_updated_at,
+						'user' => $user,
+					)
+				);
+
+				return new WP_REST_Response(
+					array(
+						'ok' => true,
+						'application' => $application,
+					),
+					200
+				);
+			} catch (Throwable $error) {
+				$status = self::STALE_APPLICATION_ERROR === $error->getMessage() ? 409 : 400;
+				return $this->json_error_response($error->getMessage(), $status);
+			}
+		}
+
+		public function rest_record_finance_communication(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+			if (!is_array($params)) {
+				return $this->json_error_response('Communication payload is required.', 400);
+			}
+			if (array_key_exists('sendEmail', $params) && !is_bool($params['sendEmail'])) {
+				return $this->json_error_response('sendEmail must be true or false.', 400);
+			}
+
+			$expected_updated_at = isset($params['expectedUpdatedAt'])
+				? trim((string) $params['expectedUpdatedAt'])
+				: '';
+			$draft = isset($params['draft']) && is_array($params['draft'])
+				? $params['draft']
+				: array();
+			if ('' === $expected_updated_at) {
+				return $this->json_error_response('Application version is required.', 400);
+			}
+			if (empty($draft)) {
+				return $this->json_error_response('Communication details are required.', 400);
+			}
+
+			try {
+				$user = $this->current_session_user();
+				$result = $this->record_finance_workspace_communication(
+					array(
+						'applicationId' => (string) $request['application_id'],
+						'draft' => $draft,
+						'expectedUpdatedAt' => $expected_updated_at,
+						'sendEmail' => !empty($params['sendEmail']),
+						'user' => $user,
+					)
+				);
+
+				$response = array(
+					'ok' => true,
+					'application' => $result['application'],
+				);
+				if (array_key_exists('delivery', $result)) {
+					$response['delivery'] = $result['delivery'];
+				}
+
+				return new WP_REST_Response($response, 200);
+			} catch (Throwable $error) {
+				$status = self::STALE_APPLICATION_ERROR === $error->getMessage()
+					? 409
+					: (preg_match('/permission|not allowed/i', $error->getMessage()) ? 403 : 400);
+				return $this->json_error_response($error->getMessage(), $status);
+			}
+		}
+
 		public function rest_send_pending_review_message(WP_REST_Request $request) {
 			$params = $request->get_json_params();
 			$message = isset($params['message'])
@@ -4866,6 +5109,43 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		public function rest_update_admission_letter_draft(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+
+			if (!is_array($params)) {
+				return $this->json_error_response('Letter draft details are required.', 400);
+			}
+			if (empty($params['expectedUpdatedAt'])) {
+				return $this->json_error_response('The current application version is required.', 400);
+			}
+
+			try {
+				$user = $this->current_session_user();
+				$result = $this->persist_admission_letter_draft(
+					(string) $request['application_id'],
+					isset($params['templateId']) ? (string) $params['templateId'] : '',
+					isset($params['action']) ? (string) $params['action'] : '',
+					isset($params['body']) ? (string) $params['body'] : '',
+					$user,
+					(string) $params['expectedUpdatedAt']
+				);
+
+				return new WP_REST_Response(
+					array(
+						'ok' => true,
+						'application' => $result['application'],
+						'draft' => $result['draft'],
+					),
+					200
+				);
+			} catch (Throwable $error) {
+				$status = self::STALE_APPLICATION_ERROR === $error->getMessage()
+					? 409
+					: (false !== stripos($error->getMessage(), 'permission') || false !== stripos($error->getMessage(), 'not allowed') ? 403 : 400);
+				return $this->json_error_response($error->getMessage(), $status);
+			}
+		}
+
 		private function posted_setting($key, $fallback = '') {
 			if (!isset($_POST[$key])) {
 				return $fallback;
@@ -4927,6 +5207,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function is_admin_user($user) {
 			return !empty($user['roles']) && in_array('administrator', $user['roles'], true);
+		}
+
+		private function can_manage_finance_workspace($user) {
+			return $this->is_admin_user($user)
+				|| $this->user_has_any_role($user, array('finance-officer'));
 		}
 
 		private function can_assign_application_owner($user) {
@@ -5267,6 +5552,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Only internal admissions staff can update operational case details.');
 			}
 
+			foreach (array_keys((array) $draft) as $field) {
+				if (preg_match('/^(commission|refund)/i', (string) $field)) {
+					throw new Exception('Use the Commissions & Refunds workspace to update commission or refund records.');
+				}
+			}
+
 			$allowed = $this->allowed_operations_fields_for_user($user);
 			$all_groups = $this->operations_field_groups();
 			$supported = array_values(array_unique(array_merge($all_groups['common'], $all_groups['admissions'], $all_groups['finance'], $all_groups['permit'], $all_groups['arrival'])));
@@ -5595,20 +5886,28 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$where_sql = '';
 			$query_args = array();
 			$commission_status_sql = "'not-applicable'";
+			$commission_amount_sql = 'NULL';
+			$commission_currency_sql = "'EUR'";
 			$refund_status_sql = "'none'";
+			$refund_amount_sql = 'NULL';
+			$refund_currency_sql = "'EUR'";
 
 			if (
 				$this->commission_records_table ===
 				$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->commission_records_table))
 			) {
-				$commission_status_sql = "COALESCE((SELECT commission.status FROM {$this->commission_records_table} commission WHERE commission.applicationId = app.id ORDER BY commission.updatedAt DESC, commission.createdAt DESC LIMIT 1), 'not-applicable')";
+				$commission_status_sql = "COALESCE((SELECT commission.status FROM {$this->commission_records_table} commission WHERE commission.applicationId = app.id ORDER BY commission.updatedAt DESC, commission.createdAt DESC, commission.id DESC LIMIT 1), 'not-applicable')";
+				$commission_amount_sql = "(SELECT commission.amount FROM {$this->commission_records_table} commission WHERE commission.applicationId = app.id ORDER BY commission.updatedAt DESC, commission.createdAt DESC, commission.id DESC LIMIT 1)";
+				$commission_currency_sql = "COALESCE((SELECT commission.currency FROM {$this->commission_records_table} commission WHERE commission.applicationId = app.id ORDER BY commission.updatedAt DESC, commission.createdAt DESC, commission.id DESC LIMIT 1), 'EUR')";
 			}
 
 			if (
 				$this->refund_records_table ===
 				$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->refund_records_table))
 			) {
-				$refund_status_sql = "COALESCE((SELECT refund.status FROM {$this->refund_records_table} refund WHERE refund.applicationId = app.id ORDER BY refund.updatedAt DESC, refund.createdAt DESC LIMIT 1), 'none')";
+				$refund_status_sql = "COALESCE((SELECT refund.status FROM {$this->refund_records_table} refund WHERE refund.applicationId = app.id ORDER BY refund.updatedAt DESC, refund.createdAt DESC, refund.id DESC LIMIT 1), 'none')";
+				$refund_amount_sql = "(SELECT refund.amount FROM {$this->refund_records_table} refund WHERE refund.applicationId = app.id ORDER BY refund.updatedAt DESC, refund.createdAt DESC, refund.id DESC LIMIT 1)";
+				$refund_currency_sql = "COALESCE((SELECT refund.currency FROM {$this->refund_records_table} refund WHERE refund.applicationId = app.id ORDER BY refund.updatedAt DESC, refund.createdAt DESC, refund.id DESC LIMIT 1), 'EUR')";
 			}
 
 			if (!$this->can_view_all_applications($user)) {
@@ -5628,7 +5927,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					migration.decisionDate AS permitDecisionDate,
 					migration.permitReference AS permitReference,
 					{$commission_status_sql} AS commissionStatus,
+					{$commission_amount_sql} AS commissionAmount,
+					{$commission_currency_sql} AS commissionCurrency,
 					{$refund_status_sql} AS refundStatus,
+					{$refund_amount_sql} AS refundAmount,
+					{$refund_currency_sql} AS refundCurrency,
 					COALESCE(document_stats.documentCount, 0) AS documentCount,
 					COALESCE(document_stats.readyDocumentCount, 0) AS readyDocumentCount,
 					COALESCE(document_stats.readyIntakeDocumentCount, 0) AS readyIntakeDocumentCount,
@@ -5716,7 +6019,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'immigrationMissingDocs' => max(0, $immigration_total - $immigration_ready),
 				'immigrationReadyDocuments' => $immigration_ready,
 				'commissionStatus' => isset($application['commissionStatus']) ? $application['commissionStatus'] : 'not-applicable',
+				'commissionAmount' => isset($application['commissionAmount']) && '' !== (string) $application['commissionAmount'] ? (string) $application['commissionAmount'] : null,
+				'commissionCurrency' => !empty($application['commissionCurrency']) ? (string) $application['commissionCurrency'] : 'EUR',
 				'refundStatus' => isset($application['refundStatus']) ? $application['refundStatus'] : 'none',
+				'refundAmount' => isset($application['refundAmount']) && '' !== (string) $application['refundAmount'] ? (string) $application['refundAmount'] : null,
+				'refundCurrency' => !empty($application['refundCurrency']) ? (string) $application['refundCurrency'] : 'EUR',
 				'nextAction' => $this->next_action_for_status($application, $ready_documents, $total_documents),
 				'workflowNote' => !empty($application['workflowNote']) ? $application['workflowNote'] : null,
 				'updatedByName' => !empty($application['lastUpdatedByName']) ? $application['lastUpdatedByName'] : null,
@@ -5731,7 +6038,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$lock_sql = $for_update ? ' FOR UPDATE' : '';
 			$application = $wpdb->get_row(
 				$wpdb->prepare(
-					"SELECT id, wordpressUserId, wordpressUsername, wordpressEmail, agencyName, consultantName, consultantEmail, consultantPhone, status, isTestData, updatedAt FROM {$this->applications_table} WHERE id = %s LIMIT 1{$lock_sql}",
+					"SELECT * FROM {$this->applications_table} WHERE id = %s LIMIT 1{$lock_sql}",
 					$application_id
 				),
 				ARRAY_A
@@ -5845,6 +6152,220 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			return $case;
+		}
+
+		private function persist_admission_letter_draft($application_id, $template_id, $action, $body, $user, $expected_updated_at) {
+			global $wpdb;
+
+			$application_id = sanitize_text_field((string) $application_id);
+			$template_id = sanitize_key((string) $template_id);
+			$action = sanitize_key((string) $action);
+			$expected_version = $this->iso_to_mysql_datetime($expected_updated_at);
+			$template_labels = $this->generated_admission_letter_template_labels();
+			$valid_actions = array('save', 'review', 'approve', 'reset');
+
+			if (!isset($template_labels[$template_id])) {
+				throw new Exception('A valid letter template id is required.');
+			}
+			if (!in_array($action, $valid_actions, true)) {
+				throw new Exception('A valid letter draft action is required.');
+			}
+			if (!$this->can_generate_admission_letter($user, $template_id)) {
+				throw new Exception('You do not have permission to update this letter draft.');
+			}
+
+			$body = trim(str_replace(array("\r\n", "\r", "\0"), array("\n", "\n", ''), (string) $body));
+			if ('' === $body) {
+				throw new Exception('Letter draft body is required.');
+			}
+			if (strlen($body) > 500000) {
+				throw new Exception('Letter draft body is too large.');
+			}
+
+			$this->get_authorized_application_base($application_id, $user);
+			$template_label = $template_labels[$template_id];
+			$now = $this->current_notification_event_mysql_datetime();
+			$application = null;
+			$saved_draft = null;
+
+			if (false === $wpdb->query('START TRANSACTION')) {
+				throw new Exception('Unable to start letter draft persistence.');
+			}
+
+			try {
+				$locked_application = $this->get_authorized_application_base($application_id, $user, true);
+				if ((string) $locked_application['updatedAt'] !== (string) $expected_version) {
+					throw new Exception(self::STALE_APPLICATION_ERROR);
+				}
+
+				$application = $this->get_detailed_application_record($application_id);
+				$existing_draft = $wpdb->get_row(
+					$wpdb->prepare(
+						"SELECT * FROM {$this->letter_drafts_table} WHERE applicationId = %s AND templateId = %s LIMIT 1 FOR UPDATE",
+						$application_id,
+						$template_id
+					),
+					ARRAY_A
+				);
+
+				$reviewed_by = null;
+				$reviewed_at = null;
+				$approved_by = null;
+				$approved_at = null;
+				$status = 'draft';
+				if ('review' === $action) {
+					$status = 'reviewed';
+					$reviewed_by = $user['name'];
+					$reviewed_at = $now;
+				} elseif ('approve' === $action) {
+					$status = 'approved';
+					$reviewed_by = !empty($existing_draft['reviewedByName']) ? (string) $existing_draft['reviewedByName'] : $user['name'];
+					$reviewed_at = !empty($existing_draft['reviewedAt']) ? (string) $existing_draft['reviewedAt'] : $now;
+					$approved_by = $user['name'];
+					$approved_at = $now;
+				}
+
+				$draft_data = array(
+					'templateLabel' => $template_label,
+					'body' => $body,
+					'status' => $status,
+					'lastEditedByName' => $user['name'],
+					'reviewedByName' => $reviewed_by,
+					'reviewedAt' => $reviewed_at,
+					'approvedByName' => $approved_by,
+					'approvedAt' => $approved_at,
+					'updatedAt' => $now,
+				);
+
+				if ($existing_draft) {
+					$draft_written = $wpdb->update(
+						$this->letter_drafts_table,
+						$draft_data,
+						array('id' => (string) $existing_draft['id'])
+					);
+					$draft_id = (string) $existing_draft['id'];
+				} else {
+					$draft_id = wp_generate_uuid4();
+					$draft_written = $wpdb->insert(
+						$this->letter_drafts_table,
+						array_merge(
+							array(
+								'id' => $draft_id,
+								'applicationId' => $application_id,
+								'templateId' => $template_id,
+								'createdAt' => $now,
+							),
+							$draft_data
+						)
+					);
+				}
+				if (false === $draft_written || (!$existing_draft && 0 === $draft_written)) {
+					throw new Exception('Unable to save the letter draft.');
+				}
+
+				$application_written = $wpdb->query(
+					$wpdb->prepare(
+						"UPDATE {$this->applications_table} SET lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3) WHERE id = %s AND updatedAt = %s",
+						$user['name'],
+						$application_id,
+						$expected_version
+					)
+				);
+				if (0 === $application_written) {
+					throw new Exception(self::STALE_APPLICATION_ERROR);
+				}
+				if (false === $application_written) {
+					throw new Exception('Unable to update the application after letter draft persistence.');
+				}
+
+				$activity_title = 'approve' === $action
+					? $template_label . ' draft approved'
+					: ('review' === $action
+						? $template_label . ' draft reviewed'
+						: ('reset' === $action ? $template_label . ' draft reset' : $template_label . ' draft saved'));
+				$activity_detail = 'approve' === $action
+					? 'The stored working draft is approved for internal release checks.'
+					: ('review' === $action
+						? 'The stored working draft was reviewed and is ready for final approval or workbook generation.'
+						: ('reset' === $action
+							? 'The stored working draft was reset to the current default review copy.'
+							: 'The stored working draft was updated for this case.'));
+				$this->create_required_activity(
+					$application_id,
+					$user,
+					'letter',
+					$activity_title,
+					$activity_detail,
+					'Unable to record the letter draft activity.'
+				);
+
+				$saved_draft = $wpdb->get_row(
+					$wpdb->prepare(
+						"SELECT * FROM {$this->letter_drafts_table} WHERE id = %s LIMIT 1",
+						$draft_id
+					),
+					ARRAY_A
+				);
+				if (!$saved_draft) {
+					$saved_draft = array_merge(
+						array(
+							'id' => $draft_id,
+							'applicationId' => $application_id,
+							'templateId' => $template_id,
+							'createdAt' => $existing_draft['createdAt'] ?? $now,
+						),
+						$draft_data
+					);
+				}
+
+				$committed_application = $this->get_authorized_application_base($application_id, $user, true);
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit letter draft persistence.');
+				}
+			} catch (Throwable $error) {
+				try {
+					$wpdb->query('ROLLBACK');
+				} catch (Throwable $rollback_error) {
+					error_log('MC Admissions letter-draft rollback failed: ' . $rollback_error->getMessage());
+				}
+				throw $error;
+			}
+
+			try {
+				$refreshed = $this->get_detailed_application_record($application_id);
+				$case = $this->to_admission_case($refreshed);
+				foreach ($case['letterDrafts'] as $draft) {
+					if ((string) $draft['templateId'] === $template_id) {
+						return array('application' => $case, 'draft' => $draft);
+					}
+				}
+			} catch (Throwable $reload_error) {
+				error_log(
+					'MC Admissions could not reload letter draft ' . $saved_draft['id']
+					. ' after it committed for application ' . $application_id . ': '
+					. $reload_error->getMessage()
+				);
+			}
+
+			// The write and audit are already committed. Return a complete local snapshot
+			// instead of a retryable error that could overwrite a newer draft on retry.
+			$application['lastUpdatedByName'] = $user['name'];
+			$application['updatedAt'] = $committed_application['updatedAt'];
+			$application['letterDrafts'] = array_values(
+				array_filter(
+					(array) $application['letterDrafts'],
+					function ($draft) use ($template_id) {
+						return (string) $draft['templateId'] !== $template_id;
+					}
+				)
+			);
+			$application['letterDrafts'][] = $saved_draft;
+			$fallback_case = $this->to_admission_case($application, false);
+
+			return array(
+				'application' => $fallback_case,
+				'draft' => $this->map_letter_draft($saved_draft),
+			);
 		}
 
 		private function persist_generated_admission_letter($application_id, $generated, $user, $expected_updated_at) {
@@ -6197,7 +6718,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if ($this->table_exists($this->communications_table)) {
 				$communications = $wpdb->get_results(
 					$wpdb->prepare(
-						"SELECT * FROM {$this->communications_table} WHERE applicationId = %s ORDER BY createdAt DESC LIMIT 24",
+						"SELECT * FROM {$this->communications_table} WHERE applicationId = %s ORDER BY createdAt DESC, id DESC LIMIT 24",
 						$application_id
 					),
 					ARRAY_A
@@ -6219,7 +6740,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if ($this->table_exists($this->commission_records_table)) {
 				$commissions = $wpdb->get_results(
 					$wpdb->prepare(
-						"SELECT * FROM {$this->commission_records_table} WHERE applicationId = %s ORDER BY updatedAt DESC LIMIT 12",
+						"SELECT * FROM {$this->commission_records_table} WHERE applicationId = %s ORDER BY updatedAt DESC, createdAt DESC, id DESC LIMIT 12",
 						$application_id
 					),
 					ARRAY_A
@@ -6230,7 +6751,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if ($this->table_exists($this->refund_records_table)) {
 				$refunds = $wpdb->get_results(
 					$wpdb->prepare(
-						"SELECT * FROM {$this->refund_records_table} WHERE applicationId = %s ORDER BY updatedAt DESC LIMIT 12",
+						"SELECT * FROM {$this->refund_records_table} WHERE applicationId = %s ORDER BY updatedAt DESC, createdAt DESC, id DESC LIMIT 12",
 						$application_id
 					),
 					ARRAY_A
@@ -6283,6 +6804,26 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$application['letterDrafts'] = is_array($letter_drafts) ? $letter_drafts : array();
 			$application['commissionRecords'] = is_array($commissions) ? $commissions : array();
 			$application['refundRecords'] = is_array($refunds) ? $refunds : array();
+			$latest_commission = !empty($application['commissionRecords'][0]) ? $application['commissionRecords'][0] : null;
+			$latest_refund = !empty($application['refundRecords'][0]) ? $application['refundRecords'][0] : null;
+			$application['commissionStatus'] = $latest_commission && isset($latest_commission['status'])
+				? (string) $latest_commission['status']
+				: 'not-applicable';
+			$application['commissionAmount'] = $latest_commission && isset($latest_commission['amount'])
+				? $latest_commission['amount']
+				: null;
+			$application['commissionCurrency'] = $latest_commission && !empty($latest_commission['currency'])
+				? (string) $latest_commission['currency']
+				: 'EUR';
+			$application['refundStatus'] = $latest_refund && isset($latest_refund['status'])
+				? (string) $latest_refund['status']
+				: 'none';
+			$application['refundAmount'] = $latest_refund && isset($latest_refund['amount'])
+				? $latest_refund['amount']
+				: null;
+			$application['refundCurrency'] = $latest_refund && !empty($latest_refund['currency'])
+				? (string) $latest_refund['currency']
+				: 'EUR';
 			$application['paymentTransactions'] = is_array($payments) ? $payments : array();
 			$application['migrationCase'] = $migration_case ? $migration_case : null;
 			$application['immigrationCase'] = $immigration_case ? $immigration_case : null;
@@ -6379,6 +6920,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'amount' => !empty($record['amount']) ? (string) $record['amount'] : null,
 				'currency' => !empty($record['currency']) ? (string) $record['currency'] : 'EUR',
 				'paidDate' => !empty($record['paidDate']) ? (string) $record['paidDate'] : null,
+				'paymentReference' => !empty($record['paymentReference']) ? (string) $record['paymentReference'] : null,
 				'reason' => !empty($record['reason']) ? (string) $record['reason'] : null,
 				'note' => !empty($record['note']) ? (string) $record['note'] : null,
 				'createdAt' => $this->mysql_datetime_to_iso($record['createdAt']),
@@ -6824,7 +7366,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			$existing = $wpdb->get_row(
-				$wpdb->prepare("SELECT id FROM {$table} WHERE applicationId = %s ORDER BY updatedAt DESC LIMIT 1", $application_id),
+				$wpdb->prepare("SELECT id FROM {$table} WHERE applicationId = %s ORDER BY updatedAt DESC, createdAt DESC, id DESC LIMIT 1", $application_id),
 				ARRAY_A
 			);
 
@@ -6862,6 +7404,912 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$written = $wpdb->insert($table, $data);
 			if (false === $written || 0 === $written) {
 				throw new Exception('Unable to create the ' . $label . ' record.');
+			}
+		}
+
+		private function assert_finance_draft_fields($draft, $allowed_fields) {
+			$unknown = array_values(array_diff(array_keys((array) $draft), (array) $allowed_fields));
+			if (!empty($unknown)) {
+				throw new Exception('Unknown finance fields: ' . implode(', ', $unknown) . '.');
+			}
+		}
+
+		private function normalize_finance_record_id($value, $label) {
+			$value = is_string($value) ? trim($value) : '';
+			if ('' === $value || !preg_match('/^[A-Za-z0-9_-]{1,191}$/', $value)) {
+				throw new Exception('A valid ' . $label . ' is required.');
+			}
+
+			return $value;
+		}
+
+		private function normalize_finance_money($value, $label, $allow_zero = true) {
+			$raw = is_string($value) ? trim($value) : '';
+			if ('' === $raw) {
+				throw new Exception($label . ' is required.');
+			}
+			if (
+				!preg_match('/^(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?:\.\d{1,2})?$/', $raw)
+			) {
+				throw new Exception($label . ' must be a non-negative value with standard thousands separators and no more than two decimal places.');
+			}
+
+			$plain = str_replace(',', '', $raw);
+			$parts = explode('.', $plain, 2);
+			$whole = ltrim($parts[0], '0');
+			$whole = '' === $whole ? '0' : $whole;
+			if (strlen($whole) > 9) {
+				throw new Exception($label . ' is too large.');
+			}
+			$fraction = isset($parts[1]) ? str_pad($parts[1], 2, '0') : '00';
+			$minor_units = ((int) $whole * 100) + (int) $fraction;
+			if (!$allow_zero && 0 === $minor_units) {
+				throw new Exception($label . ' must be greater than zero.');
+			}
+
+			return array(
+				'value' => $whole . '.' . $fraction,
+				'minorUnits' => $minor_units,
+			);
+		}
+
+		private function normalize_finance_currency($value) {
+			$currency = is_string($value) ? strtoupper(trim($value)) : '';
+			if ('' === $currency) {
+				throw new Exception('Currency is required.');
+			}
+			if (!preg_match('/^[A-Z]{3}$/', $currency)) {
+				throw new Exception('Currency must be a three-letter code such as EUR.');
+			}
+
+			return $currency;
+		}
+
+		private function normalize_finance_date($value, $label, $required = true) {
+			$value = is_string($value) ? trim($value) : '';
+			if ('' === $value) {
+				if ($required) {
+					throw new Exception($label . ' is required.');
+				}
+				return null;
+			}
+
+			$date = DateTimeImmutable::createFromFormat('!Y-m-d', $value, new DateTimeZone('UTC'));
+			$errors = DateTimeImmutable::getLastErrors();
+			if (
+				false === $date
+				|| (is_array($errors) && (!empty($errors['warning_count']) || !empty($errors['error_count'])))
+				|| $date->format('Y-m-d') !== $value
+			) {
+				throw new Exception($label . ' must use YYYY-MM-DD.');
+			}
+
+			return $value;
+		}
+
+		private function normalize_finance_text($value, $label, $max_length, $required = false, $single_line = false) {
+			$value = is_string($value) ? $value : '';
+			$text = $single_line
+				? sanitize_text_field($value)
+				: sanitize_textarea_field($value);
+			$text = trim($text);
+			if ($required && '' === $text) {
+				throw new Exception($label . ' is required.');
+			}
+			$length = function_exists('mb_strlen') ? mb_strlen($text) : strlen($text);
+			if ($length > $max_length) {
+				throw new Exception($label . ' must be ' . $max_length . ' characters or fewer.');
+			}
+
+			return '' === $text ? null : $text;
+		}
+
+		private function get_finance_record_for_update($table, $record_id, $application_id, $label) {
+			global $wpdb;
+
+			// Table names are fixed plugin properties; values are prepared.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$record = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT * FROM {$table} WHERE id = %s AND applicationId = %s LIMIT 1 FOR UPDATE",
+					$record_id,
+					$application_id
+				),
+				ARRAY_A
+			);
+			if (!$record) {
+				throw new Exception(ucfirst($label) . ' record not found for this application.');
+			}
+
+			return $record;
+		}
+
+		private function update_finance_record($table, $record_id, $application_id, $values, $label) {
+			global $wpdb;
+
+			$set_parts = array();
+			$args = array();
+			foreach ($values as $column => $value) {
+				if (null === $value) {
+					$set_parts[] = $column . ' = NULL';
+				} else {
+					$set_parts[] = $column . ' = %s';
+					$args[] = $value;
+				}
+			}
+			$set_parts[] = 'updatedAt = CURRENT_TIMESTAMP(3)';
+			$args[] = $record_id;
+			$args[] = $application_id;
+
+			// Table/column names come only from internal constants and normalized maps.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$written = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table} SET " . implode(', ', $set_parts) . ' WHERE id = %s AND applicationId = %s',
+					$args
+				)
+			);
+			if (false === $written) {
+				throw new Exception('Unable to update the ' . $label . ' record.');
+			}
+		}
+
+		private function bump_finance_application_version($application_id, $expected_version, $user) {
+			global $wpdb;
+
+			$written = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$this->applications_table} SET lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3) WHERE id = %s AND updatedAt = %s",
+					$user['name'],
+					$application_id,
+					$expected_version
+				)
+			);
+			if (false === $written) {
+				throw new Exception('Unable to save the finance record.');
+			}
+			if (0 === $written) {
+				throw new Exception(self::STALE_APPLICATION_ERROR);
+			}
+		}
+
+		private function normalize_commission_finance_draft($draft) {
+			$this->assert_finance_draft_fields(
+				$draft,
+				array('recordId', 'status', 'baseAmount', 'amount', 'currency', 'dueDate', 'paidDate', 'note')
+			);
+			$status = isset($draft['status']) ? sanitize_key((string) $draft['status']) : '';
+			$allowed_statuses = array('not-applicable', 'pending-approval', 'ready-to-invoice', 'invoiced', 'paid', 'withheld');
+			if (!in_array($status, $allowed_statuses, true)) {
+				throw new Exception('A valid commission status is required.');
+			}
+			if ('not-applicable' === $status) {
+				if (
+					(null !== $this->trim_to_null(isset($draft['baseAmount']) ? $draft['baseAmount'] : null))
+					|| (null !== $this->trim_to_null(isset($draft['amount']) ? $draft['amount'] : null))
+					|| (null !== $this->trim_to_null(isset($draft['dueDate']) ? $draft['dueDate'] : null))
+					|| (null !== $this->trim_to_null(isset($draft['paidDate']) ? $draft['paidDate'] : null))
+				) {
+					throw new Exception('Commission amounts and dates must be blank when commission is not applicable.');
+				}
+				$normalized = array(
+					'status' => 'not-applicable',
+					'baseAmount' => null,
+					'amount' => null,
+					'currency' => $this->normalize_finance_currency(isset($draft['currency']) ? $draft['currency'] : ''),
+					'dueDate' => null,
+					'paidDate' => null,
+				);
+				if (array_key_exists('note', $draft)) {
+					$normalized['note'] = $this->normalize_finance_text($draft['note'], 'Commission note', 4000);
+				}
+				return $normalized;
+			}
+
+			if (!array_key_exists('baseAmount', $draft) || !array_key_exists('amount', $draft)) {
+				throw new Exception('Commission tuition base and amount are required.');
+			}
+			$base = $this->normalize_finance_money($draft['baseAmount'], 'Commission base amount', false);
+			$amount = $this->normalize_finance_money($draft['amount'], 'Commission amount');
+			if ($amount['minorUnits'] > $base['minorUnits']) {
+				throw new Exception('Commission amount cannot exceed the tuition base amount.');
+			}
+			$currency = $this->normalize_finance_currency(isset($draft['currency']) ? $draft['currency'] : '');
+			$due_date = $this->normalize_finance_date(isset($draft['dueDate']) ? $draft['dueDate'] : '', 'Commission due date', false);
+			$paid_date = $this->normalize_finance_date(isset($draft['paidDate']) ? $draft['paidDate'] : '', 'Commission paid date', false);
+			if ('paid' === $status && !$paid_date) {
+				throw new Exception('Commission paid date is required when the commission is paid.');
+			}
+			if ('paid' !== $status && $paid_date) {
+				throw new Exception('Commission paid date can only be recorded for a paid commission.');
+			}
+
+			$normalized = array(
+				'status' => $status,
+				'baseAmount' => $base['value'],
+				'amount' => $amount['value'],
+				'currency' => $currency,
+				'dueDate' => $due_date,
+				'paidDate' => $paid_date,
+			);
+			if (array_key_exists('note', $draft)) {
+				$normalized['note'] = $this->normalize_finance_text($draft['note'], 'Commission note', 4000);
+			}
+
+			return $normalized;
+		}
+
+		private function normalize_refund_request_finance_draft($draft) {
+			$this->assert_finance_draft_fields(
+				$draft,
+				array('refundId', 'status', 'requestedDate', 'amount', 'currency', 'reason', 'note')
+			);
+			$status = isset($draft['status']) ? sanitize_key((string) $draft['status']) : '';
+			if (!in_array($status, array('requested', 'under-review', 'approved', 'declined'), true)) {
+				throw new Exception('A valid refund request status is required.');
+			}
+			if (!array_key_exists('amount', $draft)) {
+				throw new Exception('Refund amount is required.');
+			}
+			$amount = $this->normalize_finance_money($draft['amount'], 'Refund amount', false);
+			$normalized = array(
+				'status' => $status,
+				'requestedDate' => $this->normalize_finance_date(isset($draft['requestedDate']) ? $draft['requestedDate'] : '', 'Refund requested date'),
+				'amount' => $amount['value'],
+				'currency' => $this->normalize_finance_currency(isset($draft['currency']) ? $draft['currency'] : ''),
+				'paidDate' => null,
+				'paymentReference' => null,
+				'reason' => $this->normalize_finance_text(isset($draft['reason']) ? $draft['reason'] : '', 'Refund reason', 4000, true),
+			);
+			if (array_key_exists('note', $draft)) {
+				$normalized['note'] = $this->normalize_finance_text($draft['note'], 'Refund note', 4000);
+			}
+
+			return $normalized;
+		}
+
+		private function validate_refund_status_transition($current_status, $next_status) {
+			$transitions = array(
+				'requested' => array('requested', 'under-review', 'approved', 'declined'),
+				'under-review' => array('under-review', 'approved', 'declined'),
+				'approved' => array('approved', 'declined'),
+				'declined' => array(),
+			);
+			if (!isset($transitions[$current_status]) || !in_array($next_status, $transitions[$current_status], true)) {
+				throw new Exception('Refund status cannot change from ' . $current_status . ' to ' . $next_status . '.');
+			}
+		}
+
+		private function finance_workspace_fallback_application($application, $overrides = array()) {
+			$fallback = array_merge(
+				(array) $application,
+				array(
+					'documents' => array(),
+					'activities' => array(),
+					'communications' => array(),
+					'generatedLetters' => array(),
+					'letterDrafts' => array(),
+					'commissionRecords' => array(),
+					'refundRecords' => array(),
+					'paymentTransactions' => array(),
+					'migrationCase' => null,
+					'immigrationCase' => null,
+				),
+				(array) $overrides
+			);
+
+			$latest_commission = !empty($fallback['commissionRecords'][0]) ? $fallback['commissionRecords'][0] : null;
+			$latest_refund = !empty($fallback['refundRecords'][0]) ? $fallback['refundRecords'][0] : null;
+			$fallback['commissionStatus'] = $latest_commission && isset($latest_commission['status'])
+				? (string) $latest_commission['status']
+				: 'not-applicable';
+			$fallback['commissionAmount'] = $latest_commission && array_key_exists('amount', $latest_commission)
+				? $latest_commission['amount']
+				: null;
+			$fallback['commissionCurrency'] = $latest_commission && !empty($latest_commission['currency'])
+				? (string) $latest_commission['currency']
+				: 'EUR';
+			$fallback['refundStatus'] = $latest_refund && isset($latest_refund['status'])
+				? (string) $latest_refund['status']
+				: 'none';
+			$fallback['refundAmount'] = $latest_refund && array_key_exists('amount', $latest_refund)
+				? $latest_refund['amount']
+				: null;
+			$fallback['refundCurrency'] = $latest_refund && !empty($latest_refund['currency'])
+				? (string) $latest_refund['currency']
+				: 'EUR';
+
+			return $fallback;
+		}
+
+		private function load_committed_finance_application($application_id, $fallback, $label) {
+			try {
+				return $this->get_detailed_application_record($application_id);
+			} catch (Throwable $error) {
+				error_log(
+					'MC Admissions could not reload the committed ' . $label . ' for application '
+					. $application_id . ': ' . $error->getMessage()
+				);
+				return $fallback;
+			}
+		}
+
+		private function finance_case_from_committed_application($application, $fallback, $application_id, $label) {
+			try {
+				return $this->to_admission_case($application);
+			} catch (Throwable $error) {
+				error_log(
+					'MC Admissions could not refresh agency identity while returning the committed '
+					. $label . ' for application ' . $application_id . ': ' . $error->getMessage()
+				);
+				return $this->to_admission_case($fallback, false);
+			}
+		}
+
+		private function finance_workspace_note_notification_payload($application, $user, $label, $note, $roles) {
+			$note = $this->trim_to_null($note);
+			$roles = $this->filter_workflow_actor_roles((array) $roles, $user);
+			if (!$note || empty($roles)) {
+				return null;
+			}
+			$context = $this->workflow_notification_application_context($application);
+			$student_label = $context['fullName'] . ' (' . $context['referenceCode'] . ')';
+
+			return array(
+				'roles' => $roles,
+				'subject' => sanitize_text_field($label . ' updated for ' . $student_label),
+				'message' => implode(
+					"\n",
+					array(
+						(isset($user['name']) ? (string) $user['name'] : 'An admissions user') . ' added or updated ' . $label . '.',
+						'',
+						$note,
+						'',
+						'Please review the case record for the full finance context.',
+					)
+				),
+				'application' => $context,
+			);
+		}
+
+		private function record_finance_workspace_action($params) {
+			global $wpdb;
+
+			$user = $params['user'];
+			if (!$this->can_manage_finance_workspace($user)) {
+				throw new Exception('Only an administrator or Finance Officer can update commission and refund records.');
+			}
+			$application_id = $this->normalize_finance_record_id($params['applicationId'], 'application id');
+			$expected_version = $this->iso_to_mysql_datetime($params['expectedUpdatedAt']);
+			if (!$expected_version) {
+				throw new Exception('Application version is required.');
+			}
+			$action = (string) $params['action'];
+			$draft = (array) $params['draft'];
+			if (!in_array($action, array('commission', 'refund-request', 'refund-payment'), true)) {
+				throw new Exception('Finance action is invalid.');
+			}
+			if (!$this->table_exists($this->commission_records_table) || !$this->table_exists($this->refund_records_table)) {
+				throw new Exception('The finance workspace tables are not available.');
+			}
+			$application_base = null;
+			$fallback_commissions = array();
+			$fallback_refunds = array();
+			$note_notification = null;
+
+			if (false === $wpdb->query('START TRANSACTION')) {
+				throw new Exception('Unable to start the finance transaction.');
+			}
+
+			try {
+				$application_base = $this->get_authorized_application_base($application_id, $user, true);
+				$activity_title = '';
+				$activity_detail = '';
+
+				if ('commission' === $action) {
+					$values = $this->normalize_commission_finance_draft($draft);
+					$record_id = !empty($draft['recordId'])
+						? $this->normalize_finance_record_id($draft['recordId'], 'commission record id')
+						: null;
+					$existing_commission = null;
+					if ($record_id) {
+						$existing_commission = $this->get_finance_record_for_update($this->commission_records_table, $record_id, $application_id, 'commission');
+					}
+					$this->bump_finance_application_version($application_id, $expected_version, $user);
+					if ($record_id) {
+						$this->update_finance_record($this->commission_records_table, $record_id, $application_id, $values, 'commission');
+					} else {
+						$record_id = wp_generate_uuid4();
+						$written = $wpdb->insert(
+							$this->commission_records_table,
+							array_merge(
+								array(
+									'id' => $record_id,
+									'applicationId' => $application_id,
+									'note' => null,
+								),
+								$values
+							)
+						);
+						if (false === $written || 0 === $written) {
+							throw new Exception('Unable to create the commission record.');
+						}
+					}
+					$fallback_commission = array_merge(
+						$existing_commission ? $existing_commission : array(
+							'id' => $record_id,
+							'applicationId' => $application_id,
+							'note' => null,
+							'createdAt' => current_time('mysql', true),
+						),
+						$values,
+						array('updatedAt' => current_time('mysql', true))
+					);
+					$fallback_commissions = array($fallback_commission);
+					$previous_note = $existing_commission && isset($existing_commission['note'])
+						? $this->trim_to_null($existing_commission['note'])
+						: null;
+					if (
+						array_key_exists('note', $values)
+						&& null !== $values['note']
+						&& $values['note'] !== $previous_note
+					) {
+						$note_notification = array(
+							'label' => 'Commission note',
+							'note' => $values['note'],
+							'roles' => array('finance-officer'),
+						);
+					}
+					$activity_title = $existing_commission ? 'Commission record updated' : 'Commission recorded';
+					$activity_detail = sprintf(
+						'Status: %s; amount: %s %s.',
+						$values['status'],
+						isset($values['amount']) ? $values['amount'] : 'not applicable',
+						$values['currency']
+					);
+				} elseif ('refund-request' === $action) {
+					$values = $this->normalize_refund_request_finance_draft($draft);
+					$refund_id = !empty($draft['refundId'])
+						? $this->normalize_finance_record_id($draft['refundId'], 'refund record id')
+						: null;
+					if ($refund_id) {
+						$existing_refund = $this->get_finance_record_for_update($this->refund_records_table, $refund_id, $application_id, 'refund');
+						$this->validate_refund_status_transition((string) $existing_refund['status'], $values['status']);
+					} else {
+						$existing_refund = null;
+					}
+					$this->bump_finance_application_version($application_id, $expected_version, $user);
+					if ($refund_id) {
+						$this->update_finance_record($this->refund_records_table, $refund_id, $application_id, $values, 'refund');
+					} else {
+						$refund_id = wp_generate_uuid4();
+						$written = $wpdb->insert(
+							$this->refund_records_table,
+							array_merge(
+								array(
+									'id' => $refund_id,
+									'applicationId' => $application_id,
+									'paidDate' => null,
+									'paymentReference' => null,
+									'note' => null,
+								),
+								$values
+							)
+						);
+						if (false === $written || 0 === $written) {
+							throw new Exception('Unable to create the refund record.');
+						}
+					}
+					$fallback_refund = array_merge(
+						$existing_refund ? $existing_refund : array(
+							'id' => $refund_id,
+							'applicationId' => $application_id,
+							'paidDate' => null,
+							'paymentReference' => null,
+							'note' => null,
+							'createdAt' => current_time('mysql', true),
+						),
+						$values,
+						array('updatedAt' => current_time('mysql', true))
+					);
+					$fallback_refunds = array($fallback_refund);
+					$previous_note = $existing_refund && isset($existing_refund['note'])
+						? $this->trim_to_null($existing_refund['note'])
+						: null;
+					if (
+						array_key_exists('note', $values)
+						&& null !== $values['note']
+						&& $values['note'] !== $previous_note
+					) {
+						$note_notification = array(
+							'label' => 'Refund note',
+							'note' => $values['note'],
+							'roles' => array('finance-officer', 'admissions-officer'),
+						);
+					}
+					$activity_title = $existing_refund ? 'Refund request updated' : 'Refund request recorded';
+					$activity_detail = sprintf('Status: %s; amount: %s %s.', $values['status'], $values['amount'], $values['currency']);
+				} else {
+					$this->assert_finance_draft_fields($draft, array('refundId', 'paidDate', 'paymentReference', 'note'));
+					$refund_id = $this->normalize_finance_record_id(isset($draft['refundId']) ? $draft['refundId'] : '', 'refund record id');
+					$refund = $this->get_finance_record_for_update($this->refund_records_table, $refund_id, $application_id, 'refund');
+					if (empty($refund['amount'])) {
+						throw new Exception('The approved refund does not have an amount to settle.');
+					}
+					if ('approved' !== (string) $refund['status']) {
+						throw new Exception('Only an approved refund can be recorded as paid.');
+					}
+					$values = array(
+						'status' => 'paid',
+						'paidDate' => $this->normalize_finance_date(isset($draft['paidDate']) ? $draft['paidDate'] : '', 'Refund payment date'),
+						'paymentReference' => $this->normalize_finance_text(isset($draft['paymentReference']) ? $draft['paymentReference'] : '', 'Refund payment reference', 191, true, true),
+					);
+					if (array_key_exists('note', $draft)) {
+						$values['note'] = $this->normalize_finance_text($draft['note'], 'Refund payment note', 4000);
+					}
+					$this->bump_finance_application_version($application_id, $expected_version, $user);
+					$this->update_finance_record($this->refund_records_table, $refund_id, $application_id, $values, 'refund');
+					$fallback_refunds = array(
+						array_merge($refund, $values, array('updatedAt' => current_time('mysql', true))),
+					);
+					$previous_note = isset($refund['note']) ? $this->trim_to_null($refund['note']) : null;
+					if (
+						array_key_exists('note', $values)
+						&& null !== $values['note']
+						&& $values['note'] !== $previous_note
+					) {
+						$note_notification = array(
+							'label' => 'Refund note',
+							'note' => $values['note'],
+							'roles' => array('finance-officer', 'admissions-officer'),
+						);
+					}
+					$activity_title = 'Refund paid';
+					$activity_detail = sprintf(
+						'Payment reference: %s; amount: %s %s.',
+						$values['paymentReference'],
+						$refund['amount'],
+						isset($refund['currency']) ? $refund['currency'] : 'EUR'
+					);
+				}
+
+				$this->create_required_activity(
+					$application_id,
+					$user,
+					'finance',
+					$activity_title,
+					$activity_detail,
+					'Unable to record the finance activity.'
+				);
+				// Capture the authoritative application version before committing so
+				// the fallback response remains usable even if the rich post-commit
+				// case reload is temporarily unavailable.
+				$application_base = $this->get_authorized_application_base($application_id, $user, true);
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit the finance transaction.');
+				}
+			} catch (Throwable $error) {
+				try {
+					$wpdb->query('ROLLBACK');
+				} catch (Throwable $rollback_error) {
+					error_log('MC Admissions could not roll back the finance transaction: ' . $rollback_error->getMessage());
+				}
+				throw $error;
+			}
+
+			$fallback = $this->finance_workspace_fallback_application(
+				$application_base,
+				array(
+					'commissionRecords' => $fallback_commissions,
+					'refundRecords' => $fallback_refunds,
+					'lastUpdatedByName' => $user['name'],
+				)
+			);
+			$application = $this->load_committed_finance_application(
+				$application_id,
+				$fallback,
+				'finance action'
+			);
+
+			if ($note_notification) {
+				$payload = $this->finance_workspace_note_notification_payload(
+					$application,
+					$user,
+					$note_notification['label'],
+					$note_notification['note'],
+					$note_notification['roles']
+				);
+				if ($payload) {
+					$this->run_workflow_notification_delivery(
+						$application,
+						strtolower($note_notification['label']) . ' notification',
+						function () use ($application, $user, $payload) {
+							return $this->send_application_role_notification($application, $user, $payload);
+						}
+					);
+				}
+			}
+
+			return $this->finance_case_from_committed_application(
+				$application,
+				$fallback,
+				$application_id,
+				'finance action'
+			);
+		}
+
+		private function normalize_finance_communication_draft($draft, $send_email) {
+			$this->assert_finance_draft_fields($draft, array('direction', 'channel', 'subject', 'detail'));
+			$direction = isset($draft['direction']) ? sanitize_key((string) $draft['direction']) : '';
+			$channel = isset($draft['channel']) ? sanitize_key((string) $draft['channel']) : '';
+			if (!in_array($direction, array('outbound', 'inbound', 'internal'), true)) {
+				throw new Exception('A valid communication direction is required.');
+			}
+			if (!in_array($channel, array('email', 'phone', 'whatsapp', 'meeting', 'portal'), true)) {
+				throw new Exception('A valid communication channel is required.');
+			}
+			$subject = $this->normalize_finance_text(isset($draft['subject']) ? $draft['subject'] : '', 'Communication subject', 191, $send_email, true);
+			$detail = $this->normalize_finance_text(isset($draft['detail']) ? $draft['detail'] : '', 'Communication detail', 4000, true);
+			if ($send_email && ('outbound' !== $direction || 'email' !== $channel)) {
+				throw new Exception('Email delivery requires an outbound email communication.');
+			}
+
+			return array(
+				'direction' => $direction,
+				'channel' => $channel,
+				'subject' => $subject,
+				'detail' => $detail,
+			);
+		}
+
+		private function record_finance_workspace_communication($params) {
+			global $wpdb;
+
+			$user = $params['user'];
+			$application_id = $this->normalize_finance_record_id($params['applicationId'], 'application id');
+			$expected_version = $this->iso_to_mysql_datetime($params['expectedUpdatedAt']);
+			if (!$expected_version) {
+				throw new Exception('Application version is required.');
+			}
+			$send_email = !empty($params['sendEmail']);
+			$communication = $this->normalize_finance_communication_draft((array) $params['draft'], $send_email);
+			if (!$this->table_exists($this->communications_table)) {
+				throw new Exception('The communications table is not available.');
+			}
+			$communication_id = wp_generate_uuid4();
+			$application_base = null;
+
+			if (false === $wpdb->query('START TRANSACTION')) {
+				throw new Exception('Unable to start the communication transaction.');
+			}
+			try {
+				$application_base = $this->get_authorized_application_base($application_id, $user, true);
+				$this->bump_finance_application_version($application_id, $expected_version, $user);
+				$written = $wpdb->insert(
+					$this->communications_table,
+					array(
+						'id' => $communication_id,
+						'applicationId' => $application_id,
+						'direction' => $communication['direction'],
+						'channel' => $communication['channel'],
+						'subject' => $communication['subject'],
+						'detail' => $communication['detail'],
+						'actorName' => $user['name'],
+					)
+				);
+				if (false === $written || 0 === $written) {
+					throw new Exception('Unable to record the communication.');
+				}
+				$this->create_required_activity(
+					$application_id,
+					$user,
+					'communication',
+					$send_email ? 'Agency email recorded' : 'Communication recorded',
+					ucfirst($communication['direction']) . ' ' . $communication['channel'] . ($communication['subject'] ? ': ' . $communication['subject'] : ''),
+					'Unable to record the communication activity.'
+				);
+				// Keep the committed version in the fallback response. A post-commit
+				// read failure must not make the client retry a write with the stale
+				// version it originally supplied.
+				$application_base = $this->get_authorized_application_base($application_id, $user, true);
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit the communication transaction.');
+				}
+			} catch (Throwable $error) {
+				try {
+					$wpdb->query('ROLLBACK');
+				} catch (Throwable $rollback_error) {
+					error_log('MC Admissions could not roll back the communication transaction: ' . $rollback_error->getMessage());
+				}
+				throw $error;
+			}
+
+			$fallback_communication = array_merge(
+				array(
+					'id' => $communication_id,
+					'applicationId' => $application_id,
+					'actorName' => $user['name'],
+					'createdAt' => current_time('mysql', true),
+				),
+				$communication
+			);
+			$fallback = $this->finance_workspace_fallback_application(
+				$application_base,
+				array(
+					'communications' => array($fallback_communication),
+					'lastUpdatedByName' => $user['name'],
+				)
+			);
+			$application = $this->load_committed_finance_application(
+				$application_id,
+				$fallback,
+				'communication'
+			);
+			$result = array();
+			if ($send_email) {
+				$delivery_result = $this->send_finance_workspace_communication_email(
+					$application,
+					$user,
+					$communication['subject'],
+					$communication['detail']
+				);
+				$audit = $this->audit_finance_workspace_email_delivery(
+					$application_id,
+					$communication_id,
+					$user,
+					$delivery_result
+				);
+				$result['delivery'] = array(
+					'ok' => !empty($delivery_result['ok']),
+					'skipped' => !empty($delivery_result['skipped']),
+					'sentCount' => count(isset($delivery_result['sent']) ? (array) $delivery_result['sent'] : array()),
+					'failedCount' => count(isset($delivery_result['failed']) ? (array) $delivery_result['failed'] : array()),
+					'error' => isset($delivery_result['error']) ? $delivery_result['error'] : null,
+					'audit' => $audit,
+				);
+				$application = $this->load_committed_finance_application(
+					$application_id,
+					$fallback,
+					'communication delivery audit'
+				);
+			}
+			$result['application'] = $this->finance_case_from_committed_application(
+				$application,
+				$fallback,
+				$application_id,
+				'communication'
+			);
+
+			return $result;
+		}
+
+		private function send_finance_workspace_communication_email($application, $user, $subject, $message) {
+			if (!empty($application['isTestData'])) {
+				return array(
+					'ok' => false,
+					'skipped' => true,
+					'sent' => array(),
+					'failed' => array(),
+					'error' => 'Test-data applications do not send email.',
+				);
+			}
+
+			$recipient = null;
+			try {
+				$identity = $this->authoritative_agency_contact(
+					isset($application['wordpressUserId']) ? (int) $application['wordpressUserId'] : 0,
+					$application
+				);
+				$email = sanitize_email(isset($identity['consultantEmail']) ? (string) $identity['consultantEmail'] : '');
+				$student_email = sanitize_email(isset($application['email']) ? (string) $application['email'] : '');
+				if (empty($identity['ownerFound']) || !is_email($email)) {
+					throw new Exception('No valid current email is available for the owning WordPress agency account.');
+				}
+				if (is_email($student_email) && strtolower($student_email) === strtolower($email)) {
+					throw new Exception('The agency email matches the student email, so delivery was skipped.');
+				}
+
+				$headers = array('Content-Type: text/html; charset=UTF-8');
+				if (!empty($user['email']) && is_email($user['email'])) {
+					$headers[] = sprintf(
+						'Reply-To: %s <%s>',
+						$this->sanitize_mail_header_name($user['name']),
+						sanitize_email($user['email'])
+					);
+				}
+				$recipient = array(
+					'email' => $email,
+					'name' => isset($identity['agencyName']) ? $identity['agencyName'] : null,
+				);
+				$sent = wp_mail(
+					array($email),
+					$subject,
+					$this->build_email_message(
+						$message,
+						$this->workflow_notification_application_context($application)
+					),
+					$headers
+				);
+				if (!$sent) {
+					throw new Exception('WordPress did not accept the message.');
+				}
+
+				return array(
+					'ok' => true,
+					'skipped' => false,
+					'sent' => array($recipient),
+					'failed' => array(),
+					'error' => null,
+				);
+			} catch (Throwable $error) {
+				$skipped = false !== stripos($error->getMessage(), 'skipped')
+					|| false !== stripos($error->getMessage(), 'No valid current email');
+				return array(
+					'ok' => false,
+					'skipped' => $skipped,
+					'sent' => array(),
+					'failed' => !$skipped && $recipient ? array($recipient) : array(),
+					'error' => $error->getMessage(),
+				);
+			}
+		}
+
+		private function audit_finance_workspace_email_delivery($application_id, $communication_id, $user, $delivery) {
+			global $wpdb;
+
+			if (!empty($delivery['ok'])) {
+				$status = 'Email delivery: sent to the owning WordPress agency account.';
+				$title = 'Agency email sent';
+			} elseif (!empty($delivery['skipped'])) {
+				$status = 'Email delivery skipped: ' . (isset($delivery['error']) ? $delivery['error'] : 'No delivery attempt was made.');
+				$title = 'Agency email skipped';
+			} else {
+				$status = 'Email delivery failed: ' . (isset($delivery['error']) ? $delivery['error'] : 'WordPress did not accept the message.');
+				$title = 'Agency email failed';
+			}
+
+			try {
+				if (false === $wpdb->query('START TRANSACTION')) {
+					throw new Exception('Unable to start the email-audit transaction.');
+				}
+				$written = $wpdb->query(
+					$wpdb->prepare(
+						"UPDATE {$this->communications_table} SET detail = CONCAT(detail, %s) WHERE id = %s AND applicationId = %s",
+						"\n\n" . $status,
+						$communication_id,
+						$application_id
+					)
+				);
+				if (false === $written || 0 === $written) {
+					throw new Exception('Unable to append the email delivery audit.');
+				}
+				$this->create_required_activity(
+					$application_id,
+					$user,
+					'communication',
+					$title,
+					$status,
+					'Unable to record the email delivery activity.'
+				);
+				if (false === $wpdb->query('COMMIT')) {
+					throw new Exception('Unable to commit the email delivery audit.');
+				}
+
+				return array('ok' => true, 'error' => null);
+			} catch (Throwable $error) {
+				try {
+					$wpdb->query('ROLLBACK');
+				} catch (Throwable $rollback_error) {
+					error_log(
+						'MC Admissions could not roll back the finance communication delivery audit: '
+						. $rollback_error->getMessage()
+					);
+				}
+				error_log(
+					'MC Admissions finance communication delivery audit failed for application '
+					. $application_id . ': ' . $error->getMessage()
+				);
+				return array('ok' => false, 'error' => $error->getMessage());
 			}
 		}
 
