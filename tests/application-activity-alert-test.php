@@ -201,6 +201,22 @@ function sanitize_text_field($value) {
 	return trim(strip_tags((string) $value));
 }
 
+function sanitize_file_name($value) {
+	return preg_replace('/[^A-Za-z0-9._-]/', '-', basename((string) $value));
+}
+
+function trailingslashit($value) {
+	return rtrim((string) $value, '/\\') . DIRECTORY_SEPARATOR;
+}
+
+function get_temp_dir() {
+	return sys_get_temp_dir();
+}
+
+function wp_unique_filename($directory, $file_name) {
+	return 'mc-alert-' . $GLOBALS['mc_alert_uuid'] . '-' . (string) $file_name;
+}
+
 function wp_strip_all_tags($value, $remove_breaks = false) {
 	return strip_tags((string) $value);
 }
@@ -244,10 +260,12 @@ function current_time($type, $gmt = false) {
 function wp_mail($to, $subject, $message, $headers = array(), $attachments = array()) {
 	$email = strtolower((string) reset($to));
 	$GLOBALS['mc_alert_mail_calls'][] = array(
+		'to' => $to,
 		'email' => $email,
 		'subject' => $subject,
 		'message' => $message,
 		'headers' => $headers,
+		'attachments' => $attachments,
 	);
 
 	if (in_array($email, $GLOBALS['mc_alert_mail_exceptions'], true)) {
@@ -324,6 +342,8 @@ $send_role_notification = $reflection->getMethod('send_application_role_notifica
 $send_role_notification->setAccessible(true);
 $send_workflow_notifications = $reflection->getMethod('send_workflow_notifications');
 $send_workflow_notifications->setAccessible(true);
+$send_generated_letter = $reflection->getMethod('send_generated_admission_letter_email');
+$send_generated_letter->setAccessible(true);
 
 $application = array(
 	'id' => 'application-1',
@@ -679,6 +699,146 @@ alert_assert_contains(
 	'Partial delivery must be captured in the audit communication.'
 );
 
+// Official generated documents use a deliberately narrower recipient policy
+// than the generic notification endpoint. Exercise the private sender itself so
+// recipient resolution, privacy, attachment delivery, and audit warnings are
+// covered as runtime behavior rather than source markers alone.
+$generated_template_matrix = array(
+	'offer-letter' => array('label' => 'Offer letter', 'copies' => true),
+	'acceptance-letter' => array('label' => 'Acceptance letter', 'copies' => true),
+	'payment-receipt' => array('label' => 'Payment receipt', 'copies' => true),
+	'letter-of-assurance' => array('label' => 'Letter of assurance', 'copies' => false),
+	'late-arrival-affirmation-letter' => array('label' => 'Late arrival affirmation letter', 'copies' => false),
+);
+foreach ($generated_template_matrix as $template_id => $template_definition) {
+	alert_reset_side_effects();
+	$generated_result = $send_generated_letter->invoke(
+		$plugin,
+		$application,
+		$internal_user,
+		$template_id,
+		$template_definition['label'],
+		$template_id . '.pdf',
+		base64_encode('%PDF-offline-generated-letter')
+	);
+	$expected_addresses = $template_definition['copies']
+		? array('actor@example.test', 'pambos.ch@mesoyios.ac.cy', 'marina.c@mesoyios.ac.cy')
+		: array('actor@example.test');
+	alert_assert_same($expected_addresses, alert_mail_addresses(), $template_id . ' must use its exact generated-document recipient policy.');
+	alert_assert_same(true, $generated_result['ok'], $template_id . ' must report success when every required recipient accepts the document.');
+	foreach ($GLOBALS['mc_alert_mail_calls'] as $mail_call) {
+		alert_assert_same(1, count($mail_call['to']), $template_id . ' must send each recipient a separate privacy-preserving message.');
+		alert_assert_same(1, count($mail_call['attachments']), $template_id . ' must attach the generated PDF to every separate message.');
+	}
+}
+
+// Recipient de-duplication is case-insensitive. When the owning agency mailbox
+// is also Pambos, that address receives one document and Marina receives one.
+$original_owner_email = $GLOBALS['mc_alert_users'][1]->user_email;
+$GLOBALS['mc_alert_users'][1]->user_email = 'PAMBOS.CH@MESOYIOS.AC.CY';
+alert_reset_side_effects();
+$deduplicated_letter = $send_generated_letter->invoke(
+	$plugin,
+	array_merge($application, array('wordpressEmail' => 'stale@example.test', 'consultantEmail' => 'stale@example.test')),
+	$internal_user,
+	'offer-letter',
+	'Offer letter',
+	'offer.pdf',
+	base64_encode('%PDF-offline-generated-letter')
+);
+alert_assert_same(
+	array('pambos.ch@mesoyios.ac.cy', 'marina.c@mesoyios.ac.cy'),
+	alert_mail_addresses(),
+	'Agency/internal duplicate addresses must collapse case-insensitively.'
+);
+alert_assert_same(2, count($deduplicated_letter['sent']), 'The deduplicated result must describe two distinct recipients.');
+$GLOBALS['mc_alert_users'][1]->user_email = $original_owner_email;
+
+// Student privacy wins over internal-copy routing: a configured internal copy
+// address that is also the student address must be removed from all recipients.
+alert_reset_side_effects();
+$student_collision_letter = $send_generated_letter->invoke(
+	$plugin,
+	array_merge($application, array('email' => 'PAMBOS.CH@MESOYIOS.AC.CY')),
+	$internal_user,
+	'payment-receipt',
+	'Payment receipt',
+	'payment-receipt.pdf',
+	base64_encode('%PDF-offline-generated-letter')
+);
+alert_assert_same(
+	array('actor@example.test', 'marina.c@mesoyios.ac.cy'),
+	alert_mail_addresses(),
+	'The student address must be excluded even when it matches a required internal copy address.'
+);
+alert_assert_same(false, in_array('pambos.ch@mesoyios.ac.cy', alert_mail_addresses(), true), 'The student must never receive a generated official document.');
+alert_assert_same(2, count($student_collision_letter['sent']), 'The non-student agency and internal recipients must still receive the document.');
+
+// A deleted owner account invalidates stale application snapshots. Copied
+// templates still reach the two fixed internal recipients; agency-only
+// templates skip instead of mailing the stale consultant address.
+$missing_owner_application = array_merge(
+	$application,
+	array(
+		'wordpressUserId' => 999,
+		'wordpressUsername' => 'deleted-owner',
+		'wordpressEmail' => 'stale-owner@example.test',
+		'consultantEmail' => 'stale-consultant@example.test',
+	)
+);
+alert_reset_side_effects();
+$missing_owner_copied = $send_generated_letter->invoke(
+	$plugin,
+	$missing_owner_application,
+	$internal_user,
+	'acceptance-letter',
+	'Acceptance letter',
+	'acceptance.pdf',
+	base64_encode('%PDF-offline-generated-letter')
+);
+alert_assert_same(
+	array('pambos.ch@mesoyios.ac.cy', 'marina.c@mesoyios.ac.cy'),
+	alert_mail_addresses(),
+	'A copied document with a deleted owner must go only to the required internal recipients.'
+);
+alert_assert_same(false, in_array('stale-consultant@example.test', alert_mail_addresses(), true), 'A deleted owner must invalidate the stale consultant snapshot.');
+alert_assert_contains('owning WordPress agency account could not be resolved', $missing_owner_copied['error'], 'The copied-document result must preserve the missing-owner warning.');
+alert_assert_contains('warning:', strtolower($GLOBALS['wpdb']->insert_calls[0]['data']['detail']), 'The successful internal-copy audit must retain the missing-owner warning.');
+
+alert_reset_side_effects();
+$missing_owner_agency_only = $send_generated_letter->invoke(
+	$plugin,
+	$missing_owner_application,
+	$internal_user,
+	'letter-of-assurance',
+	'Letter of assurance',
+	'assurance.pdf',
+	base64_encode('%PDF-offline-generated-letter')
+);
+alert_assert_same(array(), alert_mail_addresses(), 'An agency-only document must not use stale identity after its owner was deleted.');
+alert_assert_same(true, $missing_owner_agency_only['skipped'], 'An agency-only document with no authoritative owner must report a safe skip.');
+alert_assert_contains('no generated-letter email was attempted', $missing_owner_agency_only['error'], 'The agency-only skip reason must not claim that internal copies were attempted.');
+alert_assert_not_contains('required internal copies were attempted', $missing_owner_agency_only['error'], 'An uncopied template must not claim nonexistent internal-copy delivery.');
+
+// When an internal recipient also fails, retain both the missing-owner warning
+// and the transport failure; one must never overwrite the other.
+alert_reset_side_effects();
+$GLOBALS['mc_alert_mail_failures'] = array('marina.c@mesoyios.ac.cy');
+$missing_owner_partial = $send_generated_letter->invoke(
+	$plugin,
+	$missing_owner_application,
+	$internal_user,
+	'offer-letter',
+	'Offer letter',
+	'offer-partial.pdf',
+	base64_encode('%PDF-offline-generated-letter')
+);
+alert_assert_same(1, count($missing_owner_partial['sent']), 'One internal generated-letter copy must remain recorded as sent.');
+alert_assert_same(1, count($missing_owner_partial['failed']), 'One rejected internal copy must remain recorded as failed.');
+alert_assert_contains('owning WordPress agency account could not be resolved', $missing_owner_partial['error'], 'Partial delivery must preserve the identity warning.');
+alert_assert_contains('WordPress did not accept', $missing_owner_partial['error'], 'Partial delivery must also preserve the transport failure.');
+alert_assert_contains('Warning:', $GLOBALS['wpdb']->insert_calls[0]['data']['detail'], 'The partial-delivery audit must retain warning text.');
+
 $rest_save_source = alert_method_source($reflection, 'rest_save_application');
 $boot_source = alert_method_source($reflection, 'boot');
 $activate_source = alert_method_source($reflection, 'activate');
@@ -729,6 +889,7 @@ alert_assert_same(2, substr_count($upload_source, 'should_send_post_submission_a
 alert_assert_not_contains('send_application_activity_alert', $operations_source, 'General operational edits must not emit the urgent upload alert.');
 alert_assert_not_contains('send_application_activity_alert', $delete_source, 'Document deletion must not emit the urgent upload alert.');
 alert_assert_not_contains('send_application_activity_alert', $rest_email_source, 'The ordinary /email endpoint must remain independent.');
+alert_assert_not_contains('send_generated_admission_letter_email', $rest_email_source, 'The ordinary /email endpoint must not inherit generated-document internal copies.');
 alert_assert_contains('if (!$stale_command_ignored && ($status_changed || $note_changed))', $workflow_source, 'Workflow notification delivery must exclude stale and no-op commands.');
 alert_assert_contains('$this->send_workflow_notifications(', $workflow_source, 'The WordPress workflow path must dispatch the same notification classes as the direct-Prisma path.');
 alert_assert_same(
@@ -746,6 +907,6 @@ alert_assert_contains('catch (Throwable $error)', $workflow_delivery_guard_sourc
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
 alert_assert_not_contains('should_send_draft_creation_alert', $plugin_source, 'The obsolete first-draft email gate must be absent from the plugin.');
 alert_assert_not_contains("'new-application-created'", $plugin_source, 'The obsolete first-draft email event must be absent from the plugin.');
-alert_assert_contains('Version: 0.2.62', $plugin_source, 'The plugin header must advertise version 0.2.62.');
+alert_assert_contains('Version: 0.2.63', $plugin_source, 'The plugin header must advertise version 0.2.63.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;

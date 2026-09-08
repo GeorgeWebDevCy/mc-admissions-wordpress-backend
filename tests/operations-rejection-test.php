@@ -58,6 +58,10 @@ final class MC_Rejection_Test_Wpdb {
 		);
 	}
 
+	public function esc_like($value) {
+		return addcslashes((string) $value, '_%\\');
+	}
+
 	private function unpack($prepared) {
 		return is_array($prepared)
 			? $prepared

@@ -28,11 +28,16 @@ $required_markers = array(
 	"'mc_generated_letters'",
 	"WHERE id = %s AND status IN ('offer-issued', 'prepayment-pending', 'Offer letter issued', 'Payment pending')",
 	"private function send_generated_admission_letter_email",
+	"private function generated_admission_letter_internal_copy_recipients",
+	"'pambos.ch@mesoyios.ac.cy'",
+	"'marina.c@mesoyios.ac.cy'",
 	"\$agency_email_is_student = is_email(\$student_email)",
 	"strtolower(\$student_email) === strtolower(\$agency_email)",
-	"The agency email matches the student email, so delivery was skipped.",
+	"The agency email matches the student email, so the agency delivery was skipped.",
 	"\$delivery_skipped = true",
-	"No valid originating agency email is recorded.",
+	"No valid originating agency email is recorded; only the required internal copies were attempted.",
+	"array_filter(",
+	"Each official document is delivered separately.",
 	"wp_mail(array(\$recipient['email']), \$subject, \$html_message, \$headers, \$attachments)",
 	"\$this->record_application_activity_alert(",
 	"'acceptance generated internal role handoff'",
@@ -59,8 +64,26 @@ $email_source = false !== $email_start && false !== $email_end
 	? substr($source, $email_start, $email_end - $email_start)
 	: '';
 if (false !== strpos($email_source, 'PRESIDENT_ACTIVITY_ALERT_EMAIL')) {
-	fwrite(STDERR, "Generated official letters must only be sent to the originating agency.\n");
+	fwrite(STDERR, "Generated official letters must not use the broad President activity-alert recipient.\n");
 	exit(1);
+}
+
+$internal_recipient_start = strpos($source, 'private function generated_admission_letter_internal_copy_recipients');
+$internal_recipient_end = strpos($source, 'private function can_generate_admission_letter', $internal_recipient_start);
+$internal_recipient_source = false !== $internal_recipient_start && false !== $internal_recipient_end
+	? substr($source, $internal_recipient_start, $internal_recipient_end - $internal_recipient_start)
+	: '';
+foreach (array('offer-letter', 'acceptance-letter', 'payment-receipt') as $copied_template) {
+	if (false === strpos($internal_recipient_source, "'{$copied_template}'")) {
+		fwrite(STDERR, "Missing required internal-copy template: {$copied_template}.\n");
+		exit(1);
+	}
+}
+foreach (array('letter-of-assurance', 'late-arrival-affirmation-letter') as $uncopied_template) {
+	if (false !== strpos($internal_recipient_source, "'{$uncopied_template}'")) {
+		fwrite(STDERR, "Unexpected internal-copy template: {$uncopied_template}.\n");
+		exit(1);
+	}
 }
 
 echo "Generated letter route contract tests passed.\n";
