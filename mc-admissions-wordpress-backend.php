@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.62
+ * Version: 0.2.63
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -41,6 +41,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const AGENCY_IDENTITY_BACKFILL_HOOK = 'mc_admissions_agency_identity_backfill';
 		const AGENCY_IDENTITY_BACKFILL_LOCK = 'mc_admissions_agency_identity_backfill_lock';
 		const INTAKE_CAPACITY_SCHEMA_VERSION = '0.2.62';
+		const ASSESSMENT_MESSAGE_PENDING_SUBJECT_PREFIX = '[Assessment message: pending]';
+		const ASSESSMENT_MESSAGE_REJECTED_SUBJECT_PREFIX = '[Assessment message: rejected]';
+		const ASSESSMENT_MESSAGE_PENDING_LEGACY_SUBJECT_PREFIX = 'Additional information required for ';
+		const ASSESSMENT_MESSAGE_REJECTED_LEGACY_SUBJECT_PREFIX = 'Application closed after review for ';
 
 		/** @var string */
 		private $applications_table = 'mc_admission_applications';
@@ -477,6 +481,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return array_merge(
 				$application,
 				array(
+					'ownerFound'        => !empty($identity['ownerFound']),
 					'wordpressUsername' => $identity['wordpressUsername'],
 					'wordpressEmail'    => $identity['wordpressEmail'],
 					'agencyName'        => $identity['agencyName'],
@@ -3264,19 +3269,33 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
-		private function record_application_activity_alert($application_id, $user, $payload, $sent, $failed, $error = null) {
+		private function bounded_audit_subject($subject) {
+			$subject = trim((string) $subject);
+			if (function_exists('mb_substr')) {
+				return mb_substr($subject, 0, 191, 'UTF-8');
+			}
+
+			return substr($subject, 0, 191);
+		}
+
+		private function record_application_activity_alert($application_id, $user, $payload, $sent, $failed, $error = null, $existing_communication_id = null) {
 			global $wpdb;
 
 			$sent_count = count((array) $sent);
 			$failed_count = count((array) $failed);
 			if ($sent_count > 0 && 0 === $failed_count) {
-				$delivery_status = sprintf('Email delivery: sent to %d recipient(s).', $sent_count);
+				$delivery_status = $error
+					? sprintf('Email delivery: sent to %d recipient(s); warning: %s', $sent_count, (string) $error)
+					: sprintf('Email delivery: sent to %d recipient(s).', $sent_count);
 			} elseif ($sent_count > 0) {
 				$delivery_status = sprintf(
 					'Email delivery: partially sent to %d recipient(s); %d failed.',
 					$sent_count,
 					$failed_count
 				);
+				if ($error) {
+					$delivery_status .= ' Warning: ' . (string) $error;
+				}
 			} elseif (!empty($payload['deliverySkipped'])) {
 				$delivery_status = 'Email delivery skipped: ' . ($error ? (string) $error : 'No delivery attempt was made.');
 			} else {
@@ -3286,6 +3305,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$recipient_detail = !empty($payload['recipientLabel'])
 				? 'Recipient: ' . (string) $payload['recipientLabel'] . '.'
 				: 'Recipient roles: ' . implode(', ', (array) $payload['roles']) . '.';
+			$audit_subject = $this->bounded_audit_subject(
+				$existing_communication_id && !empty($payload['deliveryAuditSubject'])
+					? (string) $payload['deliveryAuditSubject']
+					: (string) $payload['subject']
+			);
 			$detail = implode(
 				"\n",
 				array(
@@ -3305,6 +3329,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$audit_errors[] = 'Communication audit could not be recorded.';
 					$log_errors[] = 'the communications table is unavailable';
 				} else {
+					$communication_detail = $existing_communication_id
+						? $recipient_detail . "\n" . $delivery_status
+						: $detail;
 					$communication_written = $wpdb->insert(
 						$this->communications_table,
 						array(
@@ -3312,8 +3339,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'applicationId' => $application_id,
 							'direction' => 'outbound',
 							'channel' => 'email',
-							'subject' => (string) $payload['subject'],
-							'detail' => $detail,
+							'subject' => $audit_subject,
+							'detail' => $communication_detail,
 							'actorName' => isset($user['name']) ? (string) $user['name'] : 'MC Admissions',
 							'createdAt' => current_time('mysql', true),
 						),
@@ -3335,8 +3362,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$application_id,
 					$user,
 					'communication',
-					(string) $payload['subject'],
-					$delivery_status
+					$audit_subject,
+					$existing_communication_id
+						? $recipient_detail . "\n" . $delivery_status
+						: $delivery_status
 				);
 				$activity_recorded = false !== $activity_written && 0 !== $activity_written;
 				if (!$activity_recorded) {
@@ -3659,6 +3688,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return array(
 				'roles' => array(),
 				'subject' => sanitize_text_field('Application closed after review for ' . $student_label),
+				'deliveryAuditSubject' => 'Rejected assessment email delivery audit',
 				'message' => $rejection_reason
 					? $rejection_reason
 					: 'Admissions review has concluded and the application has been closed as rejected.',
@@ -3678,6 +3708,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return array(
 				'roles' => array(),
 				'subject' => sanitize_text_field('Additional information required for ' . $student_label),
+				'deliveryAuditSubject' => 'Pending assessment email delivery audit',
 				'message' => (string) $message,
 				'application' => array(
 					'id' => isset($application['id']) ? (string) $application['id'] : null,
@@ -3687,12 +3718,201 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
+		private function assessment_message_subject($kind, $application) {
+			return 'pending' === $kind
+				? self::ASSESSMENT_MESSAGE_PENDING_SUBJECT_PREFIX
+				: self::ASSESSMENT_MESSAGE_REJECTED_SUBJECT_PREFIX;
+		}
+
+		private function create_required_assessment_message_history($application_id, $user, $kind, $message, $application, $history_id) {
+			global $wpdb;
+
+			$kind = sanitize_key((string) $kind);
+			$message = trim((string) $message);
+			if (!in_array($kind, array('pending', 'rejected'), true) || '' === $message || '' === (string) $history_id) {
+				throw new Exception('Assessment message history details are invalid.');
+			}
+			if (!$this->table_exists($this->communications_table)) {
+				throw new Exception('Assessment message history is unavailable.');
+			}
+
+			$written = $wpdb->insert(
+				$this->communications_table,
+				array(
+					'id' => (string) $history_id,
+					'applicationId' => (string) $application_id,
+					'direction' => 'internal',
+					'channel' => 'portal',
+					'subject' => $this->assessment_message_subject($kind, $application),
+					'detail' => $message,
+					'actorName' => isset($user['name']) ? (string) $user['name'] : 'MC Admissions',
+					'createdAt' => current_time('mysql', true),
+				),
+				array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
+			);
+			if (false === $written || 0 === $written) {
+				throw new Exception('Unable to record the assessment message history.');
+			}
+
+			return (string) $history_id;
+		}
+
+		private function assessment_message_kind_from_communication($communication) {
+			$subject = isset($communication['subject']) ? (string) $communication['subject'] : '';
+			$direction = isset($communication['direction']) ? strtolower(trim((string) $communication['direction'])) : '';
+			$channel = isset($communication['channel']) ? strtolower(trim((string) $communication['channel'])) : '';
+			if ('internal' === $direction && 'portal' === $channel) {
+				if (0 === stripos($subject, self::ASSESSMENT_MESSAGE_PENDING_SUBJECT_PREFIX)) {
+					return 'pending';
+				}
+				if (0 === stripos($subject, self::ASSESSMENT_MESSAGE_REJECTED_SUBJECT_PREFIX)) {
+					return 'rejected';
+				}
+			}
+
+			if ('outbound' === $direction && 'email' === $channel && $this->has_legacy_assessment_delivery_audit($communication)) {
+				if (0 === stripos($subject, self::ASSESSMENT_MESSAGE_PENDING_LEGACY_SUBJECT_PREFIX)) {
+					return 'pending';
+				}
+				if (0 === stripos($subject, self::ASSESSMENT_MESSAGE_REJECTED_LEGACY_SUBJECT_PREFIX)) {
+					return 'rejected';
+				}
+			}
+
+			return null;
+		}
+
+		private function has_legacy_assessment_delivery_audit($communication) {
+			$detail = isset($communication['detail'])
+				? str_replace("\r\n", "\n", (string) $communication['detail'])
+				: '';
+			$recipient_position = strrpos($detail, "\nRecipient: ");
+			if (false === $recipient_position) {
+				return false;
+			}
+
+			return false !== strpos($detail, "\nApplication: ", $recipient_position)
+				|| false !== strpos($detail, "\nEmail delivery: ", $recipient_position);
+		}
+
+		private function is_reserved_assessment_message_subject($subject) {
+			$subject = trim((string) $subject);
+			return 0 === stripos($subject, self::ASSESSMENT_MESSAGE_PENDING_SUBJECT_PREFIX)
+				|| 0 === stripos($subject, self::ASSESSMENT_MESSAGE_REJECTED_SUBJECT_PREFIX)
+				|| 0 === stripos($subject, self::ASSESSMENT_MESSAGE_PENDING_LEGACY_SUBJECT_PREFIX)
+				|| 0 === stripos($subject, self::ASSESSMENT_MESSAGE_REJECTED_LEGACY_SUBJECT_PREFIX);
+		}
+
+		private function assessment_message_text_from_communication($communication) {
+			$detail = isset($communication['detail']) ? (string) $communication['detail'] : '';
+			$subject = isset($communication['subject']) ? (string) $communication['subject'] : '';
+			if (
+				0 === stripos($subject, self::ASSESSMENT_MESSAGE_PENDING_SUBJECT_PREFIX)
+				|| 0 === stripos($subject, self::ASSESSMENT_MESSAGE_REJECTED_SUBJECT_PREFIX)
+			) {
+				return trim($detail);
+			}
+
+			$detail = str_replace("\r\n", "\n", $detail);
+			$position = strrpos($detail, "\nRecipient: ");
+			if (false !== $position) {
+				$detail = substr($detail, 0, $position);
+			}
+
+			return trim($detail);
+		}
+
+		private function can_view_assessment_message_history($user) {
+			return $this->is_admin_user($user)
+				|| $this->user_has_any_role($user, array('admissions-officer', 'migration-officer'));
+		}
+
+		private function get_assessment_message_history($application_id, $user) {
+			global $wpdb;
+
+			if (!$this->can_view_assessment_message_history($user) || !$this->table_exists($this->communications_table)) {
+				return array();
+			}
+
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT * FROM {$this->communications_table}
+					 WHERE applicationId = %s
+					   AND (
+					     (direction = 'internal' AND channel = 'portal' AND (subject LIKE %s OR subject LIKE %s))
+					     OR
+					     (direction = 'outbound' AND channel = 'email'
+					       AND (subject LIKE %s OR subject LIKE %s)
+					       AND LOCATE(%s, detail) > 0
+					       AND (LOCATE(%s, detail) > 0 OR LOCATE(%s, detail) > 0))
+					   )
+					 ORDER BY createdAt DESC, id DESC LIMIT 200",
+					(string) $application_id,
+					$wpdb->esc_like(self::ASSESSMENT_MESSAGE_PENDING_SUBJECT_PREFIX) . '%',
+					$wpdb->esc_like(self::ASSESSMENT_MESSAGE_REJECTED_SUBJECT_PREFIX) . '%',
+					$wpdb->esc_like(self::ASSESSMENT_MESSAGE_PENDING_LEGACY_SUBJECT_PREFIX) . '%',
+					$wpdb->esc_like(self::ASSESSMENT_MESSAGE_REJECTED_LEGACY_SUBJECT_PREFIX) . '%',
+					"\nRecipient: ",
+					"\nApplication: ",
+					"\nEmail delivery: "
+				),
+				ARRAY_A
+			);
+			$history = array();
+			foreach ((array) $rows as $row) {
+				if ((string) ($row['applicationId'] ?? '') !== (string) $application_id) {
+					continue;
+				}
+				$kind = $this->assessment_message_kind_from_communication($row);
+				if (!$kind) {
+					continue;
+				}
+				$message = $this->assessment_message_text_from_communication($row);
+				if ('' === $message) {
+					continue;
+				}
+				$history[] = array(
+					'id' => (string) $row['id'],
+					'kind' => $kind,
+					'message' => $message,
+					'actorName' => isset($row['actorName']) ? (string) $row['actorName'] : '',
+					'createdAt' => $this->mysql_datetime_to_iso(isset($row['createdAt']) ? $row['createdAt'] : null),
+				);
+			}
+			usort(
+				$history,
+				function ($left, $right) {
+					$created_compare = strcmp((string) $right['createdAt'], (string) $left['createdAt']);
+					return 0 !== $created_compare
+						? $created_compare
+						: strcmp((string) $right['id'], (string) $left['id']);
+				}
+			);
+
+			return $history;
+		}
+
+		private function attach_assessment_message_history($case, $application_id, $user) {
+			$case['assessmentMessageHistory'] = array();
+			try {
+				$case['assessmentMessageHistory'] = $this->get_assessment_message_history($application_id, $user);
+			} catch (Throwable $error) {
+				error_log(
+					'MC Admissions could not load assessment message history for application '
+					. (string) $application_id . ': ' . $error->getMessage()
+				);
+			}
+
+			return $case;
+		}
+
 		private function has_application_email_audit($application_id, $subject) {
 			global $wpdb;
 
 			if (!$this->table_exists($this->communications_table)) {
 				return false;
 			}
+			$subject = $this->bounded_audit_subject($subject);
 
 			// Count only a confirmed successful delivery in the current review
 			// cycle. Failed or skipped attempts remain retryable, while a later
@@ -3707,7 +3927,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			) > 0;
 		}
 
-		private function send_originating_consultant_notification($application, $user, $payload, $deduplicate = false) {
+		private function send_originating_consultant_notification($application, $user, $payload, $deduplicate = false, $assessment_message_id = null) {
 			if (!empty($application['isTestData'])) {
 				return array(
 					'ok' => false,
@@ -3718,7 +3938,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'audit' => array(
 						'ok' => true,
 						'skipped' => true,
-						'communicationRecorded' => false,
+						'communicationRecorded' => !empty($assessment_message_id),
 						'activityRecorded' => false,
 						'error' => null,
 					),
@@ -3737,7 +3957,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$payload,
 					array(),
 					array(),
-					$error_message
+					$error_message,
+					$assessment_message_id
 				);
 				error_log(
 					'MC Admissions originating agency identity lookup failed after the case was saved for application '
@@ -3846,7 +4067,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$payload,
 				$sent,
 				$failed,
-				$error_message
+				$error_message,
+				$assessment_message_id
 			);
 
 			return array(
@@ -3859,21 +4081,23 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
-		private function send_review_rejection_notification($application, $user, $reason = null, $deduplicate = true) {
+		private function send_review_rejection_notification($application, $user, $reason = null, $deduplicate = true, $assessment_message_id = null) {
 			return $this->send_originating_consultant_notification(
 				$application,
 				$user,
 				$this->review_rejection_notification_payload($application, $reason),
-				$deduplicate
+				$deduplicate,
+				$assessment_message_id
 			);
 		}
 
-		private function send_pending_review_message_notification($application, $user, $message) {
+		private function send_pending_review_message_notification($application, $user, $message, $assessment_message_id = null) {
 			return $this->send_originating_consultant_notification(
 				$application,
 				$user,
 				$this->pending_review_message_notification_payload($application, $message),
-				false
+				false,
+				$assessment_message_id
 			);
 		}
 
@@ -7160,6 +7384,25 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
+		private function generated_admission_letter_internal_copy_recipients($template_id) {
+			if (!in_array((string) $template_id, array('offer-letter', 'acceptance-letter', 'payment-receipt'), true)) {
+				return array();
+			}
+
+			return array(
+				array(
+					'email' => 'pambos.ch@mesoyios.ac.cy',
+					'name' => 'Pambos',
+					'role' => 'internal-document-copy',
+				),
+				array(
+					'email' => 'marina.c@mesoyios.ac.cy',
+					'name' => 'Marina',
+					'role' => 'internal-document-copy',
+				),
+			);
+		}
+
 		private function can_generate_admission_letter($user, $template_id) {
 			if ($this->is_admin_user($user)) {
 				return true;
@@ -8049,10 +8292,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$subject = $template_label . ' for ' . $full_name . ' (' . $reference . ')';
 			$message = 'An official ' . strtolower($template_label) . " has been generated for {$full_name}.\nApplication reference: {$reference}.\nThe generated document is attached.";
 			$student_email = sanitize_email(isset($application['email']) ? (string) $application['email'] : '');
+			$agency_owner_found = !empty($application['ownerFound']);
 			$agency_email = sanitize_email(
-				!empty($application['consultantEmail'])
+				$agency_owner_found && !empty($application['consultantEmail'])
 					? (string) $application['consultantEmail']
-					: (!empty($application['wordpressEmail']) ? (string) $application['wordpressEmail'] : '')
+					: ($agency_owner_found && !empty($application['wordpressEmail']) ? (string) $application['wordpressEmail'] : '')
 			);
 			$agency_email_is_student = is_email($student_email)
 				&& is_email($agency_email)
@@ -8061,25 +8305,54 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if (is_email($agency_email) && !$agency_email_is_student) {
 				$to[] = array('email' => $agency_email, 'name' => $application['consultantName'] ?? $application['agencyName'] ?? null);
 			}
-			$payload = array('to' => $to);
+			$internal_copy_recipients = $this->generated_admission_letter_internal_copy_recipients($template_id);
+			foreach ($internal_copy_recipients as $internal_recipient) {
+				$to[] = $internal_recipient;
+			}
+			$recipient_label = !empty($internal_copy_recipients)
+				? 'Originating agency or consultant and required internal document copies'
+				: 'Originating agency or consultant';
+			$payload = array(
+				'to' => $to,
+				'roles' => array(),
+				'recipientLabel' => $recipient_label,
+			);
 			$sent = array();
 			$failed = array();
 			$error_message = null;
+			$error_messages = array();
 			$attachments = array();
 			$delivery_skipped = false;
 
 			if (empty($application['isTestData'])) {
 				try {
-					$recipients = array();
-					if ($agency_email_is_student) {
-						$delivery_skipped = true;
-						$error_message = 'The agency email matches the student email, so delivery was skipped.';
-					} else {
-						$recipients = $this->resolve_email_recipients($payload);
+					$recipients = array_values(
+						array_filter(
+							$this->resolve_email_recipients($payload),
+							function ($recipient) use ($student_email) {
+								$recipient_email = sanitize_email(isset($recipient['email']) ? (string) $recipient['email'] : '');
+								return !is_email($student_email)
+									|| !is_email($recipient_email)
+									|| strtolower($student_email) !== strtolower($recipient_email);
+							}
+						)
+					);
+					if (!$agency_owner_found) {
+						$error_messages[] = !empty($internal_copy_recipients)
+							? 'The owning WordPress agency account could not be resolved; only the required internal copies were attempted.'
+							: 'The owning WordPress agency account could not be resolved; no generated-letter email was attempted.';
+					} elseif ($agency_email_is_student) {
+						$error_messages[] = 'The agency email matches the student email, so the agency delivery was skipped.';
+					} elseif (!is_email($agency_email)) {
+						$error_messages[] = !empty($internal_copy_recipients)
+							? 'No valid originating agency email is recorded; only the required internal copies were attempted.'
+							: 'No valid originating agency email is recorded; no generated-letter email was attempted.';
 					}
-					if (!$delivery_skipped && empty($recipients)) {
+					if (empty($recipients)) {
 						$delivery_skipped = true;
-						$error_message = 'No valid originating agency email is recorded.';
+						if (empty($error_messages)) {
+							$error_messages[] = 'No valid generated-letter email recipient is recorded.';
+						}
 					} elseif (!$delivery_skipped) {
 						$attachments = $this->create_email_attachments(array(array('fileName' => $file_name, 'contentBase64' => $content_base64)));
 						$headers = array('Content-Type: text/html; charset=UTF-8');
@@ -8087,23 +8360,40 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							$headers[] = sprintf('Reply-To: %s <%s>', $this->sanitize_mail_header_name($user['name']), $user['email']);
 						}
 						$html_message = $this->build_email_message($message, array('referenceCode' => $reference, 'fullName' => $full_name));
+						/*
+						 * Each official document is delivered separately. This gives the
+						 * agency and internal recipients Bcc-equivalent privacy while
+						 * preserving exact per-recipient success/failure audit results.
+						 */
 						foreach ($recipients as $recipient) {
-							if (wp_mail(array($recipient['email']), $subject, $html_message, $headers, $attachments)) {
+							try {
+								$delivered = wp_mail(array($recipient['email']), $subject, $html_message, $headers, $attachments);
+							} catch (Throwable $mail_error) {
+								$delivered = false;
+								$error_messages[] = $mail_error->getMessage();
+							}
+							if ($delivered) {
 								$sent[] = $recipient;
 							} else {
 								$failed[] = $recipient;
 							}
 						}
+						if (!empty($failed)) {
+							$error_messages[] = 'WordPress did not accept one or more generated-letter messages.';
+						}
 					}
 				} catch (Throwable $error) {
-					$error_message = $error->getMessage();
+					$error_messages[] = $error->getMessage();
 				} finally {
 					$this->delete_temp_files($attachments);
 				}
 			} else {
 				$delivery_skipped = true;
-				$error_message = 'Test-data application; email delivery disabled.';
+				$error_messages[] = 'Test-data application; email delivery disabled.';
 			}
+			$error_message = !empty($error_messages)
+				? implode(' ', array_values(array_unique($error_messages)))
+				: null;
 
 			$this->record_application_activity_alert(
 				$application_id,
@@ -8111,7 +8401,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				array(
 					'subject' => $subject,
 					'message' => $message,
-					'recipientLabel' => 'Originating agency or consultant',
+					'recipientLabel' => $recipient_label,
 					'deliverySkipped' => $delivery_skipped,
 				),
 				$sent,
@@ -8120,7 +8410,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 
 			return array(
-				'ok' => !empty($sent) && empty($failed),
+				'ok' => !empty($sent) && empty($failed) && null === $error_message,
 				'skipped' => $delivery_skipped,
 				'sent' => $sent,
 				'failed' => $failed,
@@ -8163,8 +8453,28 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if ($this->table_exists($this->communications_table)) {
 				$communications = $wpdb->get_results(
 					$wpdb->prepare(
-						"SELECT * FROM {$this->communications_table} WHERE applicationId = %s ORDER BY createdAt DESC, id DESC LIMIT 24",
-						$application_id
+						"SELECT * FROM {$this->communications_table}
+						 WHERE applicationId = %s
+						   AND (
+						     subject IS NULL
+						     OR NOT (
+						       (direction = 'internal' AND channel = 'portal' AND (subject LIKE %s OR subject LIKE %s))
+						       OR
+						       (direction = 'outbound' AND channel = 'email'
+						         AND (subject LIKE %s OR subject LIKE %s)
+						         AND LOCATE(%s, detail) > 0
+						         AND (LOCATE(%s, detail) > 0 OR LOCATE(%s, detail) > 0))
+						     )
+						   )
+						 ORDER BY createdAt DESC, id DESC LIMIT 24",
+						$application_id,
+						$wpdb->esc_like(self::ASSESSMENT_MESSAGE_PENDING_SUBJECT_PREFIX) . '%',
+						$wpdb->esc_like(self::ASSESSMENT_MESSAGE_REJECTED_SUBJECT_PREFIX) . '%',
+						$wpdb->esc_like(self::ASSESSMENT_MESSAGE_PENDING_LEGACY_SUBJECT_PREFIX) . '%',
+						$wpdb->esc_like(self::ASSESSMENT_MESSAGE_REJECTED_LEGACY_SUBJECT_PREFIX) . '%',
+						"\nRecipient: ",
+						"\nApplication: ",
+						"\nEmail delivery: "
 					),
 					ARRAY_A
 				);
@@ -8464,11 +8774,19 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				array($this, 'map_activity_entry'),
 				$application['activities']
 			);
+			$case_communications = array_values(
+				array_filter(
+					isset($application['communications']) && is_array($application['communications'])
+						? $application['communications']
+						: array(),
+					function ($communication) {
+						return null === $this->assessment_message_kind_from_communication($communication);
+					}
+				)
+			);
 			$communications = array_map(
 				array($this, 'map_communication'),
-				isset($application['communications']) && is_array($application['communications'])
-					? $application['communications']
-					: array()
+				$case_communications
 			);
 			$letter_drafts = array_map(
 				array($this, 'map_letter_draft'),
@@ -8605,11 +8923,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		private function map_activity_entry($entry) {
+			$detail = !empty($entry['detail']) ? $entry['detail'] : null;
+			if ($this->is_reserved_assessment_message_subject(isset($entry['title']) ? $entry['title'] : '')) {
+				$detail = 'Assessment-message delivery result recorded.';
+			}
+
 			return array(
 				'id' => $entry['id'],
 				'kind' => self::NOTIFICATION_DOCUMENT_ACTIVITY_KIND === $entry['kind'] ? 'document' : $entry['kind'],
 				'title' => $entry['title'],
-				'detail' => !empty($entry['detail']) ? $entry['detail'] : null,
+				'detail' => $detail,
 				'actorName' => $entry['actorName'],
 				'createdAt' => $this->mysql_datetime_to_iso($entry['createdAt']),
 			);
@@ -9506,6 +9829,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('A valid communication channel is required.');
 			}
 			$subject = $this->normalize_finance_text(isset($draft['subject']) ? $draft['subject'] : '', 'Communication subject', 191, $send_email, true);
+			if ($subject && $this->is_reserved_assessment_message_subject($subject)) {
+				throw new Exception('This communication subject is reserved for assessment history.');
+			}
 			$detail = $this->normalize_finance_text(isset($draft['detail']) ? $draft['detail'] : '', 'Communication detail', 4000, true);
 			if ($send_email && ('outbound' !== $direction || 'email' !== $channel)) {
 				throw new Exception('Email delivery requires an outbound email communication.');
@@ -9772,7 +10098,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function get_admission_application_case($user, $application_id) {
 			$this->get_authorized_application_base($application_id, $user);
-			return $this->to_admission_case($this->get_detailed_application_record($application_id));
+			$case = $this->to_admission_case($this->get_detailed_application_record($application_id));
+			return $this->attach_assessment_message_history($case, $application_id, $user);
 		}
 
 		private function generate_reference_code() {
@@ -10305,6 +10632,27 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if (empty($draft)) {
 				throw new Exception('No operational fields were provided.');
 			}
+			$assessment_message_kind = isset($params['assessmentMessageKind'])
+				? sanitize_key((string) $params['assessmentMessageKind'])
+				: '';
+			$assessment_message = isset($params['assessmentMessage'])
+				? trim((string) $params['assessmentMessage'])
+				: '';
+			$assessment_message_id = isset($params['assessmentMessageId'])
+				? trim((string) $params['assessmentMessageId'])
+				: '';
+			$dedicated_assessment_message = !empty($params['dedicatedAssessmentMessage'])
+				|| !empty($params['dedicatedReviewRejection']);
+			if (
+				('' !== $assessment_message_kind || '' !== $assessment_message || '' !== $assessment_message_id)
+				&& (
+					!in_array($assessment_message_kind, array('pending', 'rejected'), true)
+					|| '' === $assessment_message
+					|| '' === $assessment_message_id
+				)
+			) {
+				throw new Exception('Assessment message history details are invalid.');
+			}
 
 			$this->assert_operations_patch_authorized($draft, $user);
 			if (
@@ -10346,6 +10694,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				}
 			}
 			$status_changed = $next_status !== $existing_status;
+			if (
+				('pending' === $assessment_message_kind && ('review-pending' !== $next_status || 'hold' !== $next_reviewer_decision))
+				|| ('rejected' === $assessment_message_kind && ('rejected' !== $next_status || 'rejected' !== $next_reviewer_decision))
+			) {
+				throw new Exception('Assessment message history does not match the review outcome.');
+			}
 
 			$set_parts = array('status = %s');
 			$args = array($next_status);
@@ -10441,6 +10795,17 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					throw new Exception('The application review outcome was not saved. Refresh and try again.');
 				}
 
+				if ($assessment_message_kind) {
+					$this->create_required_assessment_message_history(
+						$application_id,
+						$user,
+						$assessment_message_kind,
+						$assessment_message,
+						array_merge($existing, $written_state),
+						$assessment_message_id
+					);
+				}
+
 				if ($status_changed) {
 					$this->create_required_activity(
 						$application_id,
@@ -10482,7 +10847,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					ARRAY_A
 				);
 			} catch (Throwable $authoritative_read_error) {
-				if (empty($params['dedicatedReviewRejection'])) {
+				if (!$dedicated_assessment_message) {
 					throw $authoritative_read_error;
 				}
 				error_log(
@@ -10495,7 +10860,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				|| $next_status !== $this->canonical_status_key((string) $authoritative_review['status'])
 				|| $next_reviewer_decision !== (string) $authoritative_review['reviewerDecision']
 			) {
-				if (empty($params['dedicatedReviewRejection'])) {
+				if (!$dedicated_assessment_message) {
 					throw new Exception('The application review outcome was not saved. Refresh and try again.');
 				}
 				$authoritative_review = array_merge(
@@ -10548,7 +10913,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					throw new Exception('The post-commit case read did not match the committed review outcome.');
 				}
 			} catch (Throwable $reload_error) {
-				if (empty($params['dedicatedReviewRejection'])) {
+				if (!$dedicated_assessment_message) {
 					throw $reload_error;
 				}
 				error_log(
@@ -10561,7 +10926,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			try {
 				return $this->to_admission_case($application);
 			} catch (Throwable $identity_error) {
-				if (empty($params['dedicatedReviewRejection'])) {
+				if (!$dedicated_assessment_message) {
 					throw $identity_error;
 				}
 				error_log(
@@ -10576,6 +10941,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$user = $params['user'];
 			$application_id = (string) $params['applicationId'];
 			$message = trim((string) $params['message']);
+			$assessment_message_id = wp_generate_uuid4();
 			$existing = $this->get_authorized_application_base($application_id, $user);
 
 			if ('review-pending' !== $this->canonical_status_key((string) $existing['status'])) {
@@ -10588,14 +10954,28 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'draft' => array('reviewerDecision' => 'hold'),
 					'expectedUpdatedAt' => $params['expectedUpdatedAt'],
 					'user' => $user,
+					'dedicatedAssessmentMessage' => true,
+					'assessmentMessageKind' => 'pending',
+					'assessmentMessage' => $message,
+					'assessmentMessageId' => $assessment_message_id,
 				)
 			);
-			$authoritative = $this->get_detailed_application_record($application_id);
-			$delivery_result = $this->send_pending_review_message_notification(
-				$authoritative,
-				$user,
-				$message
+			$notification_application = array_merge(
+				$existing,
+				$application,
+				array(
+					'id' => $application_id,
+					'status' => 'review-pending',
+					'isTestData' => !empty($existing['isTestData']) ? 1 : 0,
+				)
 			);
+			$delivery_result = $this->send_pending_review_message_notification(
+				$notification_application,
+				$user,
+				$message,
+				$assessment_message_id
+			);
+			$application = $this->attach_assessment_message_history($application, $application_id, $user);
 
 			return array(
 				'application' => $application,
@@ -10622,6 +11002,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$user = $params['user'];
 			$application_id = (string) $params['applicationId'];
 			$reason = trim((string) $params['reason']);
+			$assessment_message_id = wp_generate_uuid4();
 			$existing = $this->get_authorized_application_base($application_id, $user);
 
 			if ('review-pending' !== $this->canonical_status_key((string) $existing['status'])) {
@@ -10636,6 +11017,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'user' => $user,
 					'suppressReviewRejectionNotification' => true,
 					'dedicatedReviewRejection' => true,
+					'assessmentMessageKind' => 'rejected',
+					'assessmentMessage' => $reason,
+					'assessmentMessageId' => $assessment_message_id,
 				)
 			);
 			if (
@@ -10658,8 +11042,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$notification_application,
 				$user,
 				$reason,
-				false
+				false,
+				$assessment_message_id
 			);
+			$application = $this->attach_assessment_message_history($application, $application_id, $user);
 
 			return array(
 				'application' => $application,

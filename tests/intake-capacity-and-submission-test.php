@@ -86,6 +86,10 @@ final class MC_Intake_Test_Wpdb {
 		return array('query' => (string) $query, 'args' => array_values($args));
 	}
 
+	public function esc_like($value) {
+		return addcslashes((string) $value, '_%\\');
+	}
+
 	private function unpack($prepared) {
 		return is_array($prepared)
 			? $prepared

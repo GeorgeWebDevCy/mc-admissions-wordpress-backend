@@ -102,6 +102,10 @@ final class MC_Pending_Message_Test_Wpdb {
 		);
 	}
 
+	public function esc_like($value) {
+		return addcslashes((string) $value, '_%\\');
+	}
+
 	private function unpack($prepared) {
 		return is_array($prepared)
 			? $prepared
@@ -347,6 +351,10 @@ function sanitize_text_field($value) {
 	return trim(strip_tags((string) $value));
 }
 
+function sanitize_key($value) {
+	return strtolower(preg_replace('/[^a-z0-9_\-]/', '', (string) $value));
+}
+
 function sanitize_textarea_field($value) {
 	return trim(strip_tags((string) $value));
 }
@@ -420,6 +428,12 @@ function pending_assert_contains($needle, $haystack, $message) {
 	}
 }
 
+function pending_assert_not_contains($needle, $haystack, $message) {
+	if (false !== strpos((string) $haystack, (string) $needle)) {
+		throw new RuntimeException($message . ' Unexpected ' . var_export($needle, true) . '.');
+	}
+}
+
 function pending_assert_throws_message($expected, $callback, $message) {
 	try {
 		$callback();
@@ -429,6 +443,27 @@ function pending_assert_throws_message($expected, $callback, $message) {
 	}
 
 	throw new RuntimeException($message . ' No exception was thrown.');
+}
+
+function pending_find_activity($title) {
+	foreach ($GLOBALS['wpdb']->activities as $activity) {
+		if (isset($activity['title']) && (string) $activity['title'] === (string) $title) {
+			return $activity;
+		}
+	}
+
+	return null;
+}
+
+
+function pending_find_communication($subject) {
+	foreach ($GLOBALS['wpdb']->communications as $communication) {
+		if (isset($communication['subject']) && (string) $communication['subject'] === (string) $subject) {
+			return $communication;
+		}
+	}
+
+	return null;
 }
 
 function pending_application(array $overrides = array()) {
@@ -570,6 +605,12 @@ $rejection_command = $reflection->getMethod('reject_review_application');
 $rejection_command->setAccessible(true);
 $can_assess = $reflection->getMethod('can_assess_admission_documents');
 $can_assess->setAccessible(true);
+$can_view_history = $reflection->getMethod('can_view_assessment_message_history');
+$can_view_history->setAccessible(true);
+$get_history = $reflection->getMethod('get_assessment_message_history');
+$get_history->setAccessible(true);
+$normalize_manual_communication = $reflection->getMethod('normalize_finance_communication_draft');
+$normalize_manual_communication->setAccessible(true);
 
 // The route must be an authenticated POST with a separate application-scoped callback.
 $plugin->register_rest_routes();
@@ -605,6 +646,103 @@ pending_assert_same(true, $can_assess->invoke($plugin, pending_internal_user(arr
 pending_assert_same(true, $can_assess->invoke($plugin, pending_internal_user(array('admissions-officer'))), 'Admissions Officers must be able to send pending-review messages.');
 pending_assert_same(false, $can_assess->invoke($plugin, pending_internal_user(array('finance-officer'))), 'Finance Officers must not use the admissions review action.');
 pending_assert_same(false, $can_assess->invoke($plugin, pending_internal_user(array('mc_agent'))), 'Agents must not send pending-review messages through the staff action.');
+pending_assert_same(true, $can_view_history->invoke($plugin, pending_internal_user(array('administrator'))), 'Administrators must see popup history.');
+pending_assert_same(true, $can_view_history->invoke($plugin, pending_internal_user(array('admissions-officer'))), 'Admissions Officers must see popup history.');
+pending_assert_same(true, $can_view_history->invoke($plugin, pending_internal_user(array('migration-officer'))), 'Migration Officers must see popup history.');
+pending_assert_same(false, $can_view_history->invoke($plugin, pending_internal_user(array('finance-officer'))), 'Finance Officers must not see assessment popup history.');
+pending_assert_same(false, $can_view_history->invoke($plugin, pending_internal_user(array('mc_agent'))), 'Agents must not see internal assessment popup history.');
+
+// Existing legacy email-audit rows remain readable as exact history, while
+// unrelated case communication is not exposed through this restricted view.
+reset_pending_case();
+$GLOBALS['wpdb']->communications = array(
+	array(
+		'id' => 'legacy-pending',
+		'applicationId' => 'app-pending-offline',
+		'direction' => 'outbound',
+		'channel' => 'email',
+		'subject' => 'Additional information required for Offline Student (MC-PENDING1)',
+		'detail' => "First line.\nSecond line.\nRecipient: Origin Consultant (consultant@example.invalid).\nEmail delivery: sent to 1 recipient(s).",
+		'actorName' => 'Admissions Officer',
+		'createdAt' => '2026-08-10 10:00:00',
+	),
+	array(
+		'id' => 'standard-rejected',
+		'applicationId' => 'app-pending-offline',
+		'direction' => 'internal',
+		'channel' => 'portal',
+		'subject' => '[Assessment message: rejected]',
+		'detail' => "Most recent exact reason.\nRecipient: this is staff-entered text.\nEmail delivery: this is also staff-entered text.",
+		'actorName' => 'Administrator',
+		'createdAt' => '2026-08-11 10:00:00',
+	),
+	array(
+		'id' => 'manual-legacy-subject-collision',
+		'applicationId' => 'app-pending-offline',
+		'direction' => 'outbound',
+		'channel' => 'email',
+		'subject' => 'Additional information required for a manually logged case',
+		'detail' => 'This ordinary manual message has no legacy delivery-audit suffix.',
+		'actorName' => 'Administrator',
+		'createdAt' => '2026-08-11 11:00:00',
+	),
+	array(
+		'id' => 'wrong-shape-standard-subject-collision',
+		'applicationId' => 'app-pending-offline',
+		'direction' => 'outbound',
+		'channel' => 'email',
+		'subject' => '[Assessment message: pending]',
+		'detail' => "A manual collision.\nRecipient: Someone.\nEmail delivery: logged only.",
+		'actorName' => 'Administrator',
+		'createdAt' => '2026-08-11 12:00:00',
+	),
+	array(
+		'id' => 'unrelated',
+		'applicationId' => 'app-pending-offline',
+		'direction' => 'internal',
+		'channel' => 'portal',
+		'subject' => 'General case note',
+		'detail' => 'Must not appear.',
+		'actorName' => 'Administrator',
+		'createdAt' => '2026-08-12 10:00:00',
+	),
+);
+$legacy_history = $get_history->invoke($plugin, 'app-pending-offline', pending_internal_user(array('migration-officer')));
+pending_assert_same(2, count($legacy_history), 'Migration history must include standardized and legacy assessment messages only.');
+pending_assert_same('rejected', $legacy_history[0]['kind'], 'History must be newest first.');
+pending_assert_same(
+	"Most recent exact reason.\nRecipient: this is staff-entered text.\nEmail delivery: this is also staff-entered text.",
+	$legacy_history[0]['message'],
+	'Standardized history must retain exact text even when staff type legacy-looking marker lines.'
+);
+pending_assert_same("First line.\nSecond line.", $legacy_history[1]['message'], 'Legacy history must strip recipient and delivery audit suffixes only.');
+pending_assert_same(array(), $get_history->invoke($plugin, 'app-pending-offline', pending_internal_user(array('finance-officer'))), 'Unauthorized roles must receive no history data.');
+
+foreach (
+	array(
+		'[Assessment message: pending]',
+		'[Assessment message: rejected] attempted manual suffix',
+		'Additional information required for a manually logged case',
+		'Application closed after review for a manually logged case',
+	) as $reserved_subject
+) {
+	pending_assert_throws_message(
+		'This communication subject is reserved for assessment history.',
+		function () use ($normalize_manual_communication, $plugin, $reserved_subject) {
+			$normalize_manual_communication->invoke(
+				$plugin,
+				array(
+					'direction' => 'internal',
+					'channel' => 'portal',
+					'subject' => $reserved_subject,
+					'detail' => 'A manual communication must not impersonate assessment history.',
+				),
+				false
+			);
+		},
+		'Reserved assessment subjects must be rejected for manual communications.'
+	);
+}
 
 // Handler validation rejects malformed input before session or database work.
 $response = $plugin->rest_send_pending_review_message(pending_request(array('message' => '  ', 'expectedUpdatedAt' => 'version')));
@@ -628,8 +766,8 @@ pending_assert_same(403, $response->get_status(), 'An agent must receive a permi
 pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A denied request must not call wp_mail.');
 pending_assert_same(0, count($GLOBALS['wpdb']->events), 'A denied request must not touch application data.');
 
-// Happy path: persist hold first, then send exactly the typed message to exactly
-// consultantEmail and record sent delivery in the communication audit.
+// Happy path: persist the hold and exact popup text in one transaction, then
+// send exactly that message to consultantEmail and record delivery separately.
 reset_pending_case();
 $typed_message = 'Please upload the corrected bank confirmation before we continue.';
 $response = $plugin->rest_send_pending_review_message(
@@ -662,35 +800,60 @@ pending_assert_same(array('consultant@example.invalid'), $mail['to'], 'The email
 pending_assert_same('Additional information required for Offline Student (MC-PENDING1)', $mail['subject'], 'The subject must identify the application.');
 pending_assert_contains($typed_message, $mail['message'], 'The email body must contain the exact typed message.');
 pending_assert_true(in_array('Reply-To: Offline User <staff@example.invalid>', $mail['headers'], true), 'The acting staff member must be Reply-To.');
-pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'A successful send must create one communication audit.');
-pending_assert_contains($typed_message, $GLOBALS['wpdb']->communications[0]['detail'], 'The audit must retain the distinct pending message.');
-pending_assert_contains('Recipient: Origin Consultant (consultant@example.invalid).', $GLOBALS['wpdb']->communications[0]['detail'], 'The audit must identify the exact consultant.');
-pending_assert_contains('Email delivery: sent to 1 recipient(s).', $GLOBALS['wpdb']->communications[0]['detail'], 'The audit must record sent delivery.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'A successful send must retain history plus a sanitized email-delivery audit row.');
+$pending_history_row = $GLOBALS['wpdb']->communications[0];
+pending_assert_same('internal', $pending_history_row['direction'], 'Assessment popup history must be internal, not an outbound communication item.');
+pending_assert_same('portal', $pending_history_row['channel'], 'Assessment popup history must use the portal channel.');
+pending_assert_same('[Assessment message: pending]', $pending_history_row['subject'], 'Pending history must use the bounded reserved marker as its entire subject.');
+pending_assert_true(strlen($pending_history_row['subject']) <= 191, 'Pending history subject must fit the database column independently of applicant name length.');
+pending_assert_same($typed_message, $pending_history_row['detail'], 'The history row must contain only the exact popup message.');
+$pending_delivery_communication = pending_find_communication('Pending assessment email delivery audit');
+pending_assert_true(null !== $pending_delivery_communication, 'The email result must be a separate communication visible in Email audit.');
+pending_assert_same('outbound', $pending_delivery_communication['direction'], 'The delivery audit communication must be outbound.');
+pending_assert_same('email', $pending_delivery_communication['channel'], 'The delivery audit communication must use the email channel.');
+pending_assert_contains('Recipient: Origin Consultant (consultant@example.invalid).', $pending_delivery_communication['detail'], 'The delivery communication must identify the consultant.');
+pending_assert_contains('Email delivery: sent to 1 recipient(s).', $pending_delivery_communication['detail'], 'The delivery communication must record successful delivery.');
+pending_assert_not_contains($typed_message, $pending_delivery_communication['detail'], 'The Email-audit row must never duplicate the restricted popup text.');
+pending_assert_same(1, count($response_data['application']['assessmentMessageHistory']), 'The returned case must expose the new history entry.');
+pending_assert_same($typed_message, $response_data['application']['assessmentMessageHistory'][0]['message'], 'The returned history must preserve the exact message.');
+pending_assert_same(array(), $response_data['application']['communications'], 'Restricted popup history must not duplicate into general case communications.');
+$pending_delivery_activity = pending_find_activity('Pending assessment email delivery audit');
+pending_assert_true(null !== $pending_delivery_activity, 'The delivery result must be recorded as a separate activity.');
+pending_assert_contains('Recipient: Origin Consultant (consultant@example.invalid).', $pending_delivery_activity['detail'], 'The delivery audit must identify the exact consultant.');
+pending_assert_contains('Email delivery: sent to 1 recipient(s).', $pending_delivery_activity['detail'], 'The delivery activity must record sent delivery.');
 $commit_index = array_search('query:COMMIT', $GLOBALS['wpdb']->events, true);
 $mail_index = array_search('mail:' . $mail['subject'], $GLOBALS['wpdb']->events, true);
 pending_assert_true(false !== $commit_index && false !== $mail_index && $commit_index < $mail_index, 'The review hold must commit before wp_mail is called.');
 
-// Audit-storage failures are visible without changing successful delivery into
-// a resendable command failure. A false communication insert still allows the
-// independent activity audit to be attempted.
+// Applicant names are unbounded user data, but communication subjects are
+// VARCHAR(191). History and delivery-audit subjects must therefore remain
+// machine-sized, and marker-looking lines typed by staff remain exact history.
+reset_pending_case(array('fullName' => str_repeat('Very Long Applicant Name ', 20)));
+$marker_message = "Please review both lines.\nRecipient: wording entered by staff.\nEmail delivery: wording entered by staff.";
+$long_name_result = invoke_pending_command($pending_command, '2026-08-11T10:00:00.000Z', $marker_message);
+pending_assert_same('hold', $GLOBALS['wpdb']->application['reviewerDecision'], 'A long applicant name must not prevent the Pending transition.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'Long-name delivery must retain history and sanitized audit.');
+pending_assert_same('[Assessment message: pending]', $GLOBALS['wpdb']->communications[0]['subject'], 'The history subject must not include the applicant name.');
+pending_assert_same($marker_message, $GLOBALS['wpdb']->communications[0]['detail'], 'Standardized history must retain staff-entered marker-looking lines exactly.');
+pending_assert_same('Pending assessment email delivery audit', $GLOBALS['wpdb']->communications[1]['subject'], 'The delivery audit must use a bounded machine subject.');
+pending_assert_true(strlen($GLOBALS['wpdb']->communications[1]['subject']) <= 191, 'The delivery audit subject must fit the database column.');
+pending_assert_not_contains($marker_message, $GLOBALS['wpdb']->communications[1]['detail'], 'The delivery audit must not copy restricted popup text.');
+pending_assert_same($marker_message, $long_name_result['application']['assessmentMessageHistory'][0]['message'], 'The returned long-name case must preserve the exact popup text.');
+
+// Popup history is part of the state transition. If its insert fails, the hold
+// rolls back and no email can be attempted.
 reset_pending_case();
 $GLOBALS['wpdb']->audit_insert_false_tables = array('mc_admission_communications');
-$false_audit_result = invoke_pending_command($pending_command, '2026-08-11T10:00:00.000Z', 'False audit insert test.');
-pending_assert_same(true, $false_audit_result['delivery']['ok'], 'A delivered message must remain delivered when an audit insert returns false.');
-pending_assert_same('hold', $GLOBALS['wpdb']->application['reviewerDecision'], 'An audit failure must not roll back the committed Pending decision.');
-pending_assert_same(1, count($GLOBALS['mc_pending_mail_calls']), 'An audit failure must not resend or suppress the already attempted email.');
-pending_assert_same(
-	array(
-		'ok' => false,
-		'skipped' => false,
-		'communicationRecorded' => false,
-		'activityRecorded' => true,
-		'error' => 'Communication audit could not be recorded.',
-	),
-	$false_audit_result['audit'],
-	'A false insert must be exposed as a partial audit failure.'
+pending_assert_throws_message(
+	'Unable to record the assessment message history.',
+	function () use ($pending_command) {
+		invoke_pending_command($pending_command, '2026-08-11T10:00:00.000Z', 'False history insert test.');
+	},
+	'A required history insert failure must abort the command.'
 );
-pending_assert_same(0, count($GLOBALS['wpdb']->communications), 'A false communication insert must not pretend that a communication row exists.');
+pending_assert_same('pending', $GLOBALS['wpdb']->application['reviewerDecision'], 'A required history failure must roll back the Pending decision.');
+pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A required history failure must not send email.');
+pending_assert_same(0, count($GLOBALS['wpdb']->communications), 'A rolled-back history insert must not remain stored.');
 
 // A thrown activity-audit write is also contained and reported after the
 // communication audit and delivered mail remain intact.
@@ -711,7 +874,9 @@ pending_assert_same(
 	$thrown_audit_result['audit'],
 	'A thrown insert must be exposed as a partial audit failure without leaking exception details.'
 );
-pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'The successful communication audit must survive a later activity-audit exception.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'The popup history and sanitized delivery communication must survive a later activity exception.');
+pending_assert_same('Thrown audit insert test.', $GLOBALS['wpdb']->communications[0]['detail'], 'A delivery-audit failure must not alter the exact popup history.');
+pending_assert_not_contains('Thrown audit insert test.', $GLOBALS['wpdb']->communications[1]['detail'], 'A delivery audit must not disclose the popup text when its peer activity insert fails.');
 
 // A non-review case is rejected before mutation or email.
 reset_pending_case(array('status' => 'offer-issued'));
@@ -750,17 +915,23 @@ foreach (
 	$result = invoke_pending_command($pending_command);
 	pending_assert_same(true, $result['delivery']['skipped'], 'An unsafe consultant destination must be reported as skipped.');
 	pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'The student must never receive a fallback email.');
-	pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'A skipped delivery must remain visible in the audit.');
-	pending_assert_contains('Email delivery skipped:', $GLOBALS['wpdb']->communications[0]['detail'], 'The audit must classify unsafe delivery as skipped.');
+	pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'A skipped delivery must preserve history plus its sanitized email-audit row.');
+	pending_assert_same('Please upload the corrected evidence.', $GLOBALS['wpdb']->communications[0]['detail'], 'A skipped delivery must not alter the exact popup message.');
+	pending_assert_not_contains('Please upload the corrected evidence.', $GLOBALS['wpdb']->communications[1]['detail'], 'A skipped delivery audit must not disclose the popup message.');
+	$skipped_activity = pending_find_activity('Pending assessment email delivery audit');
+	pending_assert_true(null !== $skipped_activity, 'A skipped delivery must remain visible in the delivery activity.');
+	pending_assert_contains('Email delivery skipped:', $skipped_activity['detail'], 'The delivery activity must classify unsafe delivery as skipped.');
 }
 
-// Test-data applications remain completely silent, including delivery-audit noise.
+// Test-data applications remain email-silent, while their popup history is still
+// durable because staff need the same review record during test workflows.
 reset_pending_case(array('isTestData' => 1));
 $test_result = invoke_pending_command($pending_command);
 pending_assert_same(true, $test_result['delivery']['skipped'], 'Test data must report a safe delivery skip.');
 pending_assert_same('Test-data applications do not send email.', $test_result['delivery']['error'], 'The safe-skip reason must be returned.');
 pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'Test data must never call wp_mail.');
-pending_assert_same(0, count($GLOBALS['wpdb']->communications), 'Test data must not create email delivery audit noise.');
+pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'Test data must retain the exact popup history.');
+pending_assert_same('Please upload the corrected evidence.', $GLOBALS['wpdb']->communications[0]['detail'], 'Test history must retain the exact popup message.');
 
 // A transport refusal is failed (not skipped) and audited without undoing the
 // already committed review hold.
@@ -773,22 +944,69 @@ pending_assert_same(0, $failed_result['delivery']['sentCount'], 'A refused mail 
 pending_assert_same(1, $failed_result['delivery']['failedCount'], 'A refused mail must report one failed consultant.');
 pending_assert_same('WordPress did not accept the message.', $failed_result['delivery']['error'], 'The transport failure must be actionable.');
 pending_assert_same('hold', $GLOBALS['wpdb']->application['reviewerDecision'], 'Mail failure must not roll back the committed Pending decision.');
-pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'A failed send must create one audit.');
-pending_assert_contains('Email delivery failed:', $GLOBALS['wpdb']->communications[0]['detail'], 'The audit must classify failed delivery.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'A failed send must retain history plus a sanitized email-audit row.');
+pending_assert_same('Please upload the corrected evidence.', $GLOBALS['wpdb']->communications[0]['detail'], 'A transport failure must not alter the popup message.');
+pending_assert_not_contains('Please upload the corrected evidence.', $GLOBALS['wpdb']->communications[1]['detail'], 'A failed delivery audit must not disclose the popup message.');
+$failed_activity = pending_find_activity('Pending assessment email delivery audit');
+pending_assert_true(null !== $failed_activity, 'A failed delivery must create a delivery activity.');
+pending_assert_contains('Email delivery failed:', $failed_activity['detail'], 'The delivery activity must classify failed delivery.');
+
+// A committed Pending decision must not become retryable when post-commit case
+// hydration fails. The exact history is already durable, and email is attempted
+// once from the committed fallback snapshot.
+reset_pending_case();
+$GLOBALS['wpdb']->fail_rich_read_after_commit = true;
+$pending_rich_read_response = $plugin->rest_send_pending_review_message(
+	pending_request(array('message' => 'Pending despite the rich reload failure.', 'expectedUpdatedAt' => '2026-08-11T10:00:00.000Z'))
+);
+pending_assert_same(200, $pending_rich_read_response->get_status(), 'A committed Pending action must survive a post-commit rich case read failure.');
+$pending_rich_read_data = $pending_rich_read_response->get_data();
+pending_assert_same('review-pending', $pending_rich_read_data['application']['stageKey'], 'The rich-read fallback must expose the committed review stage.');
+pending_assert_same('hold', $pending_rich_read_data['application']['reviewerDecision'], 'The rich-read fallback must expose the committed hold decision.');
+pending_assert_same(1, count($GLOBALS['mc_pending_mail_calls']), 'A rich-read failure must neither duplicate nor suppress the Pending email.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'A rich-read failure must retain history and sanitized delivery audit.');
+
+reset_pending_case();
+$GLOBALS['wpdb']->fail_authoritative_read_after_commit = true;
+$pending_authoritative_read_response = $plugin->rest_send_pending_review_message(
+	pending_request(array('message' => 'Pending despite the authoritative reread failure.', 'expectedUpdatedAt' => '2026-08-11T10:00:00.000Z'))
+);
+pending_assert_same(200, $pending_authoritative_read_response->get_status(), 'A committed Pending action must survive an authoritative post-commit reread failure.');
+$pending_authoritative_read_data = $pending_authoritative_read_response->get_data();
+pending_assert_same('review-pending', $pending_authoritative_read_data['application']['stageKey'], 'The authoritative fallback must expose the committed review stage.');
+pending_assert_same('hold', $pending_authoritative_read_data['application']['reviewerDecision'], 'The authoritative fallback must expose the committed hold decision.');
+pending_assert_same(1, count($GLOBALS['mc_pending_mail_calls']), 'An authoritative reread failure must neither duplicate nor suppress the Pending email.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'An authoritative reread failure must retain history and sanitized delivery audit.');
+
+reset_pending_case();
+$GLOBALS['mc_pending_identity_exception'] = true;
+$pending_identity_response = $plugin->rest_send_pending_review_message(
+	pending_request(array('message' => 'Pending while owner lookup is unavailable.', 'expectedUpdatedAt' => '2026-08-11T10:00:00.000Z'))
+);
+pending_assert_same(200, $pending_identity_response->get_status(), 'An owner lookup failure must not turn a committed Pending action into a retryable response.');
+$pending_identity_data = $pending_identity_response->get_data();
+pending_assert_same('review-pending', $pending_identity_data['application']['stageKey'], 'The identity fallback must retain the committed review stage.');
+pending_assert_same(false, $pending_identity_data['delivery']['ok'], 'Owner lookup failure must not claim Pending email success.');
+pending_assert_same(false, $pending_identity_data['delivery']['skipped'], 'Owner lookup failure is an audited delivery failure, not a safe skip.');
+pending_assert_contains('originating agency identity could not be resolved', $pending_identity_data['delivery']['error'], 'The Pending delivery result must explain the owner lookup failure.');
+pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'Pending email must not be attempted when authoritative owner lookup throws.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'Owner lookup failure must retain history and its sanitized failed-delivery audit.');
+pending_assert_same('Pending while owner lookup is unavailable.', $GLOBALS['wpdb']->communications[0]['detail'], 'Owner lookup failure must not alter the exact Pending message.');
+pending_assert_not_contains('Pending while owner lookup is unavailable.', $GLOBALS['wpdb']->communications[1]['detail'], 'Owner lookup failure audit must not disclose the popup message.');
 
 // Guard the command ordering structurally as well as through the event log.
 $method = $reflection->getMethod('send_pending_review_message');
 $lines = file($method->getFileName());
 $source = implode('', array_slice($lines, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
 pending_assert_contains("'review-pending' !== \$this->canonical_status_key", $source, 'The command must enforce authoritative review-pending state.');
+pending_assert_contains("'assessmentMessageKind' => 'pending'", $source, 'The Pending transition must persist a classified history entry.');
+pending_assert_contains("'assessmentMessage' => \$message", $source, 'The Pending transition must persist the exact popup message.');
+pending_assert_contains("'dedicatedAssessmentMessage' => true", $source, 'The Pending command must enable committed-state fallback handling.');
 pending_assert_true(
 	strpos($source, '$this->update_admission_application_operations(') < strpos($source, '$this->send_pending_review_message_notification('),
 	'The command must save the Pending decision before attempting email.'
 );
-pending_assert_true(
-	strpos($source, '$this->get_detailed_application_record(') < strpos($source, '$this->send_pending_review_message_notification('),
-	'The email must use an authoritative post-save application record.'
-);
+pending_assert_not_contains('$this->get_detailed_application_record(', $source, 'The Pending command must not add a second fragile post-commit reload before email.');
 
 // Rejection uses its own required reason command. The reason is not copied into
 // assessment comments, document remarks, or the generic workflow note.
@@ -842,10 +1060,21 @@ $rejection_mail = $GLOBALS['mc_pending_mail_calls'][0];
 pending_assert_same(array('consultant@example.invalid'), $rejection_mail['to'], 'The rejection email must target the originating consultant only.');
 pending_assert_same('Application closed after review for Offline Student (MC-PENDING1)', $rejection_mail['subject'], 'The rejection subject must identify the application.');
 pending_assert_contains($typed_reason, $rejection_mail['message'], 'The rejection email must contain the exact typed reason.');
-pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'The rejection delivery must create one separate communication audit.');
-pending_assert_same('app-pending-offline', $GLOBALS['wpdb']->communications[0]['applicationId'], 'The rejection audit must use the database application id, not the public reference code.');
-pending_assert_contains($typed_reason, $GLOBALS['wpdb']->communications[0]['detail'], 'The rejection audit must retain the distinct reason.');
-pending_assert_contains('Email delivery: sent to 1 recipient(s).', $GLOBALS['wpdb']->communications[0]['detail'], 'The rejection audit must record successful delivery.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'The rejection must create durable history plus a sanitized email-delivery audit.');
+pending_assert_same('app-pending-offline', $GLOBALS['wpdb']->communications[0]['applicationId'], 'The rejection history must use the database application id, not the public reference code.');
+pending_assert_same($typed_reason, $GLOBALS['wpdb']->communications[0]['detail'], 'The rejection history must retain only the exact distinct reason.');
+pending_assert_same('[Assessment message: rejected]', $GLOBALS['wpdb']->communications[0]['subject'], 'The rejection history must use the bounded reserved marker as its entire subject.');
+$rejection_delivery_communication = pending_find_communication('Rejected assessment email delivery audit');
+pending_assert_true(null !== $rejection_delivery_communication, 'The rejected-email result must be separately visible in Email audit.');
+pending_assert_same('outbound', $rejection_delivery_communication['direction'], 'The rejected delivery audit must be outbound.');
+pending_assert_same('email', $rejection_delivery_communication['channel'], 'The rejected delivery audit must use the email channel.');
+pending_assert_contains('Email delivery: sent to 1 recipient(s).', $rejection_delivery_communication['detail'], 'The rejected delivery communication must record successful delivery.');
+pending_assert_not_contains($typed_reason, $rejection_delivery_communication['detail'], 'The rejected Email-audit row must never disclose the restricted reason.');
+pending_assert_same('rejected', $rejection_data['application']['assessmentMessageHistory'][0]['kind'], 'The returned case must expose a rejected history entry.');
+pending_assert_same($typed_reason, $rejection_data['application']['assessmentMessageHistory'][0]['message'], 'The returned history must expose the exact rejection reason.');
+$rejection_delivery_activity = pending_find_activity('Rejected assessment email delivery audit');
+pending_assert_true(null !== $rejection_delivery_activity, 'The rejection delivery must have a separate activity audit.');
+pending_assert_contains('Email delivery: sent to 1 recipient(s).', $rejection_delivery_activity['detail'], 'The rejection delivery activity must record success.');
 $rejection_commit_index = array_search('query:COMMIT', $GLOBALS['wpdb']->events, true);
 $rejection_mail_index = array_search('mail:' . $rejection_mail['subject'], $GLOBALS['wpdb']->events, true);
 pending_assert_true(
@@ -865,7 +1094,7 @@ $rich_read_data = $rich_read_response->get_data();
 pending_assert_same('rejected', $rich_read_data['application']['stageKey'], 'The fallback case must expose the committed rejected stage.');
 pending_assert_same('rejected', $rich_read_data['application']['reviewerDecision'], 'The fallback case must expose the committed rejected decision.');
 pending_assert_same(1, count($GLOBALS['mc_pending_mail_calls']), 'A rich-read failure must not duplicate or suppress the rejection email.');
-pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'A rich-read failure must retain one delivery audit.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'A rich-read failure must retain rejection history and sanitized delivery audit.');
 
 // A post-commit authoritative review reread failure must also return the
 // committed result instead of inviting the operator to submit the rejection
@@ -880,7 +1109,7 @@ $authoritative_read_data = $authoritative_read_response->get_data();
 pending_assert_same('rejected', $authoritative_read_data['application']['stageKey'], 'The authoritative reread fallback must expose the committed rejected stage.');
 pending_assert_same('rejected', $authoritative_read_data['application']['reviewerDecision'], 'The authoritative reread fallback must expose the committed rejected decision.');
 pending_assert_same(1, count($GLOBALS['mc_pending_mail_calls']), 'An authoritative reread failure must not duplicate or suppress the rejection email.');
-pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'An authoritative reread failure must retain one delivery audit.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'An authoritative reread failure must retain rejection history and sanitized delivery audit.');
 
 // An exceptional authoritative owner lookup after commit is a delivery failure,
 // not a mutation failure. It must be audited while the response remains successful.
@@ -896,8 +1125,12 @@ pending_assert_same(false, $identity_data['delivery']['ok'], 'Owner lookup failu
 pending_assert_same(false, $identity_data['delivery']['skipped'], 'Owner lookup failure is an audited delivery failure, not a safe skip.');
 pending_assert_contains('originating agency identity could not be resolved', $identity_data['delivery']['error'], 'The delivery result must explain the owner lookup failure.');
 pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'No email may be attempted without an authoritative owner identity.');
-pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'Owner lookup failure must create one separate delivery audit.');
-pending_assert_contains('Email delivery failed:', $GLOBALS['wpdb']->communications[0]['detail'], 'The owner lookup audit must classify delivery as failed.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'Owner lookup failure must retain rejection history and sanitized failed-delivery audit.');
+pending_assert_same('Rejected while owner lookup is unavailable.', $GLOBALS['wpdb']->communications[0]['detail'], 'Owner lookup failure must not alter the exact rejection reason.');
+pending_assert_not_contains('Rejected while owner lookup is unavailable.', $GLOBALS['wpdb']->communications[1]['detail'], 'Owner lookup audit must not disclose the rejected reason.');
+$identity_delivery_activity = pending_find_activity('Rejected assessment email delivery audit');
+pending_assert_true(null !== $identity_delivery_activity, 'Owner lookup failure must create a separate delivery activity.');
+pending_assert_contains('Email delivery failed:', $identity_delivery_activity['detail'], 'The owner lookup delivery activity must classify delivery as failed.');
 
 // A stale rejection rolls back without email or delivery audit.
 reset_pending_case();
@@ -919,17 +1152,22 @@ pending_assert_same(false, $failed_rejection['delivery']['ok'], 'A refused rejec
 pending_assert_same(false, $failed_rejection['delivery']['skipped'], 'A refused rejection email is a failure, not a skip.');
 pending_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'Mail failure must not roll back the committed rejection.');
 pending_assert_same('rejected', $GLOBALS['wpdb']->application['reviewerDecision'], 'Mail failure must not roll back the rejected decision.');
-pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'A failed rejection email must remain visible in the audit.');
-pending_assert_contains('Email delivery failed:', $GLOBALS['wpdb']->communications[0]['detail'], 'The rejection audit must classify failed delivery.');
+pending_assert_same(2, count($GLOBALS['wpdb']->communications), 'A failed rejection email must retain history and sanitized failed-delivery audit.');
+pending_assert_same('The entry requirements were not met.', $GLOBALS['wpdb']->communications[0]['detail'], 'A mail failure must not alter the exact rejection reason.');
+pending_assert_not_contains('The entry requirements were not met.', $GLOBALS['wpdb']->communications[1]['detail'], 'A failed rejection delivery audit must not disclose the reason.');
+$failed_rejection_activity = pending_find_activity('Rejected assessment email delivery audit');
+pending_assert_true(null !== $failed_rejection_activity, 'A failed rejection email must create a delivery activity.');
+pending_assert_contains('Email delivery failed:', $failed_rejection_activity['detail'], 'The rejection delivery activity must classify failed delivery.');
 
-// Test-data rejection changes state but remains completely silent.
+// Test-data rejection changes state without email but still retains popup history.
 reset_pending_case(array('isTestData' => 1));
 $test_rejection = invoke_rejection_command($rejection_command);
 pending_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'Test data may exercise the offline rejection state transition.');
 pending_assert_same(true, $test_rejection['delivery']['skipped'], 'Test-data rejection delivery must be safely skipped.');
 pending_assert_same('Test-data applications do not send email.', $test_rejection['delivery']['error'], 'The test-data skip reason must be explicit.');
 pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'Test-data rejection must never call wp_mail.');
-pending_assert_same(0, count($GLOBALS['wpdb']->communications), 'Test-data rejection must not create email-delivery audit noise.');
+pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'Test-data rejection must retain the popup history.');
+pending_assert_same('The entry requirements were not met.', $GLOBALS['wpdb']->communications[0]['detail'], 'Test-data history must retain the exact rejection reason.');
 
 // Wrong-stage rejection fails before a transaction or email.
 reset_pending_case(array('status' => 'offer-issued'));
@@ -949,6 +1187,8 @@ $rejection_source = implode('', array_slice($rejection_lines, $rejection_method-
 pending_assert_contains("'draft' => array('reviewerDecision' => 'rejected')", $rejection_source, 'The rejection command must change only the review decision.');
 pending_assert_contains("'suppressReviewRejectionNotification' => true", $rejection_source, 'The dedicated reason must replace the generic rejection email.');
 pending_assert_contains("'dedicatedReviewRejection' => true", $rejection_source, 'Only the dedicated rejection command may authorize the rejected decision transition.');
+pending_assert_contains("'assessmentMessageKind' => 'rejected'", $rejection_source, 'The rejection transition must persist a classified history entry.');
+pending_assert_contains("'assessmentMessage' => \$reason", $rejection_source, 'The rejection transition must persist the exact popup reason.');
 pending_assert_contains("\$reason,\n\t\t\t\tfalse", $rejection_source, 'Each newly committed rejection must send its current reason even when an older rejection audit exists.');
 pending_assert_true(
 	strpos($rejection_source, '$this->update_admission_application_operations(') < strpos($rejection_source, '$this->send_review_rejection_notification('),
