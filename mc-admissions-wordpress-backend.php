@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.63
+ * Version: 0.2.64
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -40,6 +40,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const RELEASE_NOTIFICATION_LOCK_PREFIX = 'mc_admissions_release_';
 		const AGENCY_IDENTITY_BACKFILL_HOOK = 'mc_admissions_agency_identity_backfill';
 		const AGENCY_IDENTITY_BACKFILL_LOCK = 'mc_admissions_agency_identity_backfill_lock';
+		const MIGRATION_CASE_SCHEMA_VERSION = '0.2.64';
 		const INTAKE_CAPACITY_SCHEMA_VERSION = '0.2.62';
 		const ASSESSMENT_MESSAGE_PENDING_SUBJECT_PREFIX = '[Assessment message: pending]';
 		const ASSESSMENT_MESSAGE_REJECTED_SUBJECT_PREFIX = '[Assessment message: rejected]';
@@ -219,6 +220,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function boot() {
 			$this->ensure_roles();
 			$this->ensure_application_test_data_schema();
+			$this->ensure_migration_case_columns();
 			$this->ensure_immigration_insurance_columns();
 			$this->ensure_offer_detail_columns();
 			$this->ensure_case_detail_columns();
@@ -775,6 +777,39 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			update_option('mc_admissions_resource_index_version', '1', false);
 		}
 
+		private function ensure_migration_case_columns() {
+			global $wpdb;
+
+			if (self::MIGRATION_CASE_SCHEMA_VERSION === get_option('mc_admissions_migration_case_schema_version')) {
+				return;
+			}
+
+			// CREATE TABLE IF NOT EXISTS does not add columns to an installed table,
+			// and WordPress does not rerun the activation hook during plugin updates.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			if ($this->migration_cases_table !== $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $this->migration_cases_table))) {
+				return;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$expiry_column = $wpdb->get_var("SHOW COLUMNS FROM {$this->migration_cases_table} LIKE 'entryPermitExpiryDate'");
+			if (!$expiry_column) {
+				// The column name and definition are internal constants.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$added = $wpdb->query("ALTER TABLE {$this->migration_cases_table} ADD COLUMN entryPermitExpiryDate VARCHAR(191) NULL AFTER decisionDate");
+				if (false === $added) {
+					return;
+				}
+			}
+
+			// Record the schema version only after the database confirms the column.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$expiry_column = $wpdb->get_var("SHOW COLUMNS FROM {$this->migration_cases_table} LIKE 'entryPermitExpiryDate'");
+			if ($expiry_column) {
+				update_option('mc_admissions_migration_case_schema_version', self::MIGRATION_CASE_SCHEMA_VERSION, false);
+			}
+		}
+
 		private function ensure_immigration_insurance_columns() {
 			global $wpdb;
 
@@ -1230,6 +1265,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					paymentReference VARCHAR(191) NULL,
 					paymentDate VARCHAR(191) NULL,
 					decisionDate VARCHAR(191) NULL,
+					entryPermitExpiryDate VARCHAR(191) NULL,
 					permitReference VARCHAR(191) NULL,
 					note TEXT NULL,
 					recordedByName VARCHAR(191) NOT NULL,
@@ -6567,6 +6603,32 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return $value;
 		}
 
+		private function normalize_optional_iso_date($value, $label) {
+			if (null === $value) {
+				return null;
+			}
+			if (!is_string($value)) {
+				throw new Exception($label . ' must use YYYY-MM-DD.');
+			}
+
+			$value = trim($value);
+			if ('' === $value) {
+				return null;
+			}
+
+			$date = DateTimeImmutable::createFromFormat('!Y-m-d', $value, new DateTimeZone('UTC'));
+			$errors = DateTimeImmutable::getLastErrors();
+			if (
+				false === $date
+				|| (is_array($errors) && (!empty($errors['warning_count']) || !empty($errors['error_count'])))
+				|| $date->format('Y-m-d') !== $value
+			) {
+				throw new Exception($label . ' must use YYYY-MM-DD.');
+			}
+
+			return $value;
+		}
+
 		private function normalize_application_intake_draft($draft, $strict = false) {
 			$draft = (array) $draft;
 			$draft['programme'] = $this->normalize_programme_code(isset($draft['programme']) ? $draft['programme'] : '', $strict);
@@ -7210,6 +7272,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$refund_status_sql = "'none'";
 			$refund_amount_sql = 'NULL';
 			$refund_currency_sql = "'EUR'";
+			$permit_expiry_sql = self::MIGRATION_CASE_SCHEMA_VERSION === get_option('mc_admissions_migration_case_schema_version')
+				? 'migration.entryPermitExpiryDate'
+				: 'NULL';
 
 			if (
 				$this->commission_records_table ===
@@ -7244,6 +7309,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					migration.paymentReference AS permitPaymentReference,
 					migration.paymentDate AS permitPaymentDate,
 					migration.decisionDate AS permitDecisionDate,
+					{$permit_expiry_sql} AS permitExpiryDate,
 					migration.permitReference AS permitReference,
 					{$commission_status_sql} AS commissionStatus,
 					{$commission_amount_sql} AS commissionAmount,
@@ -7321,6 +7387,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'permitPaymentReference' => !empty($application['permitPaymentReference']) ? $application['permitPaymentReference'] : null,
 				'permitPaymentDate' => !empty($application['permitPaymentDate']) ? $application['permitPaymentDate'] : null,
 				'permitDecisionDate' => !empty($application['permitDecisionDate']) ? $application['permitDecisionDate'] : null,
+				'permitExpiryDate' => !empty($application['permitExpiryDate'])
+					? $application['permitExpiryDate']
+					: (!empty($application['migrationCase']['entryPermitExpiryDate'])
+						? $application['migrationCase']['entryPermitExpiryDate']
+						: null),
 				'permitReference' => !empty($application['permitReference']) ? $application['permitReference'] : null,
 				'arrivalStatus' => isset($application['arrivalStatus']) ? $application['arrivalStatus'] : 'planning',
 				'enrollmentStatus' => isset($application['enrollmentStatus']) ? $application['enrollmentStatus'] : 'pending',
@@ -8712,6 +8783,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'paymentReference' => !empty($migration_case['paymentReference']) ? (string) $migration_case['paymentReference'] : null,
 				'paymentDate' => !empty($migration_case['paymentDate']) ? (string) $migration_case['paymentDate'] : null,
 				'decisionDate' => !empty($migration_case['decisionDate']) ? (string) $migration_case['decisionDate'] : null,
+				'entryPermitExpiryDate' => !empty($migration_case['entryPermitExpiryDate']) ? (string) $migration_case['entryPermitExpiryDate'] : null,
 				'permitReference' => !empty($migration_case['permitReference']) ? (string) $migration_case['permitReference'] : null,
 				'note' => !empty($migration_case['note']) ? (string) $migration_case['note'] : null,
 				'recordedByName' => (string) $migration_case['recordedByName'],
@@ -12030,6 +12102,32 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return in_array($error->getMessage(), $permission_errors, true) ? 403 : 400;
 		}
 
+		private function migration_case_update_data($draft, $user) {
+			$draft = (array) $draft;
+			$data = array(
+				'packPreparedDate' => isset($draft['packPreparedDate']) ? sanitize_text_field($draft['packPreparedDate']) : null,
+				'packSubmittedDate' => isset($draft['packSubmittedDate']) ? sanitize_text_field($draft['packSubmittedDate']) : null,
+				'paymentReference' => isset($draft['paymentReference']) ? sanitize_text_field($draft['paymentReference']) : null,
+				'paymentDate' => isset($draft['paymentDate']) ? sanitize_text_field($draft['paymentDate']) : null,
+				'decisionDate' => isset($draft['decisionDate']) ? sanitize_text_field($draft['decisionDate']) : null,
+				'permitReference' => isset($draft['permitReference']) ? sanitize_text_field($draft['permitReference']) : null,
+				'note' => isset($draft['note']) ? sanitize_textarea_field($draft['note']) : null,
+				'recordedByName' => $user['name'],
+				'updatedAt' => current_time('mysql', true),
+			);
+
+			// Older app versions do not send this key. Omitting it from the SQL
+			// update preserves any expiry date saved by a newer client.
+			if (array_key_exists('entryPermitExpiryDate', $draft)) {
+				$data['entryPermitExpiryDate'] = $this->normalize_optional_iso_date(
+					$draft['entryPermitExpiryDate'],
+					'Entry permit expiry date'
+				);
+			}
+
+			return $data;
+		}
+
 		public function rest_get_migration_case(WP_REST_Request $request) {
 			global $wpdb;
 			try {
@@ -12056,17 +12154,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				}
 				$application_id = sanitize_text_field($request['application_id']);
 				$this->get_authorized_application_base($application_id, $user);
-				$data = array(
-					'packPreparedDate' => isset($draft['packPreparedDate']) ? sanitize_text_field($draft['packPreparedDate']) : null,
-					'packSubmittedDate' => isset($draft['packSubmittedDate']) ? sanitize_text_field($draft['packSubmittedDate']) : null,
-					'paymentReference' => isset($draft['paymentReference']) ? sanitize_text_field($draft['paymentReference']) : null,
-					'paymentDate' => isset($draft['paymentDate']) ? sanitize_text_field($draft['paymentDate']) : null,
-					'decisionDate' => isset($draft['decisionDate']) ? sanitize_text_field($draft['decisionDate']) : null,
-					'permitReference' => isset($draft['permitReference']) ? sanitize_text_field($draft['permitReference']) : null,
-					'note' => isset($draft['note']) ? sanitize_textarea_field($draft['note']) : null,
-					'recordedByName' => $user['name'],
-					'updatedAt' => current_time('mysql', true),
-				);
+				$data = $this->migration_case_update_data($draft, $user);
 				$this->upsert_case_record_and_touch_application(
 					$this->migration_cases_table,
 					$application_id,

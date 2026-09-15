@@ -209,6 +209,7 @@ function get_option($key, $fallback = false) {
 		'mc_admissions_notification_activity_schema_version' => '1',
 		'mc_admissions_resource_index_version' => '1',
 		'mc_admissions_schema_version' => '0.2.14',
+		'mc_admissions_migration_case_schema_version' => '0.2.64',
 		'mc_admissions_offer_detail_schema_version' => '0.2.38',
 		'mc_admissions_case_detail_schema_version' => '0.2.45',
 		'mc_admissions_document_assessment_schema_version' => '1',
@@ -666,7 +667,7 @@ release_assert_not_contains('current_session_user', $release_source, 'The releas
 release_assert_not_contains('wp_remote_', $release_source, 'The release endpoint must not contact GitHub or any external service.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-release_assert_contains('Version: 0.2.63', $plugin_source, 'The plugin header must advertise version 0.2.63.');
+release_assert_contains('Version: 0.2.64', $plugin_source, 'The plugin header must advertise version 0.2.64.');
 release_assert_contains('name="release_notification_secret"', $plugin_source, 'Settings must expose the release notification password field.');
 release_assert_contains('type="password"', $plugin_source, 'The release notification setting must use a password input.');
 release_assert_same(0, $GLOBALS['mc_release_network_calls'], 'The complete offline suite must never contact the network.');
