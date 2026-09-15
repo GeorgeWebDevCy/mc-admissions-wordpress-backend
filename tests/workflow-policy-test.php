@@ -133,6 +133,14 @@ function register_activation_hook(...$args) {
 	return true;
 }
 
+function plugin_basename($file) {
+	return 'mc-admissions-wordpress-backend/mc-admissions-wordpress-backend.php';
+}
+
+function trailingslashit($path) {
+	return rtrim((string) $path, '/\\') . '/';
+}
+
 function is_email($email) {
 	return false !== filter_var((string) $email, FILTER_VALIDATE_EMAIL);
 }
@@ -669,7 +677,7 @@ assert_same(409, $mutation_error_status->invoke($plugin, new Exception(MC_Admiss
 assert_same(400, $mutation_error_status->invoke($plugin, new Exception('Other write failure.')), 'Non-stale write errors should remain HTTP 400.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-assert_string_contains(' * Version: 0.2.64', $plugin_source, 'The plugin release header must be bumped for updater detection.');
+assert_string_contains(' * Version: 0.2.65', $plugin_source, 'The plugin release header must be bumped for updater detection.');
 assert_string_contains('$this->ensure_migration_case_columns();', $plugin_source, 'The migration schema upgrader must run during plugin boot.');
 assert_string_contains("? 'migration.entryPermitExpiryDate'", $plugin_source, 'The board query must select the flattened permit expiry date after schema verification.');
 assert_string_contains("\t\t\t\t: 'NULL';", $plugin_source, 'The board query must safely return a null expiry when the schema upgrade is unavailable.');
@@ -708,6 +716,90 @@ assert_same(
 	count($successful_schema_db->events),
 	'The migration upgrader must check the table, check the column, alter it, and verify it.'
 );
+
+$updater_root = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'mc-admissions-updater-' . bin2hex(random_bytes(8));
+$canonical_package = $updater_root . DIRECTORY_SEPARATOR . 'mc-admissions-wordpress-backend';
+if (!mkdir($canonical_package, 0777, true) && !is_dir($canonical_package)) {
+	throw new RuntimeException('Could not create the updater regression fixture.');
+}
+$updater_marker = $canonical_package . DIRECTORY_SEPARATOR . 'mc-admissions-wordpress-backend.php';
+try {
+	file_put_contents($updater_marker, 'updater-regression-marker');
+	$updater_remote_source = trailingslashit(str_replace('\\', '/', $updater_root));
+	$canonical_source = trailingslashit(str_replace('\\', '/', $canonical_package));
+	$puc_corrected_source = $updater_remote_source . 'mc-admissions-wordpress-backend/';
+	$unscoped_source = rtrim($canonical_source, '/\\');
+	assert_same(
+		$unscoped_source,
+		$plugin->normalize_update_package_paths($unscoped_source, $updater_remote_source, null, null),
+		'Updater source normalization must leave unscoped filter calls byte-for-byte unchanged.'
+	);
+	assert_same(
+		$unscoped_source,
+		$plugin->normalize_update_package_paths(
+			$unscoped_source,
+			$updater_remote_source,
+			null,
+			array(
+				'action' => 'update',
+				'plugin' => 'another-plugin/another-plugin.php',
+			)
+		),
+		'Updater source normalization must not alter another plugin package.'
+	);
+	assert_same(
+		$unscoped_source,
+		$plugin->normalize_update_package_paths(
+			$unscoped_source,
+			$updater_remote_source,
+			null,
+			array(
+				'action' => 'install',
+				'plugin' => 'mc-admissions-wordpress-backend/mc-admissions-wordpress-backend.php',
+			)
+		),
+		'Updater source normalization must not alter manual plugin-install packages.'
+	);
+	$normalized_source = $plugin->normalize_update_package_paths(
+		$canonical_source,
+		$updater_remote_source,
+		null,
+		array(
+			'action' => 'update',
+			'plugin' => 'mc-admissions-wordpress-backend/mc-admissions-wordpress-backend.php',
+		)
+	);
+	assert_same(
+		$puc_corrected_source,
+		$normalized_source,
+		'Canonical updater sources must exactly match PUC, including the trailing slash, to avoid a self-rename.'
+	);
+	assert_same(
+		$canonical_source,
+		$plugin->normalize_update_package_paths(
+			$canonical_source,
+			$updater_remote_source,
+			null,
+			array('plugin' => 'mc-admissions-wordpress-backend/mc-admissions-wordpress-backend.php')
+		),
+		'Bulk per-plugin update hook data must retain the canonical trailing slash.'
+	);
+	assert_same(
+		'updater-regression-marker',
+		file_get_contents($updater_marker),
+		'Normalizing a canonical updater source must leave the extracted plugin files intact.'
+	);
+} finally {
+	if (is_file($updater_marker)) {
+		unlink($updater_marker);
+	}
+	if (is_dir($canonical_package)) {
+		rmdir($canonical_package);
+	}
+	if (is_dir($updater_root)) {
+		rmdir($updater_root);
+	}
+}
 
 $pack_expectations = array(
 	'prepayment-pending' => 'intake',

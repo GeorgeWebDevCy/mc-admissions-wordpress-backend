@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.64
+ * Version: 0.2.65
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -1379,17 +1379,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function normalize_update_package_paths($source, $remote_source = null, $upgrader = null, $hook_extra = null) {
 			// This filter is global. Never alter packages uploaded through
 			// Plugins > Add New or packages belonging to another plugin.
-			if (is_array($hook_extra)) {
-				if (isset($hook_extra['action']) && 'install' === $hook_extra['action']) {
-					return $source;
-				}
-
-				if (
-					isset($hook_extra['plugin'])
-					&& plugin_basename(__FILE__) !== $hook_extra['plugin']
-				) {
-					return $source;
-				}
+			if (
+				!is_array($hook_extra)
+				|| !isset($hook_extra['plugin'])
+				|| plugin_basename(__FILE__) !== $hook_extra['plugin']
+				|| (isset($hook_extra['action']) && 'install' === $hook_extra['action'])
+			) {
+				return $source;
 			}
 
 			if (!is_string($source) || !is_dir($source)) {
@@ -1443,18 +1439,21 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$installed_directory = dirname(plugin_basename(__FILE__));
 			if ('.' === $installed_directory || '' === $installed_directory) {
-				return $package_root;
+				return trailingslashit($package_root);
 			}
 
 			if (basename($package_root) === $installed_directory) {
-				return $package_root;
+				// PUC compares this value to its canonical source with strict
+				// string equality. Preserve the trailing slash so it does not try
+				// to move an already-correct directory onto itself with overwrite.
+				return trailingslashit($package_root);
 			}
 
 			$target = dirname($package_root) . '/' . $installed_directory;
 			if (file_exists($target)) {
 				global $wp_filesystem;
 				if (!is_object($wp_filesystem) || !$wp_filesystem->delete($target, true)) {
-					return $package_root;
+					return trailingslashit($package_root);
 				}
 			}
 
@@ -1462,10 +1461,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$this->move_update_package_path($package_root, $target)
 				&& file_exists($target . '/mc-admissions-wordpress-backend.php')
 			) {
-				return $target;
+				return trailingslashit($target);
 			}
 
-			return $package_root;
+			return trailingslashit($package_root);
 		}
 
 		private function move_update_package_path($source, $target) {
