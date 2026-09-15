@@ -60,6 +60,7 @@ final class MC_Intake_Test_Wpdb {
 	public $capacities = array();
 	public $reservations = array();
 	public $generatedLetters = array();
+	public $annualSeatApplications = array();
 	public $historicalOfferCandidates = array();
 	public $lockedHistoricalApplications = array();
 	public $paymentTransactions = array();
@@ -68,6 +69,9 @@ final class MC_Intake_Test_Wpdb {
 	public $fail_reservation_write = false;
 	public $fail_activity_write = false;
 	public $fail_post_commit_reload = false;
+	public $failAnnualSeatQuery = false;
+	public $last_error = '';
+	public $missingTables = array();
 	private $snapshot = null;
 	private $committed = false;
 	private $version_tick = 0;
@@ -103,7 +107,8 @@ final class MC_Intake_Test_Wpdb {
 	public function get_var($prepared) {
 		$call = $this->unpack($prepared);
 		if (false !== strpos($call['query'], 'SHOW TABLES LIKE')) {
-			return isset($call['args'][0]) ? (string) $call['args'][0] : null;
+			$table = isset($call['args'][0]) ? (string) $call['args'][0] : '';
+			return in_array($table, $this->missingTables, true) ? null : $table;
 		}
 		if (false !== strpos($call['query'], 'FROM mc_admission_offer_reservations')) {
 			$semester = strtolower((string) ($call['args'][0] ?? ''));
@@ -190,6 +195,14 @@ final class MC_Intake_Test_Wpdb {
 	public function get_results($prepared, $output = null) {
 		$call = $this->unpack($prepared);
 		$query = $call['query'];
+		if (false !== strpos($query, 'SELECT year, programmeCode, status, reviewerDecision, isTestData')) {
+			if ($this->failAnnualSeatQuery) {
+				$this->last_error = 'Offline annual seat query failure.';
+				return array();
+			}
+			$this->last_error = '';
+			return array_values($this->annualSeatApplications);
+		}
 		if (false !== strpos($query, 'INNER JOIN mc_generated_letters')) {
 			return array_values(array_filter($this->historicalOfferCandidates, function ($candidate) {
 				return !isset($this->reservations[(string) ($candidate['applicationId'] ?? '')]);
@@ -380,6 +393,9 @@ final class MC_Intake_Test_Wpdb {
 		$this->fail_reservation_write = false;
 		$this->fail_activity_write = false;
 		$this->fail_post_commit_reload = false;
+		$this->failAnnualSeatQuery = false;
+		$this->last_error = '';
+		$this->missingTables = array();
 	}
 }
 
@@ -584,10 +600,10 @@ $bank_pdf = intake_private_method($reflection, 'assert_bank_transaction_confirma
 $bank_ready = intake_private_method($reflection, 'bank_transaction_confirmation_ready');
 $bank_removable = intake_private_method($reflection, 'assert_bank_transaction_confirmation_removable');
 $assert_letter_available = intake_private_method($reflection, 'assert_admission_letter_generation_available');
-$assert_reservation_intake = intake_private_method($reflection, 'assert_active_offer_reservation_intake_unchanged');
 $persist_letter = intake_private_method($reflection, 'persist_generated_admission_letter');
 $to_case = intake_private_method($reflection, 'to_admission_case');
 $capacity_snapshot = intake_private_method($reflection, 'application_intake_capacity_snapshot');
+$build_annual_seat_summary = intake_private_method($reflection, 'build_annual_bachelor_seat_summary');
 $update_operations = intake_private_method($reflection, 'update_admission_application_operations');
 $update_workflow = intake_private_method($reflection, 'update_admission_application_workflow');
 $clear_document = intake_private_method($reflection, 'clear_document_record_and_touch_application');
@@ -823,8 +839,76 @@ $payment_response = $plugin->rest_create_payment(new WP_REST_Request(
 intake_assert_same(400, $payment_response->get_status(), 'Recording a cleared payment transaction must require Transaction Confirmation PDF.');
 intake_assert_true(false !== strpos($payment_response->get_data()['error'], 'Transaction Confirmation PDF'), 'Payment guard must return an actionable error.');
 
-// REST contracts and role policy: agents may read aggregate availability;
-// only Administrators may mutate it.
+// Annual Bachelor availability is a College-wide informational counter. It
+// combines semesters, counts academically-cleared active applications, keeps
+// availability at zero once the 152 ceiling is exceeded, and excludes all
+// non-Bachelor, test, rejected, and trashed records.
+$annual_fixtures = array(
+	intake_application(array('id' => 'spring-accepted', 'semester' => 'spring', 'year' => '2026', 'isTestData' => 0, 'status' => 'offer-issued', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'fall-accepted', 'semester' => 'fall', 'year' => '2026', 'isTestData' => 0, 'programmeCode' => 'hotel-casino-resort-management', 'status' => 'Acceptance Confirmed', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'next-year-accepted', 'semester' => 'summer', 'year' => '2027', 'isTestData' => 0, 'status' => 'review-pending', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'test-excluded', 'year' => '2027', 'isTestData' => 1, 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'rejected-excluded', 'year' => '2027', 'isTestData' => 0, 'status' => 'Rejected', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'trashed-excluded', 'year' => '2027', 'isTestData' => 0, 'status' => 'trashed', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'conditional-excluded', 'year' => '2027', 'isTestData' => 0, 'reviewerDecision' => 'conditional-offer')),
+	intake_application(array('id' => 'mba-year-excluded', 'year' => '2028', 'isTestData' => 0, 'programmeCode' => 'business-administration-masters', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'foundation-year-excluded', 'year' => '2029', 'isTestData' => 0, 'programmeCode' => 'english-foundation', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'invalid-year-excluded', 'year' => '1999', 'isTestData' => 0, 'reviewerDecision' => 'academically-cleared')),
+);
+$annual_summary = $build_annual_seat_summary->invoke($plugin, $annual_fixtures, 2026);
+intake_assert_same(array(2026, 2027), array_column($annual_summary, 'intakeYear'), 'Annual cards must include the current year and valid Bachelor intake years only, sorted ascending.');
+intake_assert_same(2, $annual_summary[0]['acceptedPlacements'], 'Spring and Fall accepted Bachelor applications must aggregate into one annual count.');
+intake_assert_same(150, $annual_summary[0]['availablePlacements'], 'Annual availability must subtract accepted Bachelor applications from 152.');
+intake_assert_same(0, $annual_summary[0]['overCapacity'], 'An in-capacity year must not report an excess.');
+intake_assert_same(1, $annual_summary[1]['acceptedPlacements'], 'Rejected, trashed, test, and non-cleared applications must not consume the annual count.');
+
+$over_capacity_rows = array();
+for ($index = 0; $index < 153; $index++) {
+	$over_capacity_rows[] = intake_application(array(
+		'id' => 'over-' . $index,
+		'semester' => 0 === $index % 3 ? 'spring' : (1 === $index % 3 ? 'summer' : 'fall'),
+		'year' => '2030',
+		'isTestData' => 0,
+		'programmeCode' => 0 === $index % 2 ? 'business-administration' : 'hotel-casino-resort-management',
+		'status' => 'offer-issued',
+		'reviewerDecision' => 'academically-cleared',
+	));
+}
+$over_capacity_summary = $build_annual_seat_summary->invoke($plugin, $over_capacity_rows, 2030);
+intake_assert_same(153, $over_capacity_summary[0]['acceptedPlacements'], 'The informational counter must continue counting beyond the ceiling.');
+intake_assert_same(0, $over_capacity_summary[0]['availablePlacements'], 'Available seats must floor at zero.');
+intake_assert_same(1, $over_capacity_summary[0]['overCapacity'], 'Excess accepted placements must be reported explicitly.');
+
+// The global summary is private to internal staff. External agents continue to
+// receive only their scoped application list and an empty summary.
+$GLOBALS['wpdb']->annualSeatApplications = array(intake_application(array(
+	'id' => 'runtime-accepted',
+	'year' => gmdate('Y'),
+	'isTestData' => 0,
+	'reviewerDecision' => 'academically-cleared',
+)));
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
+$internal_board = $plugin->rest_list_applications();
+intake_assert_same(200, $internal_board->get_status(), 'Internal staff must be able to load the application board with annual seats.');
+intake_assert_same(1, $internal_board->get_data()['annualSeatSummary'][0]['acceptedPlacements'], 'Internal annual seats must be computed globally from the application table.');
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
+$agent_board = $plugin->rest_list_applications();
+intake_assert_same(200, $agent_board->get_status(), 'Agents must retain their scoped application board access.');
+intake_assert_same(array(), $agent_board->get_data()['annualSeatSummary'], 'Agents must not receive College-wide annual seat totals.');
+$GLOBALS['wpdb']->failAnnualSeatQuery = true;
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
+$failed_internal_board = $plugin->rest_list_applications();
+intake_assert_same(400, $failed_internal_board->get_status(), 'A failed global count query must not publish a false 152-seat total.');
+intake_assert_true(false !== strpos($failed_internal_board->get_data()['error'], 'annual Bachelor seat summary'), 'A count-query failure must be explicit.');
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
+$agent_board_without_global_query = $plugin->rest_list_applications();
+intake_assert_same(200, $agent_board_without_global_query->get_status(), 'Agent board reads must never execute the private global summary query.');
+intake_assert_same(array(), $agent_board_without_global_query->get_data()['annualSeatSummary'], 'Agent responses must remain empty even while the private summary query is unavailable.');
+$GLOBALS['wpdb']->failAnnualSeatQuery = false;
+
+// Legacy per-intake configuration routes remain available to internal staff
+// for compatibility; agents receive an empty successful response while old
+// desktop versions update and never receive College-wide figures.
 $plugin->register_rest_routes();
 $capacity_routes = array_values(array_filter($GLOBALS['mc_intake_routes'], static function ($route) {
 	return '/intake-capacities' === $route['route'];
@@ -839,8 +923,8 @@ $GLOBALS['wpdb']->reservations = array(
 );
 $GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
 $response = $plugin->rest_list_intake_capacities();
-intake_assert_same(200, $response->get_status(), 'External agents must be allowed to read aggregate capacity.');
-intake_assert_same(8, $response->get_data()['capacities'][0]['availablePlacements'], 'Capacity response must compute available placements.');
+intake_assert_same(200, $response->get_status(), 'Older agent clients must receive a compatible successful capacity response.');
+intake_assert_same(array(), $response->get_data()['capacities'], 'External agents must not receive College-wide legacy capacity figures.');
 $forbidden = $plugin->rest_save_intake_capacity(new WP_REST_Request(array(), array(
 	'semester' => 'fall', 'intakeYear' => 2026, 'availablePlacements' => 7,
 )));
@@ -855,6 +939,9 @@ $forbidden_cancellation = $plugin->rest_cancel_offer_placement(new WP_REST_Reque
 intake_assert_same(403, $forbidden_cancellation->get_status(), 'External agents must not cancel an offer placement.');
 
 $GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
+$internal_capacity_response = $plugin->rest_list_intake_capacities();
+intake_assert_same(200, $internal_capacity_response->get_status(), 'Internal staff may retain legacy capacity reads during retirement.');
+intake_assert_same(8, $internal_capacity_response->get_data()['capacities'][0]['availablePlacements'], 'The internal legacy response must still compute available placements.');
 $missing_capacity_version = $plugin->rest_save_intake_capacity(new WP_REST_Request(array(), array(
 	'semester' => 'fall', 'intakeYear' => 2026, 'availablePlacements' => 7,
 )));
@@ -1014,8 +1101,9 @@ $historical_cancel = $cancel_offer->invoke(
 	'Historical offer explicitly cancelled.',
 	$baseline_staff
 );
-intake_assert_same(2, $GLOBALS['wpdb']->capacities['summer:2027']['reservedPlacements'], 'Cancelling a historical offer must restore exactly one place.');
-intake_assert_same(11, $historical_cancel['intakeCapacity']['availablePlacements'], 'Cancelling a historical offer must increase visible availability by one.');
+intake_assert_same(3, $GLOBALS['wpdb']->capacities['summer:2027']['reservedPlacements'], 'Cancelling a historical offer audit must not mutate the retired semester counter.');
+intake_assert_same(false, $historical_cancel['intakeCapacity']['limited'], 'Legacy clients must see capacity enforcement disabled after cancellation.');
+intake_assert_same(null, $historical_cancel['intakeCapacity']['availablePlacements'], 'A case response must not expose the retired semester availability as authoritative.');
 
 // Use an unrelated empty intake for delete CAS behavior.
 $GLOBALS['wpdb']->historicalOfferCandidates = array();
@@ -1070,69 +1158,55 @@ $delete_reconciled = $plugin->rest_delete_intake_capacity(new WP_REST_Request(
 intake_assert_same(200, $delete_reconciled->get_status(), 'Released reservation rows must not block capacity deletion.');
 $GLOBALS['wpdb']->reservations = array();
 
-// Exact-once reservation, zero-capacity/concurrency protection, unlimited
-// programmes, explicit release, reissue, and transactional rollback.
-$GLOBALS['wpdb']->reset_transaction_state();
-$GLOBALS['wpdb']->reservations = array(
-	'application-1' => array(
-		'applicationId' => 'application-1', 'programmeCode' => 'business-administration',
-		'semester' => 'fall', 'intakeYear' => 2026, 'status' => 'active',
-		'generatedLetterId' => 'letter-existing', 'reservedAt' => '2026-08-20 09:00:00.000',
-		'reservedByName' => 'Staff User', 'releasedAt' => null, 'releasedByName' => null,
-		'cancellationReason' => null, 'updatedAt' => '2026-08-20 09:00:00.000',
-	),
+// Legacy audit rows no longer freeze intake edits. The authoritative application
+// save remains CAS-protected while Programme and intake may be corrected.
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array('isTestData' => 0));
+$GLOBALS['wpdb']->reservations['application-1'] = array(
+	'applicationId' => 'application-1', 'programmeCode' => 'business-administration',
+	'semester' => 'fall', 'intakeYear' => 2026, 'status' => 'active',
 );
-$assert_reservation_intake->invoke($plugin, 'application-1', intake_draft());
-foreach (
-	array(
-		intake_draft(array('programme' => 'business-administration-masters')),
-		intake_draft(array('semester' => 'spring')),
-		intake_draft(array('year' => '2027')),
-	) as $changed_intake
-) {
-	intake_assert_throws_contains('Cancel the active offer', static function () use ($assert_reservation_intake, $plugin, $changed_intake) {
-		$assert_reservation_intake->invoke($plugin, 'application-1', $changed_intake);
-	}, 'Programme and intake fields must be immutable while an offer reservation is active.');
-}
-$GLOBALS['wpdb']->reservations['application-1']['status'] = 'released';
-$assert_reservation_intake->invoke(
-	$plugin,
-	'application-1',
-	intake_draft(array('programme' => 'business-administration-masters', 'semester' => 'spring', 'year' => '2027'))
-);
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
+$intake_edit = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'applicationId' => 'application-1',
+	'mode' => 'draft',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'draft' => intake_draft(array('programme' => 'business-administration-masters', 'semester' => 'spring', 'year' => '2027')),
+)));
+intake_assert_same(200, $intake_edit->get_status(), 'An active legacy reservation must not block a Programme or intake correction.');
+intake_assert_same('business-administration-masters', $GLOBALS['wpdb']->application['programmeCode'], 'The corrected Programme must persist under normal CAS rules.');
+intake_assert_same('spring', $GLOBALS['wpdb']->application['semester'], 'The corrected semester must persist under normal CAS rules.');
+intake_assert_same('2027', $GLOBALS['wpdb']->application['year'], 'The corrected intake year must persist under normal CAS rules.');
 
-$GLOBALS['wpdb']->reservations = array();
-$GLOBALS['wpdb']->capacities = array();
+// Offer issuance never reads or mutates the retired capacity table. Audit rows
+// remain exact-once when available, but missing/full/unconfigured legacy data
+// cannot prevent issuance.
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 $staff = intake_user(array('admissions-officer'));
 $application = intake_application(array('isTestData' => 0));
-intake_assert_throws_contains('has not been configured', static function () use ($reserve_offer, $plugin, $application, $staff) {
-	$reserve_offer->invoke($plugin, $application, 'letter-without-capacity', $staff);
-}, 'A production Bachelor offer must be blocked until its exact intake is configured.');
-intake_assert_same(array(), $GLOBALS['wpdb']->reservations, 'A missing intake configuration must not create a reservation.');
+$production_capacity_snapshot = $capacity_snapshot->invoke($plugin, $application);
+intake_assert_same(false, $production_capacity_snapshot['limited'], 'Old clients must receive limited=false for a production Bachelor case.');
+intake_assert_same(null, $production_capacity_snapshot['totalPlacements'], 'Retired semester totals must not be exposed as authoritative case data.');
+intake_assert_same(null, $production_capacity_snapshot['availablePlacements'], 'Retired semester availability must not be exposed as authoritative case data.');
 
-$GLOBALS['wpdb']->capacities = array('fall:2026' => intake_capacity(1, 0));
-intake_assert_same(true, $reserve_offer->invoke($plugin, $application, 'letter-1', $staff), 'First Bachelor offer must reserve one placement.');
-intake_assert_same(1, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'First offer must increment the counter exactly once.');
-intake_assert_same(false, $reserve_offer->invoke($plugin, $application, 'letter-2', $staff), 'Reissuing an active offer must reuse its reservation.');
-intake_assert_same(1, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'Reissue must not double-deduct.');
-intake_assert_same('letter-2', $GLOBALS['wpdb']->reservations['application-1']['generatedLetterId'], 'Reissue must update the reservation audit pointer.');
-intake_assert_throws_contains('No bachelor placements', static function () use ($reserve_offer, $plugin, $staff) {
-	$second = intake_application(array('id' => 'application-2', 'isTestData' => 0));
-	$reserve_offer->invoke($plugin, $second, 'letter-3', $staff);
-}, 'A second concurrent-equivalent issuance must be blocked at capacity zero.');
+intake_assert_same(true, $reserve_offer->invoke($plugin, $application, 'letter-without-capacity', $staff), 'An unconfigured Bachelor intake must allow the Offer Letter audit to be recorded.');
+intake_assert_same(array(), $GLOBALS['wpdb']->capacities, 'Unconfigured offer issuance must not create or mutate a capacity row.');
+intake_assert_same(false, $reserve_offer->invoke($plugin, $application, 'letter-reissued', $staff), 'Reissuing an offer must reuse its audit row.');
+intake_assert_same('letter-reissued', $GLOBALS['wpdb']->reservations['application-1']['generatedLetterId'], 'Reissue must update the audit pointer without changing capacity.');
 
-$counter_before_unlimited = $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'];
-intake_assert_same(false, $reserve_offer->invoke($plugin, intake_application(array('programmeCode' => 'business-administration-masters')), 'letter-mba', $staff), 'MBA must be unlimited.');
-intake_assert_same(false, $reserve_offer->invoke($plugin, intake_application(array('programmeCode' => 'english-foundation')), 'letter-foundation', $staff), 'Foundation must be unlimited.');
-intake_assert_same(false, $reserve_offer->invoke($plugin, intake_application(array('isTestData' => 1)), 'letter-test-bachelor', $staff), 'Test-data Bachelor offers must be capacity-exempt.');
-intake_assert_same($counter_before_unlimited, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'Unlimited programmes must never change Bachelor capacity.');
-$test_capacity_snapshot = $capacity_snapshot->invoke($plugin, intake_application(array('isTestData' => 1)));
-intake_assert_same(false, $test_capacity_snapshot['limited'], 'Test-data Bachelor cases must expose capacity as not applicable.');
-intake_assert_same(false, $test_capacity_snapshot['configured'], 'Capacity-exempt test cases must match unlimited-programme response parity.');
+$GLOBALS['wpdb']->capacities = array('fall:2026' => intake_capacity(1, 152));
+$second_application = intake_application(array('id' => 'application-2', 'isTestData' => 0));
+intake_assert_same(true, $reserve_offer->invoke($plugin, $second_application, 'letter-over-capacity', $staff), 'A full legacy intake must not block another Bachelor Offer Letter.');
+intake_assert_same(152, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'Offer issuance must never mutate the legacy semester counter.');
 
-// Cancellation is the only release command. It decrements once, is audited,
-// and returns a complete response even if the post-commit reload fails.
-$GLOBALS['wpdb']->application = intake_application(array('isTestData' => 0));
+intake_assert_same(false, $reserve_offer->invoke($plugin, intake_application(array('programmeCode' => 'business-administration-masters')), 'letter-mba', $staff), 'MBA must not create a Bachelor offer audit.');
+intake_assert_same(false, $reserve_offer->invoke($plugin, intake_application(array('programmeCode' => 'english-foundation')), 'letter-foundation', $staff), 'Foundation must not create a Bachelor offer audit.');
+intake_assert_same(false, $reserve_offer->invoke($plugin, intake_application(array('isTestData' => 1)), 'letter-test-bachelor', $staff), 'Test-data Bachelor offers must not create an audit row.');
+
+// Explicit cancellation changes only the optional offer audit. It succeeds with
+// no capacity row, does not claim a semester seat was returned, and retains CAS.
+$GLOBALS['wpdb']->application = $application;
+$GLOBALS['wpdb']->capacities = array();
 $GLOBALS['wpdb']->fail_post_commit_reload = true;
 $cancelled_case = $cancel_offer->invoke(
 	$plugin,
@@ -1141,48 +1215,56 @@ $cancelled_case = $cancel_offer->invoke(
 	'Applicant withdrew before accepting the offer.',
 	$staff
 );
-intake_assert_same(0, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'Explicit cancellation must restore exactly one placement.');
-intake_assert_same('released', $GLOBALS['wpdb']->reservations['application-1']['status'], 'Cancellation must mark the reservation released.');
-intake_assert_same('released', $cancelled_case['offerPlacementReservation']['status'], 'Cancellation response must expose released reservation metadata.');
-intake_assert_same(1, $cancelled_case['intakeCapacity']['availablePlacements'], 'Cancellation response must expose restored availability.');
+intake_assert_same(array(), $GLOBALS['wpdb']->capacities, 'Offer cancellation must not require or create a capacity row.');
+intake_assert_same('released', $GLOBALS['wpdb']->reservations['application-1']['status'], 'Cancellation must mark only the audit row released.');
+intake_assert_same('released', $cancelled_case['offerPlacementReservation']['status'], 'Cancellation response must expose released audit metadata.');
+intake_assert_same(false, $cancelled_case['intakeCapacity']['limited'], 'Cancellation fallback must keep capacity enforcement disabled.');
+intake_assert_same(null, $cancelled_case['intakeCapacity']['availablePlacements'], 'Cancellation must not synthesize a restored semester count.');
 $GLOBALS['wpdb']->fail_post_commit_reload = false;
 $cancelled_version = $cancelled_case['updatedAt'];
 intake_assert_throws_contains('no active offer', static function () use ($cancel_offer, $plugin, $staff, $cancelled_version) {
 	$cancel_offer->invoke($plugin, 'application-1', $cancelled_version, 'Duplicate cancellation.', $staff);
-}, 'A duplicate cancellation must not release another placement.');
-intake_assert_same(0, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'Duplicate cancellation must leave the counter unchanged.');
+}, 'A duplicate cancellation must not rewrite the released audit row.');
 
-intake_assert_same(true, $reserve_offer->invoke($plugin, $GLOBALS['wpdb']->application, 'letter-reissued', $staff), 'Reissuing after explicit cancellation must reserve again.');
-intake_assert_same(1, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'Reissue after cancellation must deduct exactly once.');
+intake_assert_same(true, $reserve_offer->invoke($plugin, $GLOBALS['wpdb']->application, 'letter-after-cancellation', $staff), 'Reissuing after cancellation may reactivate the optional audit row.');
+intake_assert_same(array(), $GLOBALS['wpdb']->capacities, 'Audit reactivation must remain independent of capacity configuration.');
 
-// Cancellation reconciles the reservation's original intake even if legacy or
-// out-of-band data already changed the current application to an unlimited programme.
-$GLOBALS['wpdb']->application['programmeCode'] = 'business-administration-masters';
-$GLOBALS['wpdb']->application['programmeLabel'] = "Master's degree in Business Administration (MBA)";
-$cancel_offer->invoke(
+// If the legacy capacity and reservation tables are absent, the audit is simply
+// skipped and the generated Offer Letter transaction still commits.
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array('isTestData' => 0));
+$GLOBALS['wpdb']->missingTables = array('mc_admission_intake_capacities', 'mc_admission_offer_reservations');
+intake_assert_same(false, $reserve_offer->invoke($plugin, $GLOBALS['wpdb']->application, 'letter-without-legacy-tables', $staff), 'Missing legacy tables must degrade to a skipped audit, not a capacity error.');
+$missing_table_letter = $persist_letter->invoke(
 	$plugin,
 	'application-1',
-	$cancelled_version,
-	'Correcting a legacy programme change after offer issue.',
-	$staff
+	array(
+		'templateId' => 'offer-letter',
+		'templateVersion' => 'offline-v1',
+		'fileName' => 'offer-letter.pdf',
+		'outputFormat' => 'pdf',
+		'contentBase64' => base64_encode("%PDF-1.7\n"),
+		'inputSnapshot' => array('source' => 'offline-test'),
+	),
+	$staff,
+	'2026-08-20T10:00:00.000Z'
 );
-intake_assert_same(0, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'Cancellation must release the original reservation even if the current programme no longer matches.');
-intake_assert_same('released', $GLOBALS['wpdb']->reservations['application-1']['status'], 'Legacy mismatches must not strand an active reservation.');
+intake_assert_same('offer-letter', $missing_table_letter['letter']['templateId'], 'Offer Letter persistence must complete without either legacy placement table.');
 
-$GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'] = 0;
-$GLOBALS['wpdb']->reservations = array();
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->capacities = array('fall:2026' => intake_capacity(1, 152));
 $GLOBALS['wpdb']->fail_reservation_write = true;
 $GLOBALS['wpdb']->query('START TRANSACTION');
 try {
 	$reserve_offer->invoke($plugin, intake_application(array('isTestData' => 0)), 'letter-failing', $staff);
-	throw new RuntimeException('Reservation write failure was expected.');
+	throw new RuntimeException('Reservation audit write failure was expected.');
 } catch (ReflectionException $error) {
 	throw $error;
 } catch (Throwable $error) {
 	$GLOBALS['wpdb']->query('ROLLBACK');
 }
-intake_assert_same(0, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'A failed reservation write must roll back its capacity increment.');
-intake_assert_same(array(), $GLOBALS['wpdb']->reservations, 'A failed reservation write must not leave a reservation.');
+intake_assert_same(152, $GLOBALS['wpdb']->capacities['fall:2026']['reservedPlacements'], 'A failed audit write must never alter the retired capacity counter.');
+intake_assert_same(array(), $GLOBALS['wpdb']->reservations, 'A failed audit write must not leave a partial reservation row.');
 
 // A generated-letter write must return its committed application CAS token
 // even when both post-commit rich and base reloads fail.
@@ -1210,16 +1292,23 @@ $letter_result = $persist_letter->invoke(
 intake_assert_same('2026-08-20T10:00:01.000Z', $letter_result['application']['updatedAt'], 'Generated-letter fallback must return the committed application revision after double reload failure.');
 intake_assert_same('offer-letter', $letter_result['letter']['templateId'], 'Generated-letter fallback must return the committed letter contract.');
 
-// Workflow/rejection/trash code must not contain an implicit release path.
+// Structural guards keep the retired capacity system out of offer issuance and
+// cancellation while preserving the legacy tables for non-destructive rollout.
 $source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
 $workflow_start = strpos($source, 'private function update_admission_application_workflow');
 $workflow_end = strpos($source, 'private function update_admission_application_operations', $workflow_start);
 $workflow_source = substr($source, $workflow_start, $workflow_end - $workflow_start);
-intake_assert_same(false, false !== strpos($workflow_source, 'reservedPlacements = reservedPlacements - 1'), 'Workflow/rejected/trashed transitions must never restore capacity implicitly.');
-intake_assert_true(false !== strpos($source, 'FOR UPDATE'), 'Capacity reservations must use database row locks.');
-intake_assert_true(substr_count($source, 'ENGINE=InnoDB') >= 2, 'Capacity and reservation tables must explicitly support transactions and row locks.');
-intake_assert_true(false !== strpos($source, 'reservedPlacements < totalPlacements'), 'Capacity increments must include an atomic zero-capacity guard.');
-intake_assert_true(false !== strpos($source, '$this->assert_active_offer_reservation_intake_unchanged($record_id, $draft);'), 'Application save must enforce active-reservation intake immutability.');
+intake_assert_same(false, false !== strpos($workflow_source, 'reservedPlacements = reservedPlacements - 1'), 'Generic workflow and Trash transitions must never mutate retired capacity.');
+intake_assert_true(substr_count($source, 'ENGINE=InnoDB') >= 2, 'Legacy capacity and audit tables must remain intact during the non-destructive rollout.');
+$reserve_lines = file($reserve_offer->getFileName());
+$reserve_source = implode('', array_slice($reserve_lines, $reserve_offer->getStartLine() - 1, $reserve_offer->getEndLine() - $reserve_offer->getStartLine() + 1));
+intake_assert_same(false, false !== strpos($reserve_source, 'intake_capacities_table'), 'Offer issuance must not read the retired capacity table.');
+intake_assert_same(false, false !== strpos($reserve_source, 'totalPlacements'), 'Offer issuance must not compare against a semester ceiling.');
+intake_assert_same(false, false !== strpos($reserve_source, 'Placement availability conflict'), 'Offer issuance must not throw a capacity conflict.');
+$cancel_lines = file($cancel_offer->getFileName());
+$cancel_source = implode('', array_slice($cancel_lines, $cancel_offer->getStartLine() - 1, $cancel_offer->getEndLine() - $cancel_offer->getStartLine() + 1));
+intake_assert_same(false, false !== strpos(strtolower($cancel_source), 'placement was returned'), 'Cancellation must not claim that a semester seat was restored.');
+intake_assert_same(false, false !== strpos($source, 'assert_active_offer_reservation_intake_unchanged'), 'Legacy audit rows must not freeze Programme or intake edits.');
 intake_assert_true(false !== strpos($source, "\$mime_type = 'application/pdf';"), 'Validated browser PDFs must be stored with the canonical MIME type.');
 intake_assert_true(false !== strpos($source, '$this->assert_bank_transaction_confirmation_removable($application_id);'), 'Document deletion must enforce the payment-evidence invariant inside its transaction.');
 intake_assert_true(false !== strpos($source, "'bankTransactionConfirmationReady'"), 'Detailed case response must expose Transaction Confirmation readiness.');

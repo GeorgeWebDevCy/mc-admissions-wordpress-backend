@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.66
+ * Version: 0.2.67
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -42,6 +42,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const AGENCY_IDENTITY_BACKFILL_LOCK = 'mc_admissions_agency_identity_backfill_lock';
 		const MIGRATION_CASE_SCHEMA_VERSION = '0.2.64';
 		const INTAKE_CAPACITY_SCHEMA_VERSION = '0.2.62';
+		const ANNUAL_BACHELOR_SEAT_CEILING = 152;
 		const ASSESSMENT_MESSAGE_PENDING_SUBJECT_PREFIX = '[Assessment message: pending]';
 		const ASSESSMENT_MESSAGE_REJECTED_SUBJECT_PREFIX = '[Assessment message: rejected]';
 		const ASSESSMENT_MESSAGE_PENDING_LEGACY_SUBJECT_PREFIX = 'Additional information required for ';
@@ -4455,6 +4456,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					array(
 						'ok' => true,
 						'applications' => $applications,
+						'annualSeatSummary' => $this->can_view_all_applications($user)
+							? $this->list_annual_bachelor_seat_summary()
+							: array(),
 						'offerLetterCount' => $this->count_generated_letters($user, 'offer-letter'),
 						'acceptanceLetterCount' => $this->count_generated_letters($user, 'acceptance-letter'),
 					),
@@ -4667,10 +4671,19 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			global $wpdb;
 
 			try {
-				// The route permission already requires an authenticated WordPress
-				// session. Aggregate intake counts contain no applicant data and are
-				// intentionally visible to agents while they prepare an application.
-				$this->current_session_user();
+				$user = $this->current_session_user();
+				// The per-semester screen is retired, but keep an empty successful
+				// response for older agent clients so they do not receive College-wide
+				// figures or fail while their desktop update is rolling out.
+				if (!$this->can_view_all_applications($user)) {
+					return new WP_REST_Response(
+						array(
+							'ok' => true,
+							'capacities' => array(),
+						),
+						200
+					);
+				}
 				if (!$this->table_exists($this->intake_capacities_table)) {
 					throw new Exception('Placement availability storage is not ready.');
 				}
@@ -6895,23 +6908,26 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		private function canonical_status_key($status) {
+			$status = trim((string) $status);
 			$legacy_statuses = array(
-				'Draft' => 'profile-preparation',
-				'Application in progress' => 'profile-preparation',
-				'Under review' => 'review-pending',
-				'Offer letter issued' => 'offer-issued',
-				'Payment pending' => 'prepayment-pending',
-				'Acceptance confirmed' => 'acceptance-issued',
-				'Entry permit processing' => 'entry-permit-processing',
-				'Ready to enroll' => 'enrollment-complete',
+				'draft' => 'profile-preparation',
+				'application in progress' => 'profile-preparation',
+				'under review' => 'review-pending',
+				'offer letter issued' => 'offer-issued',
+				'payment pending' => 'prepayment-pending',
+				'acceptance confirmed' => 'acceptance-issued',
+				'entry permit processing' => 'entry-permit-processing',
+				'ready to enroll' => 'enrollment-complete',
 			);
+			$status_lookup = strtolower($status);
 
-			if (isset($legacy_statuses[$status])) {
-				return $legacy_statuses[$status];
+			if (isset($legacy_statuses[$status_lookup])) {
+				return $legacy_statuses[$status_lookup];
 			}
+			$status_key = preg_replace('/[-_\s]+/', '-', $status_lookup);
 
 			return in_array(
-				$status,
+				$status_key,
 				array(
 					'profile-preparation',
 					'review-pending',
@@ -6927,7 +6943,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				),
 				true
 			)
-				? $status
+				? $status_key
 				: 'profile-preparation';
 		}
 
@@ -7127,51 +7143,97 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return isset($this->programme_labels[$code]) ? $this->programme_labels[$code] : 'Programme not selected';
 		}
 
-		private function application_intake_capacity_snapshot($application) {
+		private function list_annual_bachelor_seat_summary() {
 			global $wpdb;
 
+			// This intentionally ignores the current user's application scope. The
+			// caller exposes this College-wide total to internal staff only.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$wpdb->last_error = '';
+			$rows = $wpdb->get_results(
+				"SELECT year, programmeCode, status, reviewerDecision, isTestData FROM {$this->applications_table}",
+				ARRAY_A
+			);
+			if (!is_array($rows) || '' !== trim((string) $wpdb->last_error)) {
+				throw new Exception('Unable to load the annual Bachelor seat summary.');
+			}
+
+			return $this->build_annual_bachelor_seat_summary($rows);
+		}
+
+		private function build_annual_bachelor_seat_summary($applications, $current_year = null) {
+			$current_year = null === $current_year ? (int) gmdate('Y') : (int) $current_year;
+			$accepted_by_year = array();
+			if ($current_year >= 2000 && $current_year <= 2199) {
+				$accepted_by_year[$current_year] = 0;
+			}
+
+			foreach ((array) $applications as $application) {
+				$year = $this->normalize_intake_year($application['year'] ?? '');
+				if (1 !== preg_match('/^[0-9]{4}$/', $year)) {
+					continue;
+				}
+				$year = (int) $year;
+				if ($year < 2000 || $year > 2199) {
+					continue;
+				}
+				$programme_code = $this->normalize_programme_code($application['programmeCode'] ?? '');
+				if (!$this->is_bachelor_programme($programme_code)) {
+					continue;
+				}
+				if (!isset($accepted_by_year[$year])) {
+					$accepted_by_year[$year] = 0;
+				}
+
+				$status = $this->canonical_status_key($application['status'] ?? '');
+				$reviewer_decision = strtolower(trim((string) ($application['reviewerDecision'] ?? '')));
+				if (
+					!empty($application['isTestData'])
+					|| in_array($status, array('rejected', 'trashed'), true)
+					|| 'academically-cleared' !== $reviewer_decision
+				) {
+					continue;
+				}
+
+				$accepted_by_year[$year]++;
+			}
+
+			ksort($accepted_by_year, SORT_NUMERIC);
+			$summary = array();
+			foreach ($accepted_by_year as $year => $accepted_placements) {
+				$accepted_placements = max(0, (int) $accepted_placements);
+				$summary[] = array(
+					'intakeYear' => (int) $year,
+					'ceiling' => self::ANNUAL_BACHELOR_SEAT_CEILING,
+					'acceptedPlacements' => $accepted_placements,
+					'availablePlacements' => max(0, self::ANNUAL_BACHELOR_SEAT_CEILING - $accepted_placements),
+					'overCapacity' => max(0, $accepted_placements - self::ANNUAL_BACHELOR_SEAT_CEILING),
+				);
+			}
+
+			return $summary;
+		}
+
+		private function application_intake_capacity_snapshot($application) {
 			$programme_code = isset($application['programmeCode'])
 				? $this->normalize_programme_code($application['programmeCode'])
 				: '';
 			$semester = $this->normalize_semester_code($application['semester'] ?? '');
 			$year = $this->normalize_intake_year($application['year'] ?? '');
-			if (!empty($application['isTestData']) || !$this->is_bachelor_programme($programme_code)) {
-				return array(
-					'limited' => false,
-					'configured' => false,
-					'semester' => in_array($semester, array('spring', 'summer', 'fall'), true) ? $semester : null,
-					'intakeYear' => 1 === preg_match('/^[0-9]{4}$/', $year) ? (int) $year : null,
-					'totalPlacements' => null,
-					'reservedPlacements' => 0,
-					'availablePlacements' => null,
-				);
-			}
-
 			$valid_intake = in_array($semester, array('spring', 'summer', 'fall'), true)
 				&& 1 === preg_match('/^[0-9]{4}$/', $year);
-			$row = null;
-			if ($valid_intake && $this->table_exists($this->intake_capacities_table)) {
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-				$row = $wpdb->get_row(
-					$wpdb->prepare(
-						"SELECT * FROM {$this->intake_capacities_table} WHERE semester = %s AND intakeYear = %d LIMIT 1",
-						$semester,
-						(int) $year
-					),
-					ARRAY_A
-				);
-			}
 
+			// Per-semester placement enforcement is retired. Keep this legacy-shaped
+			// detail payload explicitly non-limited so older clients never block an
+			// offer while the annual dashboard counter is informational only.
 			return array(
-				'limited' => true,
-				'configured' => (bool) $row,
+				'limited' => false,
+				'configured' => $valid_intake && $this->is_bachelor_programme($programme_code),
 				'semester' => $valid_intake ? $semester : null,
 				'intakeYear' => $valid_intake ? (int) $year : null,
-				'totalPlacements' => $row ? max(0, (int) $row['totalPlacements']) : null,
-				'reservedPlacements' => $row ? max(0, (int) $row['reservedPlacements']) : 0,
-				'availablePlacements' => $row
-					? max(0, (int) $row['totalPlacements'] - (int) $row['reservedPlacements'])
-					: null,
+				'totalPlacements' => null,
+				'reservedPlacements' => 0,
+				'availablePlacements' => null,
 			);
 		}
 
@@ -7798,72 +7860,39 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if (!$this->is_bachelor_programme($programme_code)) {
 				return false;
 			}
+			if (!$this->table_exists($this->offer_reservations_table)) {
+				// Reservation rows are retained only as a best-effort audit trail for
+				// older installations. Their absence must never block an Offer Letter.
+				return false;
+			}
 
 			$application_id = (string) $application['id'];
 			$semester = $this->normalize_semester_code($application['semester'] ?? '', true);
 			$year = (int) $this->normalize_intake_year($application['year'] ?? '', true);
-			$intake_label = $this->intake_display_label($semester, $year);
-
-			// Keep the same lock order as the direct Prisma path: capacity first,
-			// then the per-application reservation. This avoids cross-path deadlocks.
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-			$capacity = $wpdb->get_row(
-				$wpdb->prepare(
-					"SELECT * FROM {$this->intake_capacities_table} WHERE semester = %s AND intakeYear = %d LIMIT 1 FOR UPDATE",
-					$semester,
-					$year
-				),
-				ARRAY_A
-			);
-			if (!$capacity) {
-				throw new Exception('Placement availability conflict: Placement availability has not been configured for ' . $intake_label . '.');
-			}
 			$reservation = $this->get_offer_placement_reservation($application_id, true);
 
 			if ($reservation && 'active' === $reservation['status']) {
-				if (
-					(string) $reservation['programmeCode'] !== $programme_code
-					|| (string) $reservation['semester'] !== $semester
-					|| (int) $reservation['intakeYear'] !== $year
-				) {
-					throw new Exception('Placement availability conflict: Cancel the active offer before changing its Programme or Semester intake/Year.');
-				}
-
-				// Reissuing an active offer updates its audit pointer but never consumes
-				// a second placement.
+				// Reissuing updates the audit snapshot but never enforces or mutates a
+				// per-semester capacity. Annual availability is derived from accepted
+				// applications and remains informational.
 				$updated = $wpdb->update(
 					$this->offer_reservations_table,
 					array(
+						'programmeCode' => $programme_code,
+						'semester' => $semester,
+						'intakeYear' => $year,
 						'generatedLetterId' => $letter_id,
 						'updatedAt' => $this->current_notification_event_mysql_datetime(),
 					),
 					array('applicationId' => $application_id),
-					array('%s', '%s'),
+					array('%s', '%s', '%d', '%s', '%s'),
 					array('%s')
 				);
 				if (false === $updated) {
-					throw new Exception('Unable to update the active offer placement reservation.');
+					throw new Exception('Unable to update the active offer reservation audit.');
 				}
 
 				return false;
-			}
-
-			if ((int) $capacity['reservedPlacements'] >= (int) $capacity['totalPlacements']) {
-				throw new Exception('Placement availability conflict: No bachelor placements are available for ' . $intake_label . '.');
-			}
-
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-			$capacity_written = $wpdb->query(
-				$wpdb->prepare(
-					"UPDATE {$this->intake_capacities_table}
-					 SET reservedPlacements = reservedPlacements + 1, updatedAt = CURRENT_TIMESTAMP(3)
-					 WHERE semester = %s AND intakeYear = %d AND reservedPlacements < totalPlacements",
-					$semester,
-					$year
-				)
-			);
-			if (1 !== (int) $capacity_written) {
-				throw new Exception('Placement availability conflict: No bachelor placements are available for ' . $intake_label . '.');
 			}
 
 			$now = $this->current_notification_event_mysql_datetime();
@@ -7893,28 +7922,41 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				);
 			}
 			if (false === $reservation_written || (!$reservation && 0 === $reservation_written)) {
-				throw new Exception('Unable to save the offer placement reservation.');
+				throw new Exception('Unable to save the offer reservation audit.');
 			}
 
 			return true;
 		}
 
-		private function assert_active_offer_reservation_intake_unchanged($application_id, $draft) {
-			$reservation = $this->get_offer_placement_reservation($application_id, true);
-			if (!$reservation || 'active' !== (string) $reservation['status']) {
-				return;
+		private function release_offer_reservation_audit_for_rejection($application_id, $reason, $user) {
+			global $wpdb;
+
+			if (!$this->table_exists($this->offer_reservations_table)) {
+				return false;
 			}
 
-			$programme_code = $this->normalize_programme_code($draft['programme'] ?? '');
-			$semester = $this->normalize_semester_code($draft['semester'] ?? '');
-			$year = $this->normalize_intake_year($draft['year'] ?? '');
-			if (
-				(string) $reservation['programmeCode'] !== (string) $programme_code
-				|| (string) $reservation['semester'] !== (string) $semester
-				|| (int) $reservation['intakeYear'] !== (int) $year
-			) {
-				throw new Exception('Placement availability conflict: Cancel the active offer before changing its Programme or Semester intake/Year.');
+			$reservation = $this->get_offer_placement_reservation($application_id, true);
+			if (!$reservation || 'active' !== (string) $reservation['status']) {
+				return false;
 			}
+
+			$now = $this->current_notification_event_mysql_datetime();
+			$written = $wpdb->update(
+				$this->offer_reservations_table,
+				array(
+					'status' => 'released',
+					'releasedAt' => $now,
+					'releasedByName' => $user['name'],
+					'cancellationReason' => 'Application rejected: ' . $reason,
+					'updatedAt' => $now,
+				),
+				array('applicationId' => $application_id)
+			);
+			if (false === $written || 0 === $written) {
+				throw new Exception('Unable to release the offer reservation audit after rejection.');
+			}
+
+			return true;
 		}
 
 		private function cancel_offer_placement_reservation($application_id, $expected_updated_at, $reason, $user) {
@@ -7936,36 +7978,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 				$reservation = $this->get_offer_placement_reservation($application_id, true);
 				if (!$reservation || 'active' !== $reservation['status']) {
-					throw new Exception('Placement availability conflict: This application has no active offer placement reservation.');
-				}
-
-				// Lock and decrement the exact intake originally reserved, even if a
-				// later data correction changed the application intake fields.
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-				$capacity = $wpdb->get_row(
-					$wpdb->prepare(
-						"SELECT * FROM {$this->intake_capacities_table} WHERE semester = %s AND intakeYear = %d LIMIT 1 FOR UPDATE",
-						$reservation['semester'],
-						(int) $reservation['intakeYear']
-					),
-					ARRAY_A
-				);
-				if (!$capacity || (int) $capacity['reservedPlacements'] <= 0) {
-					throw new Exception('Placement availability conflict: The active reservation counter is inconsistent; no placement was released.');
-				}
-
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-				$capacity_written = $wpdb->query(
-					$wpdb->prepare(
-						"UPDATE {$this->intake_capacities_table}
-						 SET reservedPlacements = reservedPlacements - 1, updatedAt = CURRENT_TIMESTAMP(3)
-						 WHERE semester = %s AND intakeYear = %d AND reservedPlacements > 0",
-						$reservation['semester'],
-						(int) $reservation['intakeYear']
-					)
-				);
-				if (1 !== (int) $capacity_written) {
-					throw new Exception('Placement availability conflict: The placement could not be released safely.');
+					throw new Exception('This application has no active offer reservation to cancel.');
 				}
 
 				$now = $this->current_notification_event_mysql_datetime();
@@ -8006,7 +8019,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$user,
 					'letter',
 					'Offer letter cancelled',
-					$reason . ' The bachelor placement was returned to ' . $this->intake_display_label($reservation['semester'], $reservation['intakeYear']) . '.',
+					$reason . ' The offer reservation audit record was cancelled.',
 					'Unable to record the offer cancellation activity.'
 				);
 				$committed_application = $this->get_authorized_application_base($application_id, $user, true);
@@ -8031,8 +8044,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				);
 			}
 
-			// The release and audit already committed. Return the pre-commit rich case
-			// with its authoritative reservation/counter changes applied so a read
+			// The cancellation audit already committed. Return the pre-commit rich case
+			// with its authoritative reservation change applied so a read
 			// outage cannot invite a duplicate cancellation retry.
 			$application_snapshot['lastUpdatedByName'] = $user['name'];
 			$application_snapshot['updatedAt'] = $committed_application['updatedAt'];
@@ -8045,18 +8058,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'cancellationReason' => $reason,
 				)
 			);
-			if (!empty($application_snapshot['intakeCapacity']['limited'])) {
-				$application_snapshot['intakeCapacity']['reservedPlacements'] = max(
-					0,
-					(int) $application_snapshot['intakeCapacity']['reservedPlacements'] - 1
-				);
-				$application_snapshot['intakeCapacity']['availablePlacements'] = max(
-					0,
-					(int) $application_snapshot['intakeCapacity']['totalPlacements']
-					- (int) $application_snapshot['intakeCapacity']['reservedPlacements']
-				);
-			}
-
 			return $this->to_admission_case($application_snapshot, false);
 		}
 
@@ -8110,9 +8111,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				}
 				$application = $this->get_detailed_application_record($application_id);
 				$this->assert_admission_letter_generation_available($application, $template_id);
-				$placement_reserved = false;
+				$offer_reservation_audit_created = false;
 				if ('offer-letter' === $template_id) {
-					$placement_reserved = $this->reserve_offer_placement_for_generated_letter(
+					$offer_reservation_audit_created = $this->reserve_offer_placement_for_generated_letter(
 						$application,
 						$letter_id,
 						$user
@@ -8177,14 +8178,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$file_name . ' created from template version ' . $template_version . '.',
 					'Unable to record the generated letter activity.'
 				);
-				if ($placement_reserved) {
+				if ($offer_reservation_audit_created) {
 					$this->create_required_activity(
 						$application_id,
 						$user,
-						'placement',
-						'Bachelor placement reserved',
-						'A placement was reserved for ' . $this->intake_display_label($application['semester'], $application['year']) . ' when the Offer letter was issued.',
-						'Unable to record the placement reservation activity.'
+						'letter',
+						'Bachelor offer issuance recorded',
+						'The Offer Letter audit was recorded for ' . $this->intake_display_label($application['semester'], $application['year']) . '. No capacity restriction was applied.',
+						'Unable to record the offer issuance audit activity.'
 					);
 				}
 				if ($acceptance_stage_advanced) {
@@ -8305,6 +8306,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'offer-letter' === $template_id
 					&& empty($application['isTestData'])
 					&& $this->is_bachelor_programme($application['programmeCode'] ?? '')
+					&& (
+						$offer_reservation_audit_created
+						|| 'active' === (string) ($application['offerPlacementReservation']['status'] ?? '')
+					)
 				) {
 					$existing_reservation = isset($application['offerPlacementReservation'])
 						? (array) $application['offerPlacementReservation']
@@ -8328,16 +8333,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'cancellationReason' => null,
 						)
 					);
-					if ($placement_reserved && !empty($application['intakeCapacity']['limited'])) {
-						$post_commit_application['intakeCapacity'] = (array) $application['intakeCapacity'];
-						$post_commit_application['intakeCapacity']['reservedPlacements'] =
-							(int) $application['intakeCapacity']['reservedPlacements'] + 1;
-						$post_commit_application['intakeCapacity']['availablePlacements'] = max(
-							0,
-							(int) $application['intakeCapacity']['totalPlacements']
-							- (int) $post_commit_application['intakeCapacity']['reservedPlacements']
-						);
-					}
 				}
 
 				return array(
@@ -10230,8 +10225,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					if (!$this->can_edit_application_data($user) && !$can_continue_assigned_preparation) {
 						throw new Exception('You do not have permission to edit application data.');
 					}
-					$this->assert_active_offer_reservation_intake_unchanged($record_id, $draft);
-
 					$owner_identity = $this->authoritative_agency_contact(
 						isset($existing_application['wordpressUserId']) ? (int) $existing_application['wordpressUserId'] : 0,
 						$existing_application,
@@ -10749,7 +10742,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				: (string) $existing['reviewerDecision'];
 			$next_status = $existing_status;
 
-			if ('review-pending' === $existing_status && 'rejected' === $next_reviewer_decision) {
+			if (
+				'rejected' === $next_reviewer_decision
+				&& (
+					'review-pending' === $existing_status
+					|| !empty($params['dedicatedReviewRejection'])
+				)
+			) {
 				$next_status = 'rejected';
 				if (!array_key_exists('workflowNote', $draft)) {
 					$normalized['workflowNote'] = $this->workflow_note_for_status('rejected');
@@ -10832,6 +10831,17 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				}
 				if (0 === $updated && $expected_version) {
 					throw new Exception(self::STALE_APPLICATION_ERROR);
+				}
+				if (
+					!empty($params['dedicatedReviewRejection'])
+					&& 'rejected' === $next_status
+					&& 'rejected' === $next_reviewer_decision
+				) {
+					$this->release_offer_reservation_audit_for_rejection(
+						$application_id,
+						$assessment_message,
+						$user
+					);
 				}
 
 				$this->upsert_partial_operations_record(
@@ -11076,8 +11086,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$assessment_message_id = wp_generate_uuid4();
 			$existing = $this->get_authorized_application_base($application_id, $user);
 
-			if ('review-pending' !== $this->canonical_status_key((string) $existing['status'])) {
-				throw new Exception('Only an application awaiting review can be rejected.');
+			$existing_status = $this->canonical_status_key((string) $existing['status']);
+			$is_review_stage = 'review-pending' === $existing_status;
+			$is_accepted_active_case = 'academically-cleared' === (string) $existing['reviewerDecision']
+				&& !in_array($existing_status, array('rejected', 'trashed'), true);
+			if (!$is_review_stage && !$is_accepted_active_case) {
+				throw new Exception('Only an application awaiting review or an active academically-cleared application can be rejected.');
 			}
 
 			$application = $this->update_admission_application_operations(
