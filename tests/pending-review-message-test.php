@@ -82,6 +82,7 @@ final class MC_Pending_Message_Test_Wpdb {
 	public $application = array();
 	public $activities = array();
 	public $communications = array();
+	public $reservations = array();
 	public $events = array();
 	public $force_stale = false;
 	public $fail_authoritative_read_after_commit = false;
@@ -138,6 +139,10 @@ final class MC_Pending_Message_Test_Wpdb {
 
 			return $this->application;
 		}
+		if (false !== strpos($query, 'FROM mc_admission_offer_reservations')) {
+			$application_id = isset($call['args'][0]) ? (string) $call['args'][0] : '';
+			return isset($this->reservations[$application_id]) ? $this->reservations[$application_id] : null;
+		}
 
 		return null;
 	}
@@ -165,7 +170,9 @@ final class MC_Pending_Message_Test_Wpdb {
 
 		if (false !== strpos($query, 'SHOW TABLES LIKE')) {
 			$table = isset($args[0]) ? (string) $args[0] : '';
-			return 'mc_admission_communications' === $table ? $table : null;
+			return in_array($table, array('mc_admission_communications', 'mc_admission_offer_reservations'), true)
+				? $table
+				: null;
 		}
 
 		return null;
@@ -183,6 +190,7 @@ final class MC_Pending_Message_Test_Wpdb {
 				'application' => $this->application,
 				'activities' => $this->activities,
 				'communications' => $this->communications,
+				'reservations' => $this->reservations,
 			);
 			return 1;
 		}
@@ -196,6 +204,7 @@ final class MC_Pending_Message_Test_Wpdb {
 				$this->application = $this->transaction_snapshot['application'];
 				$this->activities = $this->transaction_snapshot['activities'];
 				$this->communications = $this->transaction_snapshot['communications'];
+				$this->reservations = $this->transaction_snapshot['reservations'];
 			}
 			$this->committed = false;
 			$this->transaction_snapshot = null;
@@ -261,10 +270,24 @@ final class MC_Pending_Message_Test_Wpdb {
 		return 1;
 	}
 
+	public function update($table, $data, $where, $format = null, $where_format = null) {
+		$this->events[] = 'update:' . $table;
+		if ('mc_admission_offer_reservations' !== $table) {
+			return 1;
+		}
+		$application_id = isset($where['applicationId']) ? (string) $where['applicationId'] : '';
+		if (!isset($this->reservations[$application_id])) {
+			return 0;
+		}
+		$this->reservations[$application_id] = array_merge($this->reservations[$application_id], $data);
+		return 1;
+	}
+
 	public function reset(array $application) {
 		$this->application = $application;
 		$this->activities = array();
 		$this->communications = array();
+		$this->reservations = array();
 		$this->events = array();
 		$this->force_stale = false;
 		$this->fail_authoritative_read_after_commit = false;
@@ -1170,17 +1193,82 @@ pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'Test-data reje
 pending_assert_same(1, count($GLOBALS['wpdb']->communications), 'Test-data rejection must retain the popup history.');
 pending_assert_same('The entry requirements were not met.', $GLOBALS['wpdb']->communications[0]['detail'], 'Test-data history must retain the exact rejection reason.');
 
-// Wrong-stage rejection fails before a transaction or email.
-reset_pending_case(array('status' => 'offer-issued'));
+// An application that was already academically cleared can still be rejected
+// from a later active stage. The stage, decision, reason history, email, and
+// optional legacy offer audit must change as one CAS-protected transaction.
+reset_pending_case(array('status' => 'acceptance-issued', 'reviewerDecision' => 'academically-cleared'));
+$GLOBALS['wpdb']->reservations['app-pending-offline'] = array(
+	'applicationId' => 'app-pending-offline',
+	'programmeCode' => 'business-administration',
+	'semester' => 'fall',
+	'intakeYear' => 2026,
+	'status' => 'active',
+	'generatedLetterId' => 'offer-letter-audit',
+	'reservedAt' => '2026-08-11 09:30:00.000',
+	'reservedByName' => 'Admissions Officer',
+	'releasedAt' => null,
+	'releasedByName' => null,
+	'cancellationReason' => null,
+	'updatedAt' => '2026-08-11 09:30:00.000',
+);
+$accepted_rejection_reason = 'The previously accepted application is no longer eligible.';
+$accepted_rejection = invoke_rejection_command(
+	$rejection_command,
+	'2026-08-11T10:00:00.000Z',
+	$accepted_rejection_reason
+);
+pending_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'A later-stage accepted application must transition to rejected.');
+pending_assert_same('rejected', $GLOBALS['wpdb']->application['reviewerDecision'], 'A later-stage rejection must clear the academically-cleared decision.');
+pending_assert_same('released', $GLOBALS['wpdb']->reservations['app-pending-offline']['status'], 'A later-stage rejection must neutralize an active legacy offer audit.');
+pending_assert_contains($accepted_rejection_reason, $GLOBALS['wpdb']->reservations['app-pending-offline']['cancellationReason'], 'The released audit must identify the rejection reason.');
+pending_assert_same('rejected', $accepted_rejection['application']['stageKey'], 'The returned case must expose the committed later-stage rejection.');
+pending_assert_same($accepted_rejection_reason, $accepted_rejection['application']['assessmentMessageHistory'][0]['message'], 'The later-stage rejection reason must remain visible in assessment history.');
+pending_assert_same(1, count($GLOBALS['mc_pending_mail_calls']), 'A later-stage rejection must email the originating agency exactly once.');
+$reservation_release_index = array_search('update:mc_admission_offer_reservations', $GLOBALS['wpdb']->events, true);
+$accepted_commit_index = array_search('query:COMMIT', $GLOBALS['wpdb']->events, true);
+pending_assert_true(false !== $reservation_release_index && $reservation_release_index < $accepted_commit_index, 'The offer audit release must occur before the rejection transaction commits.');
+
+reset_pending_case(array('status' => 'acceptance-issued', 'reviewerDecision' => 'academically-cleared'));
+$GLOBALS['wpdb']->reservations['app-pending-offline'] = array(
+	'applicationId' => 'app-pending-offline', 'status' => 'active',
+	'programmeCode' => 'business-administration', 'semester' => 'fall', 'intakeYear' => 2026,
+);
+$GLOBALS['wpdb']->audit_insert_false_tables = array('mc_admission_communications');
 pending_assert_throws_message(
-	'Only an application awaiting review can be rejected.',
+	'Unable to record the assessment message history.',
 	function () use ($rejection_command) {
 		invoke_rejection_command($rejection_command);
 	},
-	'Only review-pending applications may use the rejection action.'
+	'A required rejection-history failure must roll back the accepted-case rejection.'
+);
+pending_assert_same('acceptance-issued', $GLOBALS['wpdb']->application['status'], 'A failed accepted-case rejection must roll back the stage.');
+pending_assert_same('academically-cleared', $GLOBALS['wpdb']->application['reviewerDecision'], 'A failed accepted-case rejection must restore the accepted decision.');
+pending_assert_same('active', $GLOBALS['wpdb']->reservations['app-pending-offline']['status'], 'A failed accepted-case rejection must restore the audit row.');
+pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A rolled-back accepted-case rejection must not send email.');
+
+// Wrong-stage rejection fails before a transaction or email.
+reset_pending_case(array('status' => 'offer-issued'));
+pending_assert_throws_message(
+	'Only an application awaiting review or an active academically-cleared application can be rejected.',
+	function () use ($rejection_command) {
+		invoke_rejection_command($rejection_command);
+	},
+	'A later active stage without academic clearance must not use the rejection action.'
 );
 pending_assert_same(false, in_array('query:START TRANSACTION', $GLOBALS['wpdb']->events, true), 'A wrong-stage rejection must fail before a transaction.');
 pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A wrong-stage rejection must not email anyone.');
+
+foreach (array('rejected', 'trashed') as $terminal_status) {
+	reset_pending_case(array('status' => $terminal_status, 'reviewerDecision' => 'academically-cleared'));
+	pending_assert_throws_message(
+		'Only an application awaiting review or an active academically-cleared application can be rejected.',
+		function () use ($rejection_command) {
+			invoke_rejection_command($rejection_command);
+		},
+		'Already rejected and trashed applications must not be rejected again.'
+	);
+	pending_assert_same($terminal_status, $GLOBALS['wpdb']->application['status'], 'A terminal-stage rejection attempt must not change state.');
+}
 
 $rejection_method = $reflection->getMethod('reject_review_application');
 $rejection_lines = file($rejection_method->getFileName());
