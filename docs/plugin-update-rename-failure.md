@@ -26,15 +26,22 @@ incorrect or flattened package paths. This callback must run before Plugin
 Update Checker's callback. Register it at priority `5`; PUC uses the default
 priority and can otherwise return `puc-rename-failed` before the repair runs.
 
+The callback must also return canonical package directories with a trailing
+slash. PUC compares the source path with strict string equality. Returning the
+same path without its slash makes PUC treat it as a rename and, with overwrite
+enabled, it can delete the destination before trying to move the directory onto
+itself.
+
 ## Permanent fix
 
 1. Keep the MC Admissions path-normalization filter registered at priority `5`.
-2. Build the release archive from the plugin repository with the canonical
+2. Preserve a trailing slash on every package directory returned by the filter.
+3. Build the release archive from the plugin repository with the canonical
    top-level directory.
-3. Name the GitHub release asset exactly:
+4. Name the GitHub release asset exactly:
    `mc-admissions-wordpress-backend.zip`
-4. Ensure the plugin header version matches the Git tag and GitHub release.
-5. Verify the ZIP before publishing:
+5. Ensure the plugin header version matches the Git tag and GitHub release.
+6. Verify the ZIP before publishing:
    - one top-level `mc-admissions-wordpress-backend/` directory;
    - main PHP file present directly inside it;
    - `vendor/` and Composer files included;
