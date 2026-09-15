@@ -306,6 +306,7 @@ function get_option($key, $fallback = false) {
 		'mc_admissions_notification_activity_schema_version' => '1',
 		'mc_admissions_resource_index_version' => '1',
 		'mc_admissions_schema_version' => '0.2.14',
+		'mc_admissions_migration_case_schema_version' => '0.2.64',
 		'mc_admissions_offer_detail_schema_version' => '0.2.38',
 		'mc_admissions_case_detail_schema_version' => '0.2.45',
 		'mc_admissions_document_assessment_schema_version' => '1',

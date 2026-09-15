@@ -211,6 +211,7 @@ $GLOBALS['mc_identity_options'] = array(
 	'mc_admissions_application_test_data_schema_version' => '1',
 	'mc_admissions_resource_index_version' => '1',
 	'mc_admissions_schema_version' => '0.2.14',
+	'mc_admissions_migration_case_schema_version' => '0.2.64',
 	'mc_admissions_offer_detail_schema_version' => '0.2.38',
 	'mc_admissions_case_detail_schema_version' => '0.2.45',
 	'mc_admissions_document_assessment_schema_version' => '1',
@@ -773,7 +774,7 @@ $GLOBALS['mc_identity_fail_table_write'] = null;
 $GLOBALS['mc_identity_current_user_id'] = 10;
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-identity_assert_contains('Version: 0.2.63', $plugin_source, 'The plugin header must advertise 0.2.63.');
+identity_assert_contains('Version: 0.2.64', $plugin_source, 'The plugin header must advertise 0.2.64.');
 identity_assert_contains("\$owner_identity['agencyName']", $plugin_source, 'Application saves must use authoritative agency identity.');
 identity_assert_contains("\$owner_identity['consultantName']", $plugin_source, 'Application saves must use the owning Agency Profile contact.');
 identity_assert_contains('$identity_safe_draft', $plugin_source, 'Test-data inference must use the authoritative identity overlay.');

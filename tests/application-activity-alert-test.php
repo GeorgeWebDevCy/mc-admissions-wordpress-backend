@@ -161,6 +161,7 @@ function get_option($key, $fallback = false) {
 		'mc_admissions_notification_activity_schema_version' => '1',
 		'mc_admissions_resource_index_version' => '1',
 		'mc_admissions_schema_version' => '0.2.14',
+		'mc_admissions_migration_case_schema_version' => '0.2.64',
 		'mc_admissions_offer_detail_schema_version' => '0.2.38',
 		'mc_admissions_case_detail_schema_version' => '0.2.45',
 		'mc_admissions_document_assessment_schema_version' => '1',
@@ -907,6 +908,6 @@ alert_assert_contains('catch (Throwable $error)', $workflow_delivery_guard_sourc
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
 alert_assert_not_contains('should_send_draft_creation_alert', $plugin_source, 'The obsolete first-draft email gate must be absent from the plugin.');
 alert_assert_not_contains("'new-application-created'", $plugin_source, 'The obsolete first-draft email event must be absent from the plugin.');
-alert_assert_contains('Version: 0.2.63', $plugin_source, 'The plugin header must advertise version 0.2.63.');
+alert_assert_contains('Version: 0.2.64', $plugin_source, 'The plugin header must advertise version 0.2.64.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;

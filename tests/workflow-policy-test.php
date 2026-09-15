@@ -27,6 +27,8 @@ final class MC_Admissions_Test_Wpdb {
 	public $get_row_result = null;
 	public $update_result = 1;
 	public $insert_result = 1;
+	public $migration_cases_table_available = true;
+	public $entry_permit_expiry_column = true;
 	public $events = array();
 	public $updates = array();
 	public $inserts = array();
@@ -37,6 +39,12 @@ final class MC_Admissions_Test_Wpdb {
 
 	public function get_var($query) {
 		$this->events[] = 'get_var:' . $query;
+		if (false !== strpos($query, 'SHOW TABLES LIKE')) {
+			return $this->migration_cases_table_available ? 'mc_admission_migration_cases' : null;
+		}
+		if (false !== strpos($query, "SHOW COLUMNS FROM mc_admission_migration_cases LIKE 'entryPermitExpiryDate'")) {
+			return $this->entry_permit_expiry_column ? 'entryPermitExpiryDate' : null;
+		}
 		return $this->get_var_result;
 	}
 
@@ -47,7 +55,14 @@ final class MC_Admissions_Test_Wpdb {
 
 	public function query($query) {
 		$this->events[] = 'query:' . $query;
-		return !empty($this->query_results) ? array_shift($this->query_results) : 1;
+		$result = !empty($this->query_results) ? array_shift($this->query_results) : 1;
+		if (
+			false !== $result
+			&& false !== strpos($query, 'ALTER TABLE mc_admission_migration_cases ADD COLUMN entryPermitExpiryDate')
+		) {
+			$this->entry_permit_expiry_column = true;
+		}
+		return $result;
 	}
 
 	public function update($table, $data, $where) {
@@ -65,6 +80,18 @@ final class MC_Admissions_Test_Wpdb {
 
 $GLOBALS['wpdb'] = new MC_Admissions_Test_Wpdb();
 $GLOBALS['mc_admissions_test_roles'] = array();
+$GLOBALS['mc_admissions_test_options'] = array(
+	'mc_admissions_notification_activity_schema_version' => '1',
+	'mc_admissions_application_test_data_schema_version' => '1',
+	'mc_admissions_resource_index_version' => '1',
+	'mc_admissions_schema_version' => '0.2.14',
+	'mc_admissions_migration_case_schema_version' => '0.2.64',
+	'mc_admissions_offer_detail_schema_version' => '0.2.38',
+	'mc_admissions_case_detail_schema_version' => '0.2.45',
+	'mc_admissions_document_assessment_schema_version' => '1',
+	'mc_admissions_finance_workspace_schema_version' => '0.2.61',
+	'mc_admissions_intake_capacity_schema_version' => '0.2.62',
+);
 
 function __($text, $domain = null) {
 	return $text;
@@ -84,19 +111,13 @@ function add_role($slug, $label, $capabilities = array()) {
 }
 
 function get_option($key, $fallback = false) {
-	$versions = array(
-		'mc_admissions_notification_activity_schema_version' => '1',
-		'mc_admissions_resource_index_version' => '1',
-		'mc_admissions_schema_version' => '0.2.14',
-		'mc_admissions_offer_detail_schema_version' => '0.2.38',
-		'mc_admissions_case_detail_schema_version' => '0.2.45',
-		'mc_admissions_document_assessment_schema_version' => '1',
-	);
-
-	return array_key_exists($key, $versions) ? $versions[$key] : $fallback;
+	return array_key_exists($key, $GLOBALS['mc_admissions_test_options'])
+		? $GLOBALS['mc_admissions_test_options'][$key]
+		: $fallback;
 }
 
 function update_option($key, $value, $autoload = null) {
+	$GLOBALS['mc_admissions_test_options'][$key] = $value;
 	return true;
 }
 
@@ -118,6 +139,18 @@ function is_email($email) {
 
 function get_userdata($user_id) {
 	return false;
+}
+
+function sanitize_text_field($value) {
+	return trim(strip_tags((string) $value));
+}
+
+function sanitize_textarea_field($value) {
+	return trim(strip_tags((string) $value));
+}
+
+function current_time($type, $gmt = false) {
+	return '2026-09-15 10:00:00';
 }
 
 require dirname(__DIR__) . '/mc-admissions-wordpress-backend.php';
@@ -144,6 +177,12 @@ $case_record_upsert = $reflection->getMethod('upsert_case_record_and_touch_appli
 $case_record_upsert->setAccessible(true);
 $mutation_error_status = $reflection->getMethod('mutation_error_status');
 $mutation_error_status->setAccessible(true);
+$ensure_migration_case_columns = $reflection->getMethod('ensure_migration_case_columns');
+$ensure_migration_case_columns->setAccessible(true);
+$migration_case_update_data = $reflection->getMethod('migration_case_update_data');
+$migration_case_update_data->setAccessible(true);
+$map_migration_case = $reflection->getMethod('map_migration_case');
+$map_migration_case->setAccessible(true);
 $programme_label_from_code = $reflection->getMethod('programme_label_from_code');
 $programme_label_from_code->setAccessible(true);
 $resolve_programme_label = $reflection->getMethod('resolve_programme_label');
@@ -224,6 +263,7 @@ $masters_board = $to_board_application->invoke(
 		'status' => 'prepayment-pending',
 		'reviewerDecision' => 'pending',
 		'paymentStatus' => 'cleared',
+		'permitExpiryDate' => '2027-08-31',
 		'updatedAt' => '2026-08-12 07:00:00.000',
 	)
 );
@@ -236,6 +276,11 @@ assert_same(
 	'pending',
 	$masters_board['reviewerDecision'],
 	'Board responses must expose reviewerDecision so New and Pending can be separated reliably.'
+);
+assert_same(
+	'2027-08-31',
+	$masters_board['permitExpiryDate'],
+	'Board responses must expose the flattened entry permit expiry date.'
 );
 
 $held_review_board = $to_board_application->invoke(
@@ -475,6 +520,103 @@ foreach ($all_document_ids as $document_id) {
 assert_same(false, $document_upload_policy->invoke($plugin, $users['admin'], 'unknownDocument'), 'Unknown document types must be denied even for administrators.');
 assert_same(false, $document_upload_policy->invoke($plugin, array('roles' => array('subscriber-only')), 'passport'), 'Non-agent external users must be denied uploads.');
 
+$migration_user = array('name' => 'Migration Officer');
+$legacy_migration_data = $migration_case_update_data->invoke(
+	$plugin,
+	array(
+		'decisionDate' => '2026-08-26',
+		'permitReference' => 'MP-100',
+	),
+	$migration_user
+);
+assert_same(
+	false,
+	array_key_exists('entryPermitExpiryDate', $legacy_migration_data),
+	'An older client that omits entryPermitExpiryDate must not clear a stored expiry date.'
+);
+
+$valid_migration_data = $migration_case_update_data->invoke(
+	$plugin,
+	array('entryPermitExpiryDate' => '2027-08-31'),
+	$migration_user
+);
+assert_same(
+	'2027-08-31',
+	$valid_migration_data['entryPermitExpiryDate'],
+	'A real ISO entry permit expiry date must be persisted unchanged.'
+);
+
+$cleared_migration_data = $migration_case_update_data->invoke(
+	$plugin,
+	array('entryPermitExpiryDate' => null),
+	$migration_user
+);
+assert_same(
+	null,
+	$cleared_migration_data['entryPermitExpiryDate'],
+	'An explicit blank entry permit expiry date must clear the stored value to NULL.'
+);
+
+assert_throws_message(
+	'Entry permit expiry date must use YYYY-MM-DD.',
+	function () use ($migration_case_update_data, $plugin, $migration_user) {
+		$migration_case_update_data->invoke(
+			$plugin,
+			array('entryPermitExpiryDate' => '2026-02-30'),
+			$migration_user
+		);
+	},
+	'An impossible entry permit expiry calendar date must be rejected.'
+);
+
+assert_throws_message(
+	'Entry permit expiry date must use YYYY-MM-DD.',
+	function () use ($migration_case_update_data, $plugin, $migration_user) {
+		$migration_case_update_data->invoke(
+			$plugin,
+			array('entryPermitExpiryDate' => 20270831),
+			$migration_user
+		);
+	},
+	'A non-string entry permit expiry value must be rejected instead of treated as blank.'
+);
+
+$mapped_migration_case = $map_migration_case->invoke(
+	$plugin,
+	array(
+		'id' => 'migration-case-1',
+		'packPreparedDate' => null,
+		'packSubmittedDate' => null,
+		'paymentReference' => null,
+		'paymentDate' => null,
+		'decisionDate' => '2026-08-26',
+		'entryPermitExpiryDate' => '2027-08-31',
+		'permitReference' => 'MP-100',
+		'note' => null,
+		'recordedByName' => 'Migration Officer',
+		'updatedAt' => '2026-09-15 10:00:00.000',
+	)
+);
+assert_same(
+	'2027-08-31',
+	$mapped_migration_case['entryPermitExpiryDate'],
+	'Detailed application responses must map entryPermitExpiryDate inside migrationCase.'
+);
+
+$mapped_legacy_migration_case = $map_migration_case->invoke(
+	$plugin,
+	array(
+		'id' => 'migration-case-legacy',
+		'recordedByName' => 'Migration Officer',
+		'updatedAt' => '2026-09-15 10:00:00.000',
+	)
+);
+assert_same(
+	null,
+	$mapped_legacy_migration_case['entryPermitExpiryDate'],
+	'A legacy migration row without the new value must map it as NULL.'
+);
+
 $expected_case_version = '2026-07-29T10:11:12.345Z';
 $case_user = array('name' => 'Offline concurrency test');
 $stale_db = new MC_Admissions_Test_Wpdb();
@@ -527,8 +669,45 @@ assert_same(409, $mutation_error_status->invoke($plugin, new Exception(MC_Admiss
 assert_same(400, $mutation_error_status->invoke($plugin, new Exception('Other write failure.')), 'Non-stale write errors should remain HTTP 400.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
+assert_string_contains(' * Version: 0.2.64', $plugin_source, 'The plugin release header must be bumped for updater detection.');
+assert_string_contains('$this->ensure_migration_case_columns();', $plugin_source, 'The migration schema upgrader must run during plugin boot.');
+assert_string_contains("? 'migration.entryPermitExpiryDate'", $plugin_source, 'The board query must select the flattened permit expiry date after schema verification.');
+assert_string_contains("\t\t\t\t: 'NULL';", $plugin_source, 'The board query must safely return a null expiry when the schema upgrade is unavailable.');
 assert_same(true, substr_count($plugin_source, '$expected_updated_at = isset($params[' . "'expectedUpdatedAt'" . '])') >= 2, 'Migration and immigration REST upserts must accept expectedUpdatedAt.');
 assert_same(2, substr_count($plugin_source, '$this->mutation_error_status($error)'), 'Both migration and immigration REST upserts must use stale-aware HTTP status mapping.');
+
+unset($GLOBALS['mc_admissions_test_options']['mc_admissions_migration_case_schema_version']);
+$failed_schema_db = new MC_Admissions_Test_Wpdb();
+$failed_schema_db->entry_permit_expiry_column = false;
+$failed_schema_db->query_results = array(false);
+$GLOBALS['wpdb'] = $failed_schema_db;
+$ensure_migration_case_columns->invoke($plugin);
+assert_same(
+	false,
+	array_key_exists('mc_admissions_migration_case_schema_version', $GLOBALS['mc_admissions_test_options']),
+	'A failed ALTER TABLE must not record the migration-case schema version.'
+);
+assert_same(
+	false,
+	$failed_schema_db->entry_permit_expiry_column,
+	'A failed migration must leave the expiry column absent.'
+);
+
+$successful_schema_db = new MC_Admissions_Test_Wpdb();
+$successful_schema_db->entry_permit_expiry_column = false;
+$GLOBALS['wpdb'] = $successful_schema_db;
+$ensure_migration_case_columns->invoke($plugin);
+assert_same(true, $successful_schema_db->entry_permit_expiry_column, 'The migration upgrader must add the expiry column.');
+assert_same(
+	'0.2.64',
+	$GLOBALS['mc_admissions_test_options']['mc_admissions_migration_case_schema_version'],
+	'The migration-case schema version must be recorded only after the column is verified.'
+);
+assert_same(
+	4,
+	count($successful_schema_db->events),
+	'The migration upgrader must check the table, check the column, alter it, and verify it.'
+);
 
 $pack_expectations = array(
 	'prepayment-pending' => 'intake',
