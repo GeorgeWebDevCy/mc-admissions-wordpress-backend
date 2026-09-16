@@ -262,6 +262,7 @@ $masters_board = $to_board_application->invoke(
 		'id' => 'offline-master-record',
 		'referenceCode' => 'MC-OFFLINE',
 		'fullName' => 'Offline Master Applicant',
+		'passportNumber' => 'K1234567',
 		'agencyName' => 'Offline Agency',
 		'applicationRoute' => 'postgraduate',
 		'programmeCode' => 'business-administration-masters',
@@ -279,6 +280,11 @@ assert_same(
 	"Master's degree in Business Administration (MBA)",
 	$masters_board['programme'],
 	'Board and case responses must expose the repaired Master\'s programme label.'
+);
+assert_same(
+	'K1234567',
+	$masters_board['passportNumber'],
+	'Board responses must expose the application passport number.'
 );
 assert_same(
 	'pending',
@@ -310,6 +316,7 @@ $held_review_board = $to_board_application->invoke(
 	)
 );
 assert_same('hold', $held_review_board['reviewerDecision'], 'A held review must remain identifiable on the board.');
+assert_same('', $held_review_board['passportNumber'], 'Legacy board rows without a passport number must expose an empty string.');
 assert_same(
 	'Wait for the agency response to the Pending review message, then reassess the case.',
 	$held_review_board['nextAction'],
@@ -677,7 +684,7 @@ assert_same(409, $mutation_error_status->invoke($plugin, new Exception(MC_Admiss
 assert_same(400, $mutation_error_status->invoke($plugin, new Exception('Other write failure.')), 'Non-stale write errors should remain HTTP 400.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-assert_string_contains(' * Version: 0.2.67', $plugin_source, 'The plugin release header must be bumped for updater detection.');
+assert_string_contains(' * Version: 0.2.68', $plugin_source, 'The plugin release header must be bumped for updater detection.');
 assert_string_contains('$this->ensure_migration_case_columns();', $plugin_source, 'The migration schema upgrader must run during plugin boot.');
 assert_string_contains("? 'migration.entryPermitExpiryDate'", $plugin_source, 'The board query must select the flattened permit expiry date after schema verification.');
 assert_string_contains("\t\t\t\t: 'NULL';", $plugin_source, 'The board query must safely return a null expiry when the schema upgrade is unavailable.');
