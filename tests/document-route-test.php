@@ -705,6 +705,376 @@ $persist_assessments = $reflection->getMethod('persist_document_assessments');
 $persist_assessments->setAccessible(true);
 $clear_document = $reflection->getMethod('clear_document_record_and_touch_application');
 $clear_document->setAccessible(true);
+$filter_agent_case = $reflection->getMethod('application_case_response_for_user');
+$filter_agent_case->setAccessible(true);
+$filter_agent_board = $reflection->getMethod('application_board_response_for_user');
+$filter_agent_board->setAccessible(true);
+$get_document_download = $reflection->getMethod('get_admission_document_download');
+$get_document_download->setAccessible(true);
+$get_application_case_source = document_method_source($reflection, 'get_admission_application_case');
+document_assert_contains(
+	'$this->get_authorized_application_base($application_id, $user)',
+	$get_application_case_source,
+	'Opening a case must authorize the application owner before loading its detail.'
+);
+document_assert_contains(
+	'$this->application_case_response_for_user($case, $user)',
+	$get_application_case_source,
+	'Opening a case must apply the role-specific response boundary.'
+);
+
+$agent_user = array('id' => 42, 'name' => 'Offline Agent', 'roles' => array('mc_agent'));
+$staff_user = array('id' => 7, 'name' => 'Offline Admin', 'roles' => array('administrator'));
+$agent_case_fixture = array_merge(
+	document_detailed_application(array(
+		'wordpressUsername' => 'offline-agent',
+		'wordpressEmail' => 'offline-agent@example.test',
+		'permitStatus' => 'approved',
+	)),
+	array(
+		'recordId' => 'application-1',
+		'studentName' => 'Offline Applicant',
+		'agentName' => 'Offline Agency',
+		'programme' => 'English Foundation Year',
+		'semesterCode' => 'fall',
+		'stage' => 'Migration documents',
+		'stageKey' => 'migration-documents',
+		'lane' => 'migration',
+		'progress' => 72,
+		'missingDocs' => 1,
+		'readyDocuments' => 3,
+		'totalIntakeDocuments' => 6,
+		'intakeMissingDocs' => 0,
+		'intakeReadyDocuments' => 6,
+		'totalMigrationDocuments' => 4,
+		'migrationMissingDocs' => 1,
+		'migrationReadyDocuments' => 3,
+		'totalImmigrationDocuments' => 10,
+		'immigrationMissingDocs' => 10,
+		'immigrationReadyDocuments' => 0,
+		'activeDocumentPack' => 'migration',
+		'documents' => array(array(
+			'id' => 'passport-document',
+			'type' => 'passport',
+			'label' => 'Copy of passport',
+			'isReady' => true,
+			'assessmentStatus' => 'approved',
+			'assessmentRemark' => 'Readable copy.',
+			'assessedAt' => '2026-07-29T12:30:00.000Z',
+			'assessedByName' => 'Internal Reviewer',
+			'uploadedUrl' => '/api/admissions/application-1/documents/passport-document/file',
+			'originalName' => 'passport.pdf',
+			'mimeType' => 'application/pdf',
+			'fileSizeBytes' => 12,
+			'uploadedAt' => '2026-07-29T12:00:00.000Z',
+			'uploadedByName' => 'Internal Staff',
+			'storageItemId' => 'private-storage-id',
+		), array(
+			'id' => 'medical-document',
+			'type' => 'medicalCertificate',
+			'label' => 'Medical certificate',
+			'isReady' => true,
+			'uploadedUrl' => '/api/admissions/application-1/documents/medical-document/file',
+			'originalName' => 'internal-medical.pdf',
+			'mimeType' => 'application/pdf',
+			'fileSizeBytes' => 24,
+			'uploadedAt' => '2026-07-30T12:00:00.000Z',
+			'uploadedByName' => 'Internal Immigration',
+		)),
+		'letters' => array(array(
+			'id' => 'letter-1',
+			'templateId' => 'acceptance-letter',
+			'templateLabel' => 'Acceptance letter',
+			'templateVersion' => '2026-07',
+			'stageKey' => 'acceptance-issued',
+			'fileName' => 'acceptance.pdf',
+			'outputFormat' => 'pdf',
+			'outputUrl' => '/api/admissions/application-1/letters/letter-1/file',
+			'generatedAt' => '2026-07-29T13:00:00.000Z',
+			'generatedByName' => 'Internal Admissions',
+		)),
+		'assessmentMessageHistory' => array(array(
+			'id' => 'internal-assessment-message',
+			'message' => 'Internal assessment history marker.',
+		)),
+		'reviewSummary' => 'Internal academic assessment.',
+		'decisionDueDate' => '2026-08-15',
+		'workflowNote' => 'Internal workflow note.',
+		'financeNote' => 'Internal finance note.',
+		'paymentStatus' => 'cleared',
+		'paymentAmount' => '4000.00',
+		'paymentReference' => 'PRIVATE-PAYMENT-REFERENCE',
+		'paymentTransactions' => array(array('id' => 'payment-1', 'note' => 'Internal payment note.')),
+		'permitReference' => 'MP-PRIVATE',
+		'permitNote' => 'Internal permit note.',
+		'migrationCase' => array('id' => 'migration-1', 'note' => 'Internal migration note.'),
+		'immigrationCase' => array('id' => 'immigration-1', 'note' => 'Internal immigration note.'),
+		'commissions' => array(array('id' => 'commission-1')),
+		'refunds' => array(array('id' => 'refund-1')),
+		'letterDrafts' => array(array('id' => 'draft-1', 'body' => 'Internal draft.')),
+		'communications' => array(array('id' => 'communication-1', 'detail' => 'Internal email audit.')),
+		'activity' => array(array('id' => 'activity-1', 'detail' => 'Internal activity.')),
+	)
+);
+
+$filtered_agent_case = $filter_agent_case->invoke($plugin, $agent_case_fixture, $agent_user);
+foreach (array(
+	'fullName', 'passportNumber', 'email', 'phone', 'birthday', 'address', 'city',
+	'postalCode', 'country', 'gender', 'semesterCode', 'year', 'programmeCode',
+	'consultantName', 'consultantEmail', 'consultantPhone', 'submissionDate',
+	'tuitionAcknowledged', 'offerTermsAcknowledged', 'gdprAcknowledged',
+) as $submitted_field) {
+	document_assert_same(
+		$agent_case_fixture[$submitted_field],
+		$filtered_agent_case[$submitted_field] ?? null,
+		'Agent case responses must retain submitted field ' . $submitted_field . '.'
+	);
+}
+document_assert_same('approved', $filtered_agent_case['permitStatus'], 'Agent case responses must expose the current permit status.');
+document_assert_same(1, count($filtered_agent_case['documents']), 'Agent case responses must retain submitted document metadata.');
+document_assert_same(
+	'/api/admissions/application-1/documents/passport-document/file',
+	$filtered_agent_case['documents'][0]['uploadedUrl'],
+	'Agent document metadata must retain the authenticated download URL.'
+);
+$agent_case_json = json_encode($filtered_agent_case);
+document_assert_same(false, false !== strpos((string) $agent_case_json, 'medical-document'), 'Agent case responses must exclude staff-side migration and immigration documents.');
+document_assert_same(false, false !== strpos((string) $agent_case_json, 'internal-medical.pdf'), 'Agent case responses must exclude staff-side document metadata and URLs.');
+document_assert_same(false, array_key_exists('assessmentMessageHistory', $filtered_agent_case), 'Agent mutation responses must not carry assessment-message history through the external response sanitizer.');
+document_assert_same(false, array_key_exists('storageItemId', $filtered_agent_case['documents'][0]), 'Agent document metadata must not expose storage identifiers.');
+document_assert_same(false, array_key_exists('assessedByName', $filtered_agent_case['documents'][0]), 'Agent document metadata must not expose internal reviewer identity.');
+document_assert_same(false, array_key_exists('assessmentStatus', $filtered_agent_case['documents'][0]), 'Agent document metadata must not expose internal assessment status.');
+document_assert_same(false, array_key_exists('assessmentRemark', $filtered_agent_case['documents'][0]), 'Agent document metadata must not expose internal assessment remarks.');
+document_assert_same(false, array_key_exists('assessedAt', $filtered_agent_case['documents'][0]), 'Agent document metadata must not expose internal assessment timestamps.');
+document_assert_same(1, count($filtered_agent_case['letters']), 'Agent case responses must retain safe generated-letter metadata.');
+document_assert_same(
+	'/api/admissions/application-1/letters/letter-1/file',
+	$filtered_agent_case['letters'][0]['outputUrl'],
+	'Agent generated-letter metadata must retain the authenticated download URL.'
+);
+document_assert_same(false, array_key_exists('generatedByName', $filtered_agent_case['letters'][0]), 'Agent generated-letter metadata must not expose internal generator identity.');
+foreach (array('generatedByName', 'assessmentStatus', 'assessmentRemark', 'assessedAt') as $internal_marker) {
+	document_assert_same(
+		false,
+		false !== strpos((string) $agent_case_json, $internal_marker),
+		'Agent case responses must not expose internal marker ' . $internal_marker . '.'
+	);
+}
+$safe_placeholders = array(
+	'activity' => array(),
+	'communications' => array(),
+	'letterDrafts' => array(),
+	'paymentTransactions' => array(),
+	'commissions' => array(),
+	'refunds' => array(),
+	'workflowNote' => null,
+	'reviewerDecision' => 'pending',
+	'reviewSummary' => null,
+	'decisionDueDate' => null,
+	'offerIssuedDate' => null,
+	'offerExpiryDate' => null,
+	'offerConditionNote' => null,
+	'classesStartDate' => null,
+	'tuitionFeeFirstYear' => null,
+	'tuitionFeeFollowingYears' => null,
+	'termBalanceApplies' => false,
+	'paymentStatus' => 'awaiting-invoice',
+	'paymentAmount' => null,
+	'paymentCurrency' => 'EUR',
+	'paymentReference' => null,
+	'paymentConfirmedDate' => null,
+	'financeNote' => null,
+	'permitReference' => null,
+	'permitSubmittedDate' => null,
+	'permitDecisionDate' => null,
+	'permitNote' => null,
+	'arrivalStatus' => 'planning',
+	'travelDate' => null,
+	'accommodationStatus' => null,
+	'enrollmentStatus' => 'pending',
+	'orientationDate' => null,
+	'enrollmentNote' => null,
+	'lateArrivalReason' => null,
+	'migrationCase' => null,
+	'immigrationCase' => null,
+);
+foreach ($safe_placeholders as $field => $expected_value) {
+	document_assert_same(true, array_key_exists($field, $filtered_agent_case), 'Agent case responses must remain shape-complete for ' . $field . '.');
+	document_assert_same($expected_value, $filtered_agent_case[$field], 'Agent case responses must neutralize hidden field ' . $field . '.');
+}
+document_assert_same($agent_case_fixture, $filter_agent_case->invoke($plugin, $agent_case_fixture, $staff_user), 'Internal staff case responses must remain unchanged.');
+
+$GLOBALS['mc_document_current_user'] = document_test_user(array('mc_agent'), 42);
+$agent_library_db = new MC_Document_Test_Wpdb();
+$agent_library_db->rows_results = array(
+	array(array(
+		'id' => 'application-1',
+		'referenceCode' => 'MC-DOC1',
+		'fullName' => 'Offline Applicant',
+		'agencyName' => 'Offline Agency',
+	)),
+	array(array(
+		'id' => 'letter-1',
+		'applicationId' => 'application-1',
+		'templateLabel' => 'Acceptance letter',
+		'fileName' => 'acceptance.pdf',
+		'createdAt' => '2026-07-29 13:00:00.000',
+		'generatedByName' => 'Internal Admissions',
+	)),
+	array(
+		array(
+			'id' => 'passport-document',
+			'type' => 'passport',
+			'label' => 'Copy of passport',
+			'originalName' => 'passport.pdf',
+			'uploadedByName' => 'Internal Staff',
+			'uploadedAt' => '2026-07-29 12:00:00.000',
+			'createdAt' => '2026-07-29 12:00:00.000',
+			'mimeType' => 'application/pdf',
+			'uploadedUrl' => '/api/admissions/application-1/documents/passport-document/file',
+		),
+		array(
+			'id' => 'medical-document',
+			'type' => 'medicalCertificate',
+			'label' => 'Medical certificate',
+			'originalName' => 'internal-medical.pdf',
+			'uploadedByName' => 'Internal Immigration',
+			'uploadedAt' => '2026-07-30 12:00:00.000',
+			'createdAt' => '2026-07-30 12:00:00.000',
+			'mimeType' => 'application/pdf',
+			'uploadedUrl' => '/api/admissions/application-1/documents/medical-document/file',
+		),
+	),
+);
+$agent_library_db->var_results = array('mc_generated_letters');
+$GLOBALS['wpdb'] = $agent_library_db;
+$agent_library = $plugin->rest_get_document_library();
+document_assert_same(200, $agent_library->get_status(), 'Agents must retain their scoped document library.');
+$agent_library_application = $agent_library->get_data()['applications'][0];
+document_assert_same(1, count($agent_library_application['documents']), 'The agent document library must exclude staff-side migration and immigration documents.');
+document_assert_same('passport', $agent_library_application['documents'][0]['type'], 'The agent document library must retain intake-side documents.');
+document_assert_same(false, array_key_exists('uploadedByName', $agent_library_application['documents'][0]), 'The agent document library must not expose internal uploader identity.');
+document_assert_same(false, array_key_exists('generatedByName', $agent_library_application['generatedLetters'][0]), 'The agent document library must not expose internal letter generator identity.');
+$agent_library_events = implode("\n", $agent_library_db->events);
+document_assert_contains('type IN (%s', $agent_library_events, 'The agent document library must restrict intake document types in SQL before applying its limit.');
+document_assert_same(
+	true,
+	strpos($agent_library_events, 'type IN (%s') < strpos($agent_library_events, 'ORDER BY updatedAt DESC, createdAt DESC LIMIT 12'),
+	'The intake-document SQL predicate must be applied before ORDER BY and LIMIT.'
+);
+
+$agent_board_fixture = array(
+	'recordId' => 'application-1',
+	'id' => 'MC-DOC1',
+	'studentName' => 'Offline Applicant',
+	'passportNumber' => 'OFFLINE',
+	'agentName' => 'Offline Agency',
+	'programme' => 'English Foundation Year',
+	'semester' => 'fall 2026',
+	'stage' => 'Migration documents',
+	'stageKey' => 'migration-documents',
+	'reviewerDecision' => 'academically-cleared',
+	'permitStatus' => 'approved',
+	'lane' => 'migration',
+	'progress' => 72,
+	'updatedAt' => '2026-07-29T12:00:00.000Z',
+	'isLive' => true,
+	'permitReference' => 'MP-PRIVATE',
+	'commissionStatus' => 'payable',
+	'refundStatus' => 'requested',
+	'workflowNote' => 'Internal workflow note.',
+	'updatedByName' => 'Internal Staff',
+);
+$filtered_agent_board = $filter_agent_board->invoke($plugin, $agent_board_fixture, $agent_user);
+document_assert_same('OFFLINE', $filtered_agent_board['passportNumber'], 'Agent board responses must retain passport-number search data.');
+document_assert_same('approved', $filtered_agent_board['permitStatus'], 'Agent board responses must retain the current permit status.');
+foreach (array('reviewerDecision', 'permitReference', 'commissionStatus', 'refundStatus', 'workflowNote', 'updatedByName') as $internal_field) {
+	document_assert_same(false, array_key_exists($internal_field, $filtered_agent_board), 'Agent board responses must not expose internal field ' . $internal_field . '.');
+}
+
+$owner_download_db = new MC_Document_Test_Wpdb();
+$owner_download_db->row_results = array(
+	document_application_base(42, array('status' => 'migration-documents')),
+	array(
+		'type' => 'passport',
+		'label' => 'Copy of passport',
+		'originalName' => 'passport.pdf',
+		'mimeType' => 'application/pdf',
+		'storageDriveId' => 'drive-1',
+		'storageItemId' => 'item-1',
+	),
+);
+$GLOBALS['wpdb'] = $owner_download_db;
+$owner_download = $get_document_download->invoke($plugin, array(
+	'applicationId' => 'application-1',
+	'documentId' => 'passport-document',
+	'user' => $agent_user,
+));
+document_assert_same('item-1', $owner_download['storageItemId'], 'The owning agent must retain document streaming access after submission.');
+
+$GLOBALS['mc_document_current_user'] = document_test_user(array('mc_agent'), 42);
+$internal_download_db = new MC_Document_Test_Wpdb();
+$internal_download_db->row_results = array(
+	document_application_base(42, array('status' => 'migration-documents')),
+	array(
+		'type' => 'medicalCertificate',
+		'label' => 'Medical certificate',
+		'originalName' => 'internal-medical.pdf',
+		'mimeType' => 'application/pdf',
+		'storageDriveId' => 'drive-1',
+		'storageItemId' => 'internal-item-1',
+	),
+);
+$GLOBALS['wpdb'] = $internal_download_db;
+$internal_download = $plugin->rest_download_document_file(new WP_REST_Request(array(
+	'application_id' => 'application-1',
+	'document_id' => 'medical-document',
+)));
+document_assert_same(403, $internal_download->get_status(), 'An owning agent must not stream staff-side migration or immigration documents.');
+
+$staff_internal_download_db = new MC_Document_Test_Wpdb();
+$staff_internal_download_db->row_results = array(
+	document_application_base(42, array('status' => 'migration-documents')),
+	array(
+		'type' => 'medicalCertificate',
+		'label' => 'Medical certificate',
+		'originalName' => 'internal-medical.pdf',
+		'mimeType' => 'application/pdf',
+		'storageDriveId' => 'drive-1',
+		'storageItemId' => 'internal-item-1',
+	),
+);
+$GLOBALS['wpdb'] = $staff_internal_download_db;
+$staff_internal_download = $get_document_download->invoke($plugin, array(
+	'applicationId' => 'application-1',
+	'documentId' => 'medical-document',
+	'user' => $staff_user,
+));
+document_assert_same('internal-item-1', $staff_internal_download['storageItemId'], 'Internal staff must retain staff-side document access.');
+
+$foreign_download_db = new MC_Document_Test_Wpdb();
+$foreign_download_db->row_results = array(document_application_base(99, array('status' => 'migration-documents')));
+$GLOBALS['wpdb'] = $foreign_download_db;
+$foreign_download_error = null;
+try {
+	$get_document_download->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'documentId' => 'passport-document',
+		'user' => $agent_user,
+	));
+} catch (Throwable $error) {
+	$foreign_download_error = $error->getMessage();
+}
+document_assert_same('You are not allowed to access this application.', $foreign_download_error, 'An agent must not stream another agency\'s document.');
+document_assert_same(1, count($foreign_download_db->events), 'A rejected cross-agency download must stop before document metadata is queried.');
+
+$GLOBALS['mc_document_current_user'] = document_test_user(array('mc_agent'), 42);
+$restricted_panel_db = new MC_Document_Test_Wpdb();
+$GLOBALS['wpdb'] = $restricted_panel_db;
+document_assert_same(403, $plugin->rest_list_payments(new WP_REST_Request(array('application_id' => 'application-1')))->get_status(), 'Agents must not read internal payment transactions directly.');
+document_assert_same(403, $plugin->rest_get_migration_case(new WP_REST_Request(array('application_id' => 'application-1')))->get_status(), 'Agents must not read internal migration case details directly.');
+document_assert_same(403, $plugin->rest_get_immigration_case(new WP_REST_Request(array('application_id' => 'application-1')))->get_status(), 'Agents must not read internal immigration case details directly.');
+document_assert_same(array(), $restricted_panel_db->events, 'Restricted agent sub-panel reads must fail before database access.');
 
 foreach (array('update_admission_document_assessments', 'delete_admission_document') as $method_name) {
 	document_assert_contains(

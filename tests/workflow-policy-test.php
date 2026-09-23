@@ -684,7 +684,7 @@ assert_same(409, $mutation_error_status->invoke($plugin, new Exception(MC_Admiss
 assert_same(400, $mutation_error_status->invoke($plugin, new Exception('Other write failure.')), 'Non-stale write errors should remain HTTP 400.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-assert_string_contains(' * Version: 0.2.68', $plugin_source, 'The plugin release header must be bumped for updater detection.');
+assert_string_contains(' * Version: 0.2.69', $plugin_source, 'The plugin release header must be bumped for updater detection.');
 assert_string_contains('$this->ensure_migration_case_columns();', $plugin_source, 'The migration schema upgrader must run during plugin boot.');
 assert_string_contains("? 'migration.entryPermitExpiryDate'", $plugin_source, 'The board query must select the flattened permit expiry date after schema verification.');
 assert_string_contains("\t\t\t\t: 'NULL';", $plugin_source, 'The board query must safely return a null expiry when the schema upgrade is unavailable.');
