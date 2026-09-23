@@ -55,6 +55,7 @@ final class MC_Intake_Test_Role {
 final class MC_Intake_Test_Wpdb {
 	public $prefix = 'wp_';
 	public $application;
+	public $boardApplications = array();
 	public $profile;
 	public $documents = array();
 	public $capacities = array();
@@ -78,6 +79,7 @@ final class MC_Intake_Test_Wpdb {
 
 	public function __construct() {
 		$this->application = intake_application();
+		$this->boardApplications = array($this->application);
 		$this->profile = intake_profile();
 	}
 
@@ -195,6 +197,7 @@ final class MC_Intake_Test_Wpdb {
 	public function get_results($prepared, $output = null) {
 		$call = $this->unpack($prepared);
 		$query = $call['query'];
+		$args = $call['args'];
 		if (false !== strpos($query, 'SELECT year, programmeCode, status, reviewerDecision, isTestData')) {
 			if ($this->failAnnualSeatQuery) {
 				$this->last_error = 'Offline annual seat query failure.';
@@ -207,6 +210,16 @@ final class MC_Intake_Test_Wpdb {
 			return array_values(array_filter($this->historicalOfferCandidates, function ($candidate) {
 				return !isset($this->reservations[(string) ($candidate['applicationId'] ?? '')]);
 			}));
+		}
+		if (false !== strpos($query, 'FROM mc_admission_applications app')) {
+			$applications = array_values($this->boardApplications);
+			if (false !== strpos($query, 'WHERE app.wordpressUserId = %d')) {
+				$owner_id = (int) ($args[0] ?? 0);
+				$applications = array_values(array_filter($applications, static function ($application) use ($owner_id) {
+					return (int) ($application['wordpressUserId'] ?? 0) === $owner_id;
+				}));
+			}
+			return $applications;
 		}
 		if (false !== strpos($query, 'FROM mc_admission_intake_capacities')) {
 			return array_values($this->capacities);
@@ -887,6 +900,26 @@ $GLOBALS['wpdb']->annualSeatApplications = array(intake_application(array(
 	'isTestData' => 0,
 	'reviewerDecision' => 'academically-cleared',
 )));
+$GLOBALS['wpdb']->boardApplications = array(
+	intake_application(array(
+		'id' => 'agent-owned-case',
+		'referenceCode' => 'MC-OWNED',
+		'wordpressUserId' => 42,
+		'passportNumber' => 'OWNED-PASSPORT',
+		'status' => 'migration-documents',
+		'permitStatus' => 'approved',
+		'permitReference' => 'MP-INTERNAL',
+		'commissionStatus' => 'payable',
+		'refundStatus' => 'requested',
+		'workflowNote' => 'Internal workflow note.',
+	)),
+	intake_application(array(
+		'id' => 'other-agency-case',
+		'referenceCode' => 'MC-FOREIGN',
+		'wordpressUserId' => 77,
+		'passportNumber' => 'FOREIGN-PASSPORT',
+	)),
+);
 $GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
 $internal_board = $plugin->rest_list_applications();
 intake_assert_same(200, $internal_board->get_status(), 'Internal staff must be able to load the application board with annual seats.');
@@ -895,6 +928,14 @@ $GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
 $agent_board = $plugin->rest_list_applications();
 intake_assert_same(200, $agent_board->get_status(), 'Agents must retain their scoped application board access.');
 intake_assert_same(array(), $agent_board->get_data()['annualSeatSummary'], 'Agents must not receive College-wide annual seat totals.');
+$agent_board_applications = $agent_board->get_data()['applications'];
+intake_assert_same(1, count($agent_board_applications), 'Agents must receive only applications owned by their WordPress account.');
+intake_assert_same('agent-owned-case', $agent_board_applications[0]['recordId'], 'The scoped board must retain the owning agent application.');
+intake_assert_same('OWNED-PASSPORT', $agent_board_applications[0]['passportNumber'], 'The scoped board must retain passport-number search data.');
+intake_assert_same('approved', $agent_board_applications[0]['permitStatus'], 'The scoped board must retain the current permit status.');
+foreach (array('permitReference', 'commissionStatus', 'refundStatus', 'workflowNote', 'updatedByName') as $internal_field) {
+	intake_assert_same(false, array_key_exists($internal_field, $agent_board_applications[0]), 'The agent board must not expose internal field ' . $internal_field . '.');
+}
 $GLOBALS['wpdb']->failAnnualSeatQuery = true;
 $GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
 $failed_internal_board = $plugin->rest_list_applications();

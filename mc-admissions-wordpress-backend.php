@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.68
+ * Version: 0.2.69
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -4266,10 +4266,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			try {
 				$user = $this->current_session_user();
+				$external_agent_view = !$this->can_view_all_applications($user);
 
 				$where = '';
 				$args = array();
-				if (!$this->can_view_all_applications($user)) {
+				if ($external_agent_view) {
 					$where = 'WHERE wordpressUserId = %d';
 					$args[] = (int) $user['id'];
 				}
@@ -4305,13 +4306,39 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					$document_type_sql = '';
+					$document_query_args = array($aid);
+					if ($external_agent_view) {
+						$visible_document_types = $this->external_agent_application_document_types();
+						$document_type_sql = ' AND type IN (' . implode(', ', array_fill(0, count($visible_document_types), '%s')) . ')';
+						$document_query_args = array_merge($document_query_args, $visible_document_types);
+					}
 					$docs = $wpdb->get_results(
 						$wpdb->prepare(
-							"SELECT id, label, originalName, uploadedByName, uploadedAt, createdAt, mimeType, uploadedUrl FROM {$this->documents_table} WHERE applicationId = %s AND isReady = 1 ORDER BY updatedAt DESC, createdAt DESC LIMIT 12",
-							$aid
+							"SELECT id, type, label, originalName, uploadedByName, uploadedAt, createdAt, mimeType, uploadedUrl FROM {$this->documents_table} WHERE applicationId = %s AND isReady = 1{$document_type_sql} ORDER BY updatedAt DESC, createdAt DESC LIMIT 12",
+							$document_query_args
 						),
 						ARRAY_A
 					);
+					if ($external_agent_view) {
+						$letters = array_map(
+							static function ($letter) {
+								unset($letter['generatedByName']);
+								return $letter;
+							},
+							is_array($letters) ? $letters : array()
+						);
+						$docs = array_map(
+							static function ($document) {
+								unset($document['uploadedByName']);
+								return $document;
+							},
+							array_values(array_filter(
+								is_array($docs) ? $docs : array(),
+								array($this, 'is_external_agent_application_document_type')
+							))
+						);
+					}
 
 					$app['generatedLetters'] = is_array($letters) ? $letters : array();
 					$app['documents'] = is_array($docs) ? $docs : array();
@@ -4451,6 +4478,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			try {
 				$user = $this->current_session_user();
 				$applications = $this->list_admission_board_applications($user);
+				if (!$this->can_view_all_applications($user)) {
+					$applications = array_map(
+						array($this, 'to_external_agent_board_application'),
+						$applications
+					);
+				}
 
 				return new WP_REST_Response(
 					array(
@@ -5471,8 +5504,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					array(
 						'ok' => true,
 						'applicationId' => $saved['id'],
-						'application' => $saved['application'],
-						'caseRecord' => $saved['caseRecord'],
+						'application' => $this->application_board_response_for_user($saved['application'], $user),
+						'caseRecord' => $this->application_case_response_for_user($saved['caseRecord'], $user),
 					),
 					200
 				);
@@ -5548,7 +5581,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return new WP_REST_Response(
 					array(
 						'ok' => true,
-						'application' => $application,
+						'application' => $this->application_case_response_for_user($application, $user),
 					),
 					200
 				);
@@ -5604,7 +5637,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return new WP_REST_Response(
 					array(
 						'ok' => true,
-						'application' => $application,
+						'application' => $this->application_case_response_for_user($application, $user),
 					),
 					200
 				);
@@ -5798,7 +5831,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return new WP_REST_Response(
 					array(
 						'ok' => true,
-						'application' => $application,
+						'application' => $this->application_case_response_for_user($application, $user),
 					),
 					200
 				);
@@ -5864,7 +5897,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return new WP_REST_Response(
 					array(
 						'ok' => true,
-						'application' => $application,
+						'application' => $this->application_case_response_for_user($application, $user),
 					),
 					200
 				);
@@ -5903,7 +5936,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				echo $body; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 				exit;
 			} catch (Exception $error) {
-				return $this->json_error_response($error->getMessage(), 404);
+				$status = 'You do not have permission to download this document.' === $error->getMessage()
+					? 403
+					: 404;
+				return $this->json_error_response($error->getMessage(), $status);
 			}
 		}
 
@@ -7482,6 +7518,241 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'updatedAt' => $this->mysql_datetime_to_iso($application['updatedAt']),
 				'isLive' => true,
 			);
+		}
+
+		private function response_field_subset($record, $fields) {
+			return array_intersect_key(
+				(array) $record,
+				array_fill_keys((array) $fields, true)
+			);
+		}
+
+		private function to_external_agent_board_application($application) {
+			return $this->response_field_subset(
+				$application,
+				array(
+					'recordId',
+					'id',
+					'studentName',
+					'passportNumber',
+					'agentName',
+					'programme',
+					'semester',
+					'stage',
+					'stageKey',
+					'permitStatus',
+					'lane',
+					'progress',
+					'missingDocs',
+					'readyDocuments',
+					'totalIntakeDocuments',
+					'intakeMissingDocs',
+					'intakeReadyDocuments',
+					'totalMigrationDocuments',
+					'migrationMissingDocs',
+					'migrationReadyDocuments',
+					'totalImmigrationDocuments',
+					'immigrationMissingDocs',
+					'immigrationReadyDocuments',
+					'updatedAt',
+					'isLive',
+				)
+			);
+		}
+
+		private function application_board_response_for_user($application, $user) {
+			return $this->can_view_all_applications($user)
+				? $application
+				: $this->to_external_agent_board_application($application);
+		}
+
+		private function external_agent_application_document_types() {
+			return array(
+				'passport',
+				'secondaryMarksheet',
+				'higherSecondaryMarksheet',
+				'englishCertificate',
+				'studentSignature',
+				'consultantSignature',
+				'bachelorDiploma',
+				'bachelorTranscript',
+				'bankTransactionConfirmation',
+			);
+		}
+
+		private function is_external_agent_application_document_type($document_type) {
+			if (is_array($document_type)) {
+				$document_type = isset($document_type['type']) ? $document_type['type'] : '';
+			}
+
+			return in_array(
+				(string) $document_type,
+				$this->external_agent_application_document_types(),
+				true
+			);
+		}
+
+		private function to_external_agent_document($document) {
+			return $this->response_field_subset(
+				$document,
+				array(
+					'id',
+					'type',
+					'label',
+					'isReady',
+					'uploadedUrl',
+					'originalName',
+					'mimeType',
+					'fileSizeBytes',
+					'uploadedAt',
+				)
+			);
+		}
+
+		private function to_external_agent_generated_letter($letter) {
+			return $this->response_field_subset(
+				$letter,
+				array(
+					'id',
+					'templateId',
+					'templateLabel',
+					'templateVersion',
+					'stageKey',
+					'fileName',
+					'outputFormat',
+					'outputUrl',
+					'generatedAt',
+				)
+			);
+		}
+
+		private function application_case_response_for_user($application, $user) {
+			if ($this->can_view_all_applications($user)) {
+				return $application;
+			}
+
+			$filtered = $this->response_field_subset(
+				$application,
+				array(
+					'recordId',
+					'id',
+					'studentName',
+					'passportNumber',
+					'agentName',
+					'programme',
+					'semester',
+					'stage',
+					'stageKey',
+					'permitStatus',
+					'lane',
+					'progress',
+					'missingDocs',
+					'readyDocuments',
+					'totalIntakeDocuments',
+					'intakeMissingDocs',
+					'intakeReadyDocuments',
+					'totalMigrationDocuments',
+					'migrationMissingDocs',
+					'migrationReadyDocuments',
+					'totalImmigrationDocuments',
+					'immigrationMissingDocs',
+					'immigrationReadyDocuments',
+					'activeDocumentPack',
+					'fullName',
+					'wordpressUsername',
+					'wordpressEmail',
+					'email',
+					'phone',
+					'birthday',
+					'address',
+					'city',
+					'postalCode',
+					'country',
+					'gender',
+					'semesterCode',
+					'year',
+					'applicationRoute',
+					'programmeCode',
+					'consultantName',
+					'consultantEmail',
+					'consultantPhone',
+					'submissionDate',
+					'tuitionAcknowledged',
+					'offerTermsAcknowledged',
+					'gdprAcknowledged',
+					'documents',
+					'letters',
+					'createdAt',
+					'updatedAt',
+					'isLive',
+				)
+			);
+
+			$visible_documents = array_values(
+				array_filter(
+					isset($application['documents']) && is_array($application['documents'])
+						? $application['documents']
+						: array(),
+					array($this, 'is_external_agent_application_document_type')
+				)
+			);
+			$filtered['documents'] = array_map(
+				array($this, 'to_external_agent_document'),
+				$visible_documents
+			);
+			$filtered['letters'] = array_map(
+				array($this, 'to_external_agent_generated_letter'),
+				isset($application['letters']) && is_array($application['letters'])
+					? $application['letters']
+					: array()
+			);
+			$filtered = array_merge(
+				$filtered,
+				array(
+					// Keep the client contract shape complete without returning staff data.
+					'activity' => array(),
+					'communications' => array(),
+					'letterDrafts' => array(),
+					'paymentTransactions' => array(),
+					'commissions' => array(),
+					'refunds' => array(),
+					'workflowNote' => null,
+					'reviewerDecision' => 'pending',
+					'reviewSummary' => null,
+					'decisionDueDate' => null,
+					'offerIssuedDate' => null,
+					'offerExpiryDate' => null,
+					'offerConditionNote' => null,
+					'classesStartDate' => null,
+					'tuitionFeeFirstYear' => null,
+					'tuitionFeeFollowingYears' => null,
+					'termBalanceApplies' => false,
+					'paymentStatus' => 'awaiting-invoice',
+					'paymentAmount' => null,
+					'paymentCurrency' => 'EUR',
+					'paymentReference' => null,
+					'paymentConfirmedDate' => null,
+					'financeNote' => null,
+					'permitStatus' => isset($application['permitStatus'])
+						? (string) $application['permitStatus']
+						: 'not-started',
+					'permitReference' => null,
+					'permitSubmittedDate' => null,
+					'permitDecisionDate' => null,
+					'permitNote' => null,
+					'arrivalStatus' => 'planning',
+					'travelDate' => null,
+					'accommodationStatus' => null,
+					'enrollmentStatus' => 'pending',
+					'orientationDate' => null,
+					'enrollmentNote' => null,
+					'lateArrivalReason' => null,
+					'migrationCase' => null,
+					'immigrationCase' => null,
+				)
+			);
+
+			return $filtered;
 		}
 
 		private function get_authorized_application_base($application_id, $user, $for_update = false) {
@@ -10166,6 +10437,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private function get_admission_application_case($user, $application_id) {
 			$this->get_authorized_application_base($application_id, $user);
 			$case = $this->to_admission_case($this->get_detailed_application_record($application_id));
+			$case = $this->application_case_response_for_user($case, $user);
 			return $this->attach_assessment_message_history($case, $application_id, $user);
 		}
 
@@ -11710,7 +11982,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$document = $wpdb->get_row(
 				$wpdb->prepare(
 					"
-					SELECT label, originalName, mimeType, storageDriveId, storageItemId
+					SELECT type, label, originalName, mimeType, storageDriveId, storageItemId
 					FROM {$this->documents_table}
 					WHERE id = %s AND applicationId = %s
 					LIMIT 1
@@ -11723,6 +11995,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			if (!$document || empty($document['storageItemId'])) {
 				throw new Exception('Document file not found.');
+			}
+			if (
+				!$this->can_view_all_applications($params['user'])
+				&& !$this->is_external_agent_application_document_type($document['type'])
+			) {
+				throw new Exception('You do not have permission to download this document.');
 			}
 
 			return $document;
@@ -11938,6 +12216,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			global $wpdb;
 			try {
 				$user = $this->current_session_user();
+				if (!$this->can_view_all_applications($user)) {
+					return $this->json_error_response('Payment transaction details are restricted to internal staff.', 403);
+				}
 				$application_id = sanitize_text_field($request['application_id']);
 				$this->get_authorized_application_base($application_id, $user);
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
@@ -12146,6 +12427,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			global $wpdb;
 			try {
 				$user = $this->current_session_user();
+				if (!$this->can_view_all_applications($user)) {
+					return $this->json_error_response('Migration case details are restricted to internal staff.', 403);
+				}
 				$application_id = sanitize_text_field($request['application_id']);
 				$this->get_authorized_application_base($application_id, $user);
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
@@ -12193,6 +12477,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			global $wpdb;
 			try {
 				$user = $this->current_session_user();
+				if (!$this->can_view_all_applications($user)) {
+					return $this->json_error_response('Immigration case details are restricted to internal staff.', 403);
+				}
 				$application_id = sanitize_text_field($request['application_id']);
 				$this->get_authorized_application_base($application_id, $user);
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
