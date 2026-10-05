@@ -237,6 +237,8 @@ $GLOBALS['mc_identity_users'] = array(
 	23 => (object) array('ID' => 23, 'user_login' => 'admissions-staff', 'display_name' => 'Admissions Staff', 'user_email' => 'admissions@example.invalid', 'roles' => array('admissions-officer'), 'allcaps' => array()),
 	24 => (object) array('ID' => 24, 'user_login' => 'finance-staff', 'display_name' => 'Finance Staff', 'user_email' => 'finance@example.invalid', 'roles' => array('finance-officer'), 'allcaps' => array()),
 	25 => (object) array('ID' => 25, 'user_login' => 'dual-role-staff', 'display_name' => 'Dual Role Staff', 'user_email' => 'dual-role@example.invalid', 'roles' => array('mc_agent', 'admissions-officer'), 'allcaps' => array()),
+	26 => (object) array('ID' => 26, 'user_login' => 'MC-ADMISSIONS-DPT', 'display_name' => 'MC Admissions Department', 'user_email' => 'dpt@example.invalid', 'roles' => array('subscriber'), 'allcaps' => array()),
+	27 => (object) array('ID' => 27, 'user_login' => 'migration-staff', 'display_name' => 'Migration Staff', 'user_email' => 'migration@example.invalid', 'roles' => array('migration-officer'), 'allcaps' => array()),
 	54 => (object) array('ID' => 54, 'user_login' => 'OnePoint-Education', 'display_name' => 'Kashif', 'user_email' => 'onepoint@example.invalid', 'roles' => array('mc_agent'), 'allcaps' => array()),
 );
 $GLOBALS['wpdb']->profiles[10] = array(
@@ -261,6 +263,14 @@ $GLOBALS['wpdb']->profiles[23] = array(
 	'consultantName' => 'Admissions Contact', 'consultantEmail' => 'admissions@example.invalid',
 	'consultantPhone' => '+357 25000001', 'defaultApplicationRoute' => 'standard',
 	'agreementOnFile' => 0, 'authorizationOnFile' => 0, 'notes' => null,
+	'updatedAt' => '2026-08-13 08:00:00',
+);
+$GLOBALS['wpdb']->profiles[26] = array(
+	'id' => 'profile-26', 'wordpressUserId' => 26, 'wordpressUsername' => 'MC-ADMISSIONS-DPT',
+	'wordpressEmail' => 'dpt@example.invalid', 'agencyName' => 'MC Admissions Department',
+	'consultantName' => 'Admissions Department', 'consultantEmail' => 'dpt@example.invalid',
+	'consultantPhone' => '+357 25000002', 'defaultApplicationRoute' => 'standard',
+	'agreementOnFile' => 1, 'authorizationOnFile' => 1, 'notes' => null,
 	'updatedAt' => '2026-08-13 08:00:00',
 );
 $GLOBALS['wpdb']->applications['case-10'] = array(
@@ -326,6 +336,15 @@ function get_userdata($user_id) {
 		throw new RuntimeException('get_userdata was called before WordPress loaded pluggable functions.');
 	}
 	return $GLOBALS['mc_identity_users'][(int) $user_id] ?? false;
+}
+function get_user_by($field, $value) {
+	if ('login' !== (string) $field) return false;
+	foreach ($GLOBALS['mc_identity_users'] as $user) {
+		if (strtolower((string) $user->user_login) === strtolower((string) $value)) {
+			return get_userdata((int) $user->ID);
+		}
+	}
+	return false;
 }
 function get_users($args = array()) {
 	$users = $GLOBALS['mc_identity_users'];
@@ -593,6 +612,7 @@ $administrator_agent_list = $plugin->rest_list_agents();
 identity_assert_same(200, $administrator_agent_list->status, 'Administrators must be able to list agents for ownership selection.');
 $administrator_agent_ids = array_map(function ($agent) { return (int) $agent['id']; }, $administrator_agent_list->data['agents']);
 identity_assert_same(false, in_array(25, $administrator_agent_ids, true), 'The ownership selector must exclude internal staff even when they also have an agent role.');
+identity_assert_same(true, in_array(26, $administrator_agent_ids, true), 'The ownership selector must include MC-ADMISSIONS-DPT for Foundation advancement applications.');
 $administrator_agents_by_id = array();
 foreach ($administrator_agent_list->data['agents'] as $agent_summary) {
 	$administrator_agents_by_id[(int) $agent_summary['id']] = $agent_summary;
@@ -606,6 +626,14 @@ identity_assert_same(false, $administrator_agents_by_id[11]['authorizationOnFile
 $GLOBALS['mc_identity_current_user_id'] = 23;
 $admissions_agent_list = $plugin->rest_list_agents();
 identity_assert_same(200, $admissions_agent_list->status, 'Admissions Officers must be able to list agents for ownership selection.');
+$GLOBALS['mc_identity_current_user_id'] = 27;
+$migration_advancement_owner_list = $plugin->rest_list_agents();
+identity_assert_same(200, $migration_advancement_owner_list->status, 'Migration Officers must be able to resolve the dedicated Foundation advancement owner.');
+identity_assert_same(array(26), array_map(function ($agent) { return (int) $agent['id']; }, $migration_advancement_owner_list->data['agents']), 'Migration Officers must see only MC-ADMISSIONS-DPT in the ownership selector.');
+$GLOBALS['mc_identity_current_user_id'] = 26;
+$department_advancement_owner_list = $plugin->rest_list_agents();
+identity_assert_same(200, $department_advancement_owner_list->status, 'MC-ADMISSIONS-DPT must be able to resolve its own advancement ownership record.');
+identity_assert_same(array(26), array_map(function ($agent) { return (int) $agent['id']; }, $department_advancement_owner_list->data['agents']), 'MC-ADMISSIONS-DPT must not gain access to other agency owners.');
 $GLOBALS['mc_identity_current_user_id'] = 10;
 $external_agent_list = $plugin->rest_list_agents();
 identity_assert_same(403, $external_agent_list->status, 'External agents must not be able to list other agents.');
@@ -774,7 +802,7 @@ $GLOBALS['mc_identity_fail_table_write'] = null;
 $GLOBALS['mc_identity_current_user_id'] = 10;
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-identity_assert_contains('Version: 0.2.69', $plugin_source, 'The plugin header must advertise 0.2.69.');
+identity_assert_contains('Version: 0.2.70', $plugin_source, 'The plugin header must advertise 0.2.70.');
 identity_assert_contains("\$owner_identity['agencyName']", $plugin_source, 'Application saves must use authoritative agency identity.');
 identity_assert_contains("\$owner_identity['consultantName']", $plugin_source, 'Application saves must use the owning Agency Profile contact.');
 identity_assert_contains('$identity_safe_draft', $plugin_source, 'Test-data inference must use the authoritative identity overlay.');

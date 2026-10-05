@@ -123,13 +123,16 @@ final class MC_Intake_Test_Wpdb {
 		}
 		if (false !== strpos($call['query'], 'FROM mc_generated_letters')) {
 			$application_id = (string) ($call['args'][0] ?? '');
-			return count(array_filter($this->generatedLetters, static function ($letter) use ($application_id) {
+			$template_id = isset($call['args'][1]) ? (string) $call['args'][1] : null;
+			return count(array_filter($this->generatedLetters, static function ($letter) use ($application_id, $template_id) {
 				return (string) ($letter['applicationId'] ?? '') === $application_id
-					&& in_array(
+					&& (null !== $template_id
+						? (string) ($letter['templateId'] ?? '') === $template_id
+						: in_array(
 						(string) ($letter['templateId'] ?? ''),
 						array('payment-receipt', 'acceptance-letter', 'letter-of-assurance'),
 						true
-					);
+					));
 			}));
 		}
 		if (false !== strpos($call['query'], 'FROM mc_admission_payments')) {
@@ -219,6 +222,18 @@ final class MC_Intake_Test_Wpdb {
 					return (int) ($application['wordpressUserId'] ?? 0) === $owner_id;
 				}));
 			}
+			if (false !== strpos($query, 'AS acceptanceLetterCount')) {
+				$applications = array_map(function ($application) {
+					$application['acceptanceLetterCount'] = count(array_filter(
+						$this->generatedLetters,
+						static function ($letter) use ($application) {
+							return (string) ($letter['applicationId'] ?? '') === (string) ($application['id'] ?? '')
+								&& 'acceptance-letter' === (string) ($letter['templateId'] ?? '');
+						}
+					));
+					return $application;
+				}, $applications);
+			}
 			return $applications;
 		}
 		if (false !== strpos($query, 'FROM mc_admission_intake_capacities')) {
@@ -229,6 +244,12 @@ final class MC_Intake_Test_Wpdb {
 		}
 		if (false !== strpos($query, 'FROM mc_admission_activities')) {
 			return array_reverse($this->activities);
+		}
+		if (false !== strpos($query, 'FROM mc_generated_letters')) {
+			$application_id = (string) ($args[0] ?? '');
+			return array_values(array_filter($this->generatedLetters, static function ($letter) use ($application_id) {
+				return (string) ($letter['applicationId'] ?? '') === $application_id;
+			}));
 		}
 
 		return array();
@@ -245,6 +266,7 @@ final class MC_Intake_Test_Wpdb {
 				'application' => $this->application,
 				'capacities' => $this->capacities,
 				'reservations' => $this->reservations,
+				'generatedLetters' => $this->generatedLetters,
 				'activities' => $this->activities,
 			);
 			$this->committed = false;
@@ -341,6 +363,22 @@ final class MC_Intake_Test_Wpdb {
 			);
 			return 1;
 		}
+		if (false !== strpos($query, "SET status = 'acceptance-issued'")) {
+			$source_statuses = array('offer-issued', 'prepayment-pending', 'Offer letter issued', 'Payment pending');
+			if (false !== strpos($query, "'Payment pending', 'acceptance-issued', 'Acceptance confirmed'")) {
+				$source_statuses[] = 'acceptance-issued';
+				$source_statuses[] = 'Acceptance confirmed';
+			}
+			if (!in_array((string) $this->application['status'], $source_statuses, true)) {
+				return 0;
+			}
+			$this->version_tick++;
+			$this->application['status'] = 'acceptance-issued';
+			$this->application['workflowNote'] = (string) ($args[0] ?? '');
+			$this->application['lastUpdatedByName'] = (string) ($args[1] ?? '');
+			$this->application['updatedAt'] = sprintf('2026-08-20 10:00:%02d.000', $this->version_tick);
+			return 1;
+		}
 		if (false !== strpos($query, 'UPDATE mc_admission_applications') && false !== strpos($query, 'status = %s')) {
 			$expected = isset($args[4]) ? (string) $args[4] : null;
 			if (null !== $expected && $expected !== (string) $this->application['updatedAt']) return 0;
@@ -366,6 +404,15 @@ final class MC_Intake_Test_Wpdb {
 	}
 
 	public function update($table, $data, $where, $format = null, $where_format = null) {
+		if ('mc_admission_applications' === $table) {
+			$this->version_tick++;
+			$this->application = array_merge(
+				$this->application,
+				$data,
+				array('updatedAt' => sprintf('2026-08-20 10:00:%02d.000', $this->version_tick))
+			);
+			return 1;
+		}
 		if ('mc_admission_offer_reservations' === $table) {
 			if ($this->fail_reservation_write) return false;
 			$id = (string) ($where['applicationId'] ?? '');
@@ -377,6 +424,11 @@ final class MC_Intake_Test_Wpdb {
 	}
 
 	public function insert($table, $data, $format = null) {
+		if ('mc_admission_applications' === $table) {
+			$this->application = array_merge(intake_application(), $data);
+			$this->boardApplications = array($this->application);
+			return 1;
+		}
 		if ('mc_admission_offer_reservations' === $table) {
 			if ($this->fail_reservation_write) return false;
 			$id = (string) $data['applicationId'];
@@ -387,6 +439,13 @@ final class MC_Intake_Test_Wpdb {
 		if ('mc_admission_activities' === $table) {
 			if ($this->fail_activity_write) return false;
 			$this->activities[] = $data;
+			return 1;
+		}
+		if ('mc_generated_letters' === $table) {
+			if (!isset($data['createdAt'])) {
+				$data['createdAt'] = '2026-08-20 10:00:00.000';
+			}
+			$this->generatedLetters[] = $data;
 			return 1;
 		}
 		return 1;
@@ -550,11 +609,24 @@ function wp_json_encode($value) { return json_encode($value); }
 function wp_get_current_user() { return $GLOBALS['mc_intake_current_user']; }
 function get_avatar_url($user_id, $args = array()) { return ''; }
 function get_userdata($user_id) {
-	if (42 !== (int) $user_id) return false;
-	return (object) array(
-		'ID' => 42, 'user_login' => 'agency-owner', 'display_name' => 'Agency Owner',
-		'user_email' => 'agency@example.com', 'roles' => array('mc_agent'), 'allcaps' => array(),
-	);
+	if (42 === (int) $user_id) {
+		return (object) array(
+			'ID' => 42, 'user_login' => 'agency-owner', 'display_name' => 'Agency Owner',
+			'user_email' => 'agency@example.com', 'roles' => array('mc_agent'), 'allcaps' => array(),
+		);
+	}
+	if (84 === (int) $user_id) {
+		return (object) array(
+			'ID' => 84, 'user_login' => 'MC-ADMISSIONS-DPT', 'display_name' => 'MC Admissions Department',
+			'user_email' => 'admissions@example.com', 'roles' => array('mc_agent'), 'allcaps' => array(),
+		);
+	}
+	return false;
+}
+function get_user_by($field, $value) {
+	return 'login' === (string) $field && 'mc-admissions-dpt' === strtolower((string) $value)
+		? get_userdata(84)
+		: false;
 }
 function wp_generate_uuid4() { $GLOBALS['mc_intake_uuid']++; return 'intake-uuid-' . $GLOBALS['mc_intake_uuid']; }
 function current_time($type, $gmt = false) { return '2026-08-20 10:00:00'; }
@@ -605,6 +677,8 @@ function intake_capacity($total, $reserved = 0, $semester = 'fall', $year = 2026
 
 $plugin = mc_admissions_wordpress_backend();
 $reflection = new ReflectionClass($plugin);
+$agency_profile_cache = $reflection->getProperty('agency_profile_cache');
+$agency_profile_cache->setAccessible(true);
 $normalize_draft = intake_private_method($reflection, 'normalize_application_intake_draft');
 $assert_submission = intake_private_method($reflection, 'assert_review_submission_complete');
 $reserve_offer = intake_private_method($reflection, 'reserve_offer_placement_for_generated_letter');
@@ -613,8 +687,11 @@ $bank_pdf = intake_private_method($reflection, 'assert_bank_transaction_confirma
 $bank_ready = intake_private_method($reflection, 'bank_transaction_confirmation_ready');
 $bank_removable = intake_private_method($reflection, 'assert_bank_transaction_confirmation_removable');
 $assert_letter_available = intake_private_method($reflection, 'assert_admission_letter_generation_available');
+$can_generate_letter = intake_private_method($reflection, 'can_generate_admission_letter');
+$resolve_application_owner = intake_private_method($reflection, 'resolve_application_owner');
 $persist_letter = intake_private_method($reflection, 'persist_generated_admission_letter');
 $to_case = intake_private_method($reflection, 'to_admission_case');
+$filter_case_for_user = intake_private_method($reflection, 'application_case_response_for_user');
 $capacity_snapshot = intake_private_method($reflection, 'application_intake_capacity_snapshot');
 $build_annual_seat_summary = intake_private_method($reflection, 'build_annual_bachelor_seat_summary');
 $update_operations = intake_private_method($reflection, 'update_admission_application_operations');
@@ -678,6 +755,16 @@ intake_assert_same('CAS Updated Applicant', $valid_save->get_data()['caseRecord'
 intake_assert_true(false !== strpos(implode("\n", $GLOBALS['wpdb']->events), 'AND updatedAt = %s'), 'Every existing-application UPDATE must include its CAS predicate.');
 
 $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('finance-officer'), 13);
+$normal_unauthorized_save = $plugin->rest_save_application(new WP_REST_Request(array(), array_merge(
+	$save_body,
+	array('expectedUpdatedAt' => '2026-08-20T10:00:00.000Z')
+)));
+intake_assert_same(400, $normal_unauthorized_save->get_status(), 'Foundation-specific forbidden mapping must not change the legacy normal-application save response.');
+intake_assert_true(false !== stripos((string) $normal_unauthorized_save->get_data()['error'], 'permission'), 'A rejected normal save must retain its actionable authorization error.');
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 $create_without_version = $plugin->rest_save_application(new WP_REST_Request(array(), array(
 	'mode' => 'draft',
 	'draft' => intake_draft(),
@@ -690,22 +777,100 @@ $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 // Authoritative field, declaration, owner-profile, and attachment validation.
 intake_seed_core_documents();
 $assert_submission->invoke($plugin, intake_draft(), intake_profile_identity(), 42, 'application-1');
-intake_assert_throws_contains('Phone number', static function () use ($assert_submission, $plugin) {
-	$assert_submission->invoke($plugin, intake_draft(array('phone' => '')), intake_profile_identity(), 42, 'application-1');
-}, 'Required scalar fields must not be bypassable.');
-intake_assert_throws_contains('declarations', static function () use ($assert_submission, $plugin) {
-	$assert_submission->invoke($plugin, intake_draft(array('gdprAcknowledged' => false)), intake_profile_identity(), 42, 'application-1');
-}, 'Required declarations must not be bypassable.');
+$required_submission_fields = array(
+	'fullName' => 'Full name',
+	'passportNumber' => 'Passport number',
+	'email' => 'Applicant email',
+	'phone' => 'Phone number',
+	'birthday' => 'Birthday',
+	'address' => 'Home address',
+	'city' => 'City',
+	'postalCode' => 'Postal code',
+	'country' => 'Country',
+	'gender' => 'Gender',
+	'programme' => 'Programme',
+	'semester' => 'Semester intake',
+	'year' => 'Intake year',
+	'submissionDate' => 'Date of submission',
+);
+foreach ($required_submission_fields as $field => $label) {
+	intake_assert_throws_contains($label, static function () use ($assert_submission, $plugin, $field) {
+		$assert_submission->invoke(
+			$plugin,
+			intake_draft(array($field => '   ')),
+			intake_profile_identity(),
+			42,
+			'application-1'
+		);
+	}, 'Ordinary review submission must require the ' . $label . ' field.');
+}
+$required_submission_declarations = array(
+	'tuitionAcknowledged' => 'Tuition fee policy acknowledged',
+	'offerTermsAcknowledged' => 'Offer letter terms accepted',
+	'gdprAcknowledged' => 'GDPR note reviewed',
+);
+foreach ($required_submission_declarations as $field => $label) {
+	intake_assert_throws_contains($label, static function () use ($assert_submission, $plugin, $field) {
+		$assert_submission->invoke(
+			$plugin,
+			intake_draft(array($field => false)),
+			intake_profile_identity(),
+			42,
+			'application-1'
+		);
+	}, 'Ordinary review submission must require the ' . $label . ' declaration.');
+}
+$required_owner_profile_fields = array('agencyName', 'consultantName', 'consultantEmail', 'consultantPhone');
+foreach ($required_owner_profile_fields as $profile_field) {
+	intake_assert_throws_contains('Agency Profile', static function () use ($assert_submission, $plugin, $profile_field) {
+		$owner_identity = array_merge(intake_profile_identity(), array($profile_field => ''));
+		$assert_submission->invoke($plugin, intake_draft(), $owner_identity, 42, 'application-1');
+	}, 'An ordinary submission must require owning profile field ' . $profile_field . '.');
+}
 intake_assert_throws_contains('Agency Profile', static function () use ($assert_submission, $plugin) {
 	$assert_submission->invoke($plugin, intake_draft(), intake_profile_identity(false), 42, 'application-1');
-}, 'An incomplete owning profile must block review submission.');
+}, 'An explicitly incomplete owning profile must block review submission.');
 
-// Boolean checklist claims alone do not satisfy an upload requirement.
+// Every ordinary intake upload must be a genuine stored attachment. Boolean
+// checklist claims alone do not satisfy an upload requirement.
+$ordinary_required_documents = array(
+	'passport' => 'Copy of passport',
+	'secondaryMarksheet' => 'Copy of Secondary School (10th grade) marksheet',
+	'higherSecondaryMarksheet' => 'Copy of Higher Secondary School (12th grade) marksheet',
+	'englishCertificate' => 'English proficiency certificate',
+	'studentSignature' => 'Student signature',
+	'consultantSignature' => 'Agent / consultant signature',
+);
+foreach ($ordinary_required_documents as $document_type => $label) {
+	intake_seed_core_documents();
+	unset($GLOBALS['wpdb']->documents[$document_type]);
+	intake_assert_throws_contains($label, static function () use ($assert_submission, $plugin) {
+		$assert_submission->invoke($plugin, intake_draft(), intake_profile_identity(), 42, 'application-1');
+	}, 'Ordinary review submission must require a stored ' . $label . ' attachment.');
+}
+
 $GLOBALS['wpdb']->documents = array();
 intake_assert_throws_contains('Copy of passport', static function () use ($assert_submission, $plugin) {
 	$claimed = intake_draft(array('documents' => array('passport' => true, 'secondaryMarksheet' => true)));
 	$assert_submission->invoke($plugin, $claimed, intake_profile_identity(), 42, 'application-1');
 }, 'A forged document checklist must not bypass uploaded attachment checks.');
+
+// Agency onboarding documents are conditionally required when the authoritative
+// owner profile does not already hold them.
+$GLOBALS['wpdb']->profile = intake_profile(array('agreementOnFile' => 0, 'authorizationOnFile' => 0));
+$agency_profile_cache->setValue($plugin, array());
+intake_seed_core_documents();
+intake_assert_throws_contains('Agency agreement', static function () use ($assert_submission, $plugin) {
+	$assert_submission->invoke($plugin, intake_draft(), intake_profile_identity(), 42, 'application-1');
+}, 'An ordinary submission must require the Agency agreement when it is not on file.');
+$GLOBALS['wpdb']->documents['agencyAgreement'] = intake_document('agencyAgreement');
+intake_assert_throws_contains('Authorization certificate', static function () use ($assert_submission, $plugin) {
+	$assert_submission->invoke($plugin, intake_draft(), intake_profile_identity(), 42, 'application-1');
+}, 'An ordinary submission must require the Authorization certificate when it is not on file.');
+$GLOBALS['wpdb']->documents['authorizationCertificate'] = intake_document('authorizationCertificate');
+$assert_submission->invoke($plugin, intake_draft(), intake_profile_identity(), 42, 'application-1');
+$GLOBALS['wpdb']->profile = intake_profile();
+$agency_profile_cache->setValue($plugin, array());
 
 intake_seed_core_documents();
 $mba = intake_draft(array('programme' => 'business-administration-masters'));
@@ -713,9 +878,635 @@ intake_assert_throws_contains('Bachelor diploma', static function () use ($asser
 	$assert_submission->invoke($plugin, $mba, intake_profile_identity(), 42, 'application-1');
 }, 'MBA must require Bachelor diploma and transcripts.');
 $GLOBALS['wpdb']->documents['bachelorDiploma'] = intake_document('bachelorDiploma');
+intake_assert_throws_contains('Bachelor transcripts', static function () use ($assert_submission, $plugin, $mba) {
+	$assert_submission->invoke($plugin, $mba, intake_profile_identity(), 42, 'application-1');
+}, 'MBA must independently require Bachelor transcripts.');
 $GLOBALS['wpdb']->documents['bachelorTranscript'] = intake_document('bachelorTranscript');
 $assert_submission->invoke($plugin, $mba, intake_profile_identity(), 42, 'application-1');
 $assert_submission->invoke($plugin, intake_draft(array('programme' => 'english-foundation')), intake_profile_identity(), 42, 'application-1');
+
+// The public REST command must actually invoke the complete validator for an
+// ordinary agent's draft-to-review transition. Draft saves remain intentionally
+// incomplete so the wizard can be resumed later.
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'Application in progress',
+	'reviewerDecision' => 'pending',
+));
+intake_seed_core_documents();
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
+$missing_address_submission = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'mode' => 'review',
+	'draft' => intake_draft(array('address' => '')),
+)));
+intake_assert_same(400, $missing_address_submission->get_status(), 'An ordinary agent must not submit an application without a Home address.');
+intake_assert_true(false !== strpos((string) $missing_address_submission->get_data()['error'], 'Home address'), 'The rejected Home address submission must identify the missing field.');
+intake_assert_same('Application in progress', $GLOBALS['wpdb']->application['status'], 'Rejected ordinary submissions must remain in preparation.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'Application in progress',
+	'reviewerDecision' => 'pending',
+));
+$GLOBALS['wpdb']->documents = array();
+$missing_upload_submission = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'mode' => 'review',
+	'draft' => intake_draft(),
+)));
+intake_assert_same(400, $missing_upload_submission->get_status(), 'An ordinary agent must not submit without every required stored intake upload.');
+intake_assert_true(false !== strpos((string) $missing_upload_submission->get_data()['error'], 'Copy of passport'), 'The rejected ordinary submission must identify its missing upload pack.');
+intake_assert_same('Application in progress', $GLOBALS['wpdb']->application['status'], 'A missing upload pack must not advance the ordinary case.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'Application in progress',
+	'reviewerDecision' => 'pending',
+));
+$ordinary_incomplete_draft = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'mode' => 'draft',
+	'draft' => intake_draft(array('address' => '')),
+)));
+intake_assert_same(200, $ordinary_incomplete_draft->get_status(), 'Ordinary agents must still be able to save an incomplete resumable draft.');
+intake_assert_same('Application in progress', $GLOBALS['wpdb']->application['status'], 'Saving an incomplete ordinary draft must not submit it for review.');
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
+
+// Foundation advancement keeps every scalar field and declaration required,
+// but reuses the student's existing College file instead of requiring duplicate
+// intake uploads. Ownership and access are locked to the dedicated department.
+$advancement_code = 'foundation-advancement-business-administration';
+$advancement_draft = intake_draft(array('programme' => $advancement_code));
+$GLOBALS['wpdb']->documents = array();
+$assert_submission->invoke($plugin, $advancement_draft, intake_profile_identity(), 84, null);
+intake_assert_throws_contains('Agency Profile', static function () use ($assert_submission, $plugin, $advancement_draft) {
+	$assert_submission->invoke($plugin, $advancement_draft, intake_profile_identity(false), 84, null);
+}, 'Foundation advancement must still require the dedicated owner account to have a complete Agency Profile.');
+intake_assert_throws_contains('Phone number', static function () use ($assert_submission, $plugin, $advancement_draft) {
+	$assert_submission->invoke(
+		$plugin,
+		array_merge($advancement_draft, array('phone' => '')),
+		intake_profile_identity(),
+		84,
+		null
+	);
+}, 'Foundation advancement must still require every non-document field.');
+intake_assert_throws_contains('declarations', static function () use ($assert_submission, $plugin, $advancement_draft) {
+	$assert_submission->invoke(
+		$plugin,
+		array_merge($advancement_draft, array('gdprAcknowledged' => false)),
+		intake_profile_identity(),
+		84,
+		null
+	);
+}, 'Foundation advancement must still require every declaration.');
+
+$migration_user = intake_user(array('migration-officer'), 11);
+$advancement_owner = $resolve_application_owner->invoke($plugin, $migration_user, 999, $advancement_code);
+intake_assert_same(84, $advancement_owner['id'], 'Foundation advancement ownership must be forced to MC-ADMISSIONS-DPT.');
+intake_assert_throws_contains('permission', static function () use ($resolve_application_owner, $plugin, $advancement_code) {
+	$resolve_application_owner->invoke($plugin, intake_user(array('mc_agent')), 0, $advancement_code);
+}, 'Ordinary agents must not create Foundation advancement applications.');
+
+$advancement_case = array_merge(
+	intake_application(array(
+		'programmeCode' => $advancement_code,
+		'programmeLabel' => 'Advancement from English Foundation Year to Bachelor’s degree in Business Administration',
+		'status' => 'acceptance-issued',
+		'classesStartDate' => null,
+		'paymentStatus' => 'awaiting-invoice',
+		'paymentAmount' => null,
+	)),
+	array(
+		'documents' => array(), 'activities' => array(), 'communications' => array(),
+		'generatedLetters' => array(), 'letterDrafts' => array(), 'commissionRecords' => array(),
+		'refundRecords' => array(), 'paymentTransactions' => array(), 'migrationCase' => null,
+		'immigrationCase' => null, 'bankTransactionConfirmationReady' => false,
+		'intakeCapacity' => null, 'offerPlacementReservation' => null,
+	)
+);
+$advancement_preparation_case = $to_case->invoke(
+	$plugin,
+	array_merge(
+		$advancement_case,
+		array('status' => 'profile-preparation', 'reviewerDecision' => 'pending')
+	),
+	false
+);
+intake_assert_same(0, $advancement_preparation_case['totalIntakeDocuments'], 'Foundation advancement preparation must expose no required intake-document slots.');
+intake_assert_same(0, $advancement_preparation_case['intakeMissingDocs'], 'Optional Foundation advancement intake uploads must not be reported as missing.');
+intake_assert_same(0, $advancement_preparation_case['missingDocs'], 'The active preparation pack must not claim missing intake documents for Foundation advancement.');
+$advancement_migration_pack = $to_case->invoke($plugin, $advancement_case, false);
+intake_assert_same(4, $advancement_migration_pack['totalMigrationDocuments'], 'Foundation advancement must retain the ordinary Migration pack after submission.');
+intake_assert_same(4, $advancement_migration_pack['migrationMissingDocs'], 'Missing Migration documents must remain visible after Foundation advancement submission.');
+intake_assert_same(4, $advancement_migration_pack['missingDocs'], 'The submitted Foundation advancement active pack must use Migration requirements.');
+$advancement_immigration_pack = $to_case->invoke(
+	$plugin,
+	array_merge($advancement_case, array('status' => 'arrival-immigration')),
+	false
+);
+intake_assert_same(10, $advancement_immigration_pack['totalImmigrationDocuments'], 'Foundation advancement must retain the ordinary Immigration pack at the arrival stage.');
+intake_assert_same(10, $advancement_immigration_pack['immigrationMissingDocs'], 'Missing Immigration documents must remain visible for Foundation advancement.');
+intake_assert_same(10, $advancement_immigration_pack['missingDocs'], 'The Foundation advancement arrival pack must use normal Immigration requirements.');
+$advancement_acceptance_letter_record = array(
+	'id' => 'foundation-detail-acceptance-1',
+	'applicationId' => 'application-1',
+	'templateId' => 'acceptance-letter',
+	'templateLabel' => 'Acceptance letter',
+	'templateVersion' => 'foundation-offline-v1',
+	'stageKeySnapshot' => 'acceptance-issued',
+	'fileName' => 'foundation-acceptance-letter.pdf',
+	'outputFormat' => 'pdf',
+	'generatedByName' => 'Migration Officer',
+	'createdAt' => '2026-08-20 10:00:00.000',
+);
+$advancement_issued_case = $to_case->invoke(
+	$plugin,
+	array_merge($advancement_case, array('generatedLetters' => array($advancement_acceptance_letter_record))),
+	false
+);
+intake_assert_same(1, $advancement_issued_case['acceptanceLetterCount'], 'Detailed special cases must expose their per-case Acceptance Letter count.');
+$dpt_special_case = $to_case->invoke(
+	$plugin,
+	array_merge(
+		$advancement_case,
+		array(
+			'wordpressUsername' => 'MC-ADMISSIONS-DPT',
+			'classesStartDate' => '15/09/2026',
+			'tuitionFeeFirstYear' => '4100.00',
+			'tuitionFeeFollowingYears' => '3900.00',
+		)
+	),
+	false
+);
+$dpt_projection_user = array(
+	'id' => 84,
+	'username' => 'MC-ADMISSIONS-DPT',
+	'name' => 'MC Admissions Department',
+	'email' => 'admissions@example.com',
+	'roles' => array('mc_agent'),
+);
+$dpt_special_projection = $filter_case_for_user->invoke($plugin, $dpt_special_case, $dpt_projection_user);
+intake_assert_same('15/09/2026', $dpt_special_projection['classesStartDate'], 'Exact DPT special-case reads must preserve the stored classes start date used to render Acceptance.');
+intake_assert_same('4100.00', $dpt_special_projection['tuitionFeeFirstYear'], 'Exact DPT special-case reads must preserve the first-year tuition override.');
+intake_assert_same('3900.00', $dpt_special_projection['tuitionFeeFollowingYears'], 'Exact DPT special-case reads must preserve the following-year tuition override.');
+$ordinary_dpt_case = array_merge($dpt_special_case, array('programmeCode' => 'business-administration'));
+$ordinary_dpt_projection = $filter_case_for_user->invoke($plugin, $ordinary_dpt_case, $dpt_projection_user);
+intake_assert_same(null, $ordinary_dpt_projection['classesStartDate'], 'Exact DPT reads must not expose operations fields for ordinary programmes.');
+$other_agent_projection = $filter_case_for_user->invoke(
+	$plugin,
+	$dpt_special_case,
+	array('id' => 42, 'username' => 'agency-owner', 'name' => 'Agent', 'email' => 'agent@example.com', 'roles' => array('mc_agent'))
+);
+intake_assert_same(null, $other_agent_projection['tuitionFeeFirstYear'], 'The special tuition projection must not broaden to other external agents.');
+$assert_letter_available->invoke($plugin, $advancement_case, 'acceptance-letter');
+$advancement_before_acceptance = array_merge($advancement_case, array('status' => 'Application in progress'));
+intake_assert_throws_contains('Acceptance Letter section first', static function () use ($assert_letter_available, $plugin, $advancement_before_acceptance) {
+	$assert_letter_available->invoke($plugin, $advancement_before_acceptance, 'acceptance-letter');
+}, 'A special draft must not generate its Acceptance Letter before final submission.');
+$rejected_advancement_case = array_merge($advancement_case, array('status' => 'rejected'));
+intake_assert_throws_contains('Acceptance Letter section first', static function () use ($assert_letter_available, $plugin, $rejected_advancement_case) {
+	$assert_letter_available->invoke($plugin, $rejected_advancement_case, 'acceptance-letter');
+}, 'A rejected Foundation advancement case must not generate an Acceptance Letter.');
+intake_assert_throws_contains('do not use an Offer Letter', static function () use ($assert_letter_available, $plugin, $advancement_case) {
+	$assert_letter_available->invoke($plugin, $advancement_case, 'offer-letter');
+}, 'Foundation advancement must never expose Offer Letter generation.');
+intake_assert_throws_contains('do not use a Payment Receipt', static function () use ($assert_letter_available, $plugin, $advancement_case) {
+	$assert_letter_available->invoke($plugin, $advancement_case, 'payment-receipt');
+}, 'Foundation advancement must never expose Payment Receipt generation.');
+intake_assert_same(true, $can_generate_letter->invoke($plugin, $migration_user, 'acceptance-letter', $advancement_case), 'Migration may issue the special Acceptance Letter.');
+intake_assert_same(true, $can_generate_letter->invoke($plugin, intake_user(array('administrator')), 'acceptance-letter', $advancement_case), 'Administrators may issue the special Acceptance Letter.');
+intake_assert_same(true, $can_generate_letter->invoke($plugin, intake_user(array('admissions-officer')), 'acceptance-letter', $advancement_case), 'Admissions may issue the special Acceptance Letter.');
+intake_assert_same(true, $can_generate_letter->invoke($plugin, array('id' => 84, 'username' => 'MC-ADMISSIONS-DPT', 'name' => 'MC Admissions Department', 'email' => 'admissions@example.com', 'roles' => array('mc_agent')), 'acceptance-letter', $advancement_case), 'MC-ADMISSIONS-DPT may issue its special Acceptance Letter.');
+intake_assert_same(false, $can_generate_letter->invoke($plugin, intake_user(array('immigration-officer')), 'acceptance-letter', $advancement_case), 'Immigration must not issue the special Acceptance Letter.');
+intake_assert_same(false, $can_generate_letter->invoke($plugin, intake_user(array('administrator')), 'offer-letter', $advancement_case), 'Even administrators must not issue an Offer Letter for Foundation advancement.');
+intake_assert_same(false, $can_generate_letter->invoke($plugin, intake_user(array('finance-officer')), 'payment-receipt', $advancement_case), 'No authorized role may issue a Payment Receipt for Foundation advancement.');
+intake_assert_same(true, $can_generate_letter->invoke($plugin, intake_user(array('administrator')), 'letter-of-assurance', $advancement_case), 'Administrators must retain later-stage Letter of Assurance access for Foundation advancement.');
+intake_assert_same(true, $can_generate_letter->invoke($plugin, intake_user(array('immigration-officer')), 'late-arrival-affirmation-letter', $advancement_case), 'Immigration must retain later-stage letter access after Foundation advancement reaches the ordinary migration workflow.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'wordpressUserId' => 84,
+	'wordpressUsername' => 'MC-ADMISSIONS-DPT',
+	'programmeCode' => $advancement_code,
+	'status' => 'acceptance-issued',
+));
+$GLOBALS['mc_intake_current_user'] = (object) array(
+	'ID' => 84,
+	'user_login' => 'MC-ADMISSIONS-DPT',
+	'display_name' => 'MC Admissions Department',
+	'user_email' => 'admissions@example.com',
+	'roles' => array('mc_agent'),
+	'allcaps' => array(),
+);
+$forged_dpt_draft_approval = $plugin->rest_update_admission_letter_draft(new WP_REST_Request(
+	array('application_id' => 'application-1'),
+	array(
+		'templateId' => 'acceptance-letter',
+		'action' => 'approve',
+		'body' => 'Forged approval body.',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	)
+));
+intake_assert_same(403, $forged_dpt_draft_approval->get_status(), 'Exact DPT issuance authority must not grant crafted letter-draft approval permission.');
+intake_assert_same(false, false !== strpos(implode("\n", $GLOBALS['wpdb']->events), 'START TRANSACTION'), 'A forbidden DPT draft action must fail before any write transaction.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'wordpressUserId' => 84,
+	'wordpressUsername' => 'MC-ADMISSIONS-DPT',
+	'wordpressEmail' => 'admissions@example.com',
+	'agencyName' => 'MC Admissions Department',
+	'programmeCode' => $advancement_code,
+	'programmeLabel' => 'Advancement from English Foundation Year to Bachelor’s degree in Business Administration',
+	'status' => 'acceptance-issued',
+	'workflowNote' => 'Issue the Acceptance Letter.',
+	'classesStartDate' => null,
+	'paymentStatus' => 'awaiting-invoice',
+	'paymentAmount' => null,
+	'isTestData' => 0,
+));
+$advancement_acceptance_payload = array(
+	'templateId' => 'acceptance-letter',
+	'templateVersion' => 'foundation-offline-v1',
+	'fileName' => 'foundation-acceptance-letter.pdf',
+	'outputFormat' => 'pdf',
+	'contentBase64' => base64_encode("%PDF-1.7\n"),
+	'inputSnapshot' => array('source' => 'foundation-offline-test'),
+);
+$first_advancement_acceptance = $persist_letter->invoke(
+	$plugin,
+	'application-1',
+	$advancement_acceptance_payload,
+	$migration_user,
+	'2026-08-20T10:00:00.000Z'
+);
+intake_assert_same('acceptance-issued', $first_advancement_acceptance['application']['stageKey'], 'First special Acceptance issuance must keep the directly accepted case at Acceptance.');
+$issued_advancement_note = (string) $GLOBALS['wpdb']->application['workflowNote'];
+intake_assert_true(false !== strpos($issued_advancement_note, 'Acceptance Letter was issued'), 'First special Acceptance issuance must persist an issued-letter workflow note under the application lock.');
+intake_assert_true(false !== strpos($issued_advancement_note, 'Migration handoff'), 'The issued special workflow note must describe the next Migration handoff.');
+intake_assert_same(false, false !== stripos($issued_advancement_note, 'Payment Receipt'), 'The post-issuance special workflow note must not retain the pending-letter Payment Receipt wording.');
+intake_assert_same($issued_advancement_note, $first_advancement_acceptance['application']['workflowNote'], 'The generated-letter response must return the committed special issuance note.');
+$special_acceptance_activities = array_values(array_filter($GLOBALS['wpdb']->activities, static function ($activity) {
+	return 'Foundation advancement acceptance letter issued' === (string) ($activity['title'] ?? '');
+}));
+intake_assert_same(1, count($special_acceptance_activities), 'First special Acceptance issuance must record exactly one workflow handoff activity.');
+$acceptance_handoff_audits = array_values(array_filter($GLOBALS['wpdb']->activities, static function ($activity) {
+	return 0 === strpos((string) ($activity['title'] ?? ''), 'Workflow handoff: Acceptance package issued');
+}));
+intake_assert_same(1, count($acceptance_handoff_audits), 'First special Acceptance issuance must trigger the ordinary Acceptance-to-Migration role handoff.');
+
+$second_expected_version = str_replace(' ', 'T', (string) $GLOBALS['wpdb']->application['updatedAt']) . 'Z';
+$persist_letter->invoke(
+	$plugin,
+	'application-1',
+	array_merge($advancement_acceptance_payload, array('fileName' => 'foundation-acceptance-letter-reissued.pdf')),
+	$migration_user,
+	$second_expected_version
+);
+$special_acceptance_activities = array_values(array_filter($GLOBALS['wpdb']->activities, static function ($activity) {
+	return 'Foundation advancement acceptance letter issued' === (string) ($activity['title'] ?? '');
+}));
+$acceptance_handoff_audits = array_values(array_filter($GLOBALS['wpdb']->activities, static function ($activity) {
+	return 0 === strpos((string) ($activity['title'] ?? ''), 'Workflow handoff: Acceptance package issued');
+}));
+intake_assert_same(1, count($special_acceptance_activities), 'Reissuing the special Acceptance Letter must not duplicate the workflow handoff activity.');
+intake_assert_same(1, count($acceptance_handoff_audits), 'Reissuing the special Acceptance Letter must not notify the Migration handoff twice.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('migration-officer'), 11);
+$advancement_draft_save = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'draft',
+	'draft' => $advancement_draft,
+)));
+intake_assert_same(200, $advancement_draft_save->get_status(), 'Migration must be able to save a Foundation advancement draft.');
+intake_assert_same('Application in progress', $GLOBALS['wpdb']->application['status'], 'A saved advancement draft must remain in preparation.');
+intake_assert_same('pending', $GLOBALS['wpdb']->application['reviewerDecision'], 'An unsubmitted advancement draft must not consume an annual accepted Bachelor seat.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('migration-officer'), 11);
+$advancement_submission = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'review',
+	'draft' => $advancement_draft,
+)));
+intake_assert_same(200, $advancement_submission->get_status(), 'Migration must be able to submit a Foundation advancement application.');
+intake_assert_same(84, (int) $GLOBALS['wpdb']->application['wordpressUserId'], 'Submitted advancement must be charged to MC-ADMISSIONS-DPT.');
+intake_assert_same('acceptance-issued', $GLOBALS['wpdb']->application['status'], 'Submitted advancement must skip review, offer, and payment queues.');
+intake_assert_same('academically-cleared', $GLOBALS['wpdb']->application['reviewerDecision'], 'Submitted advancement must be de facto academically accepted.');
+intake_assert_true(false !== strpos((string) $GLOBALS['wpdb']->application['workflowNote'], 'Issue the Acceptance Letter'), 'Submitted advancement must explain its direct Acceptance Letter handoff.');
+
+// Generic operations PATCHes must not forge the policy-owned special review
+// decision or reopen a rejected special case through the normal review queue.
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = array_merge(intake_application(), array(
+	'programmeCode' => $advancement_code,
+	'status' => 'profile-preparation',
+	'reviewerDecision' => 'pending',
+));
+$forged_draft_clearance = $plugin->rest_update_operations(new WP_REST_Request(
+	array('application_id' => 'application-1'),
+	array(
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'draft' => array('reviewerDecision' => 'academically-cleared'),
+	)
+));
+intake_assert_same(400, $forged_draft_clearance->get_status(), 'A crafted operations PATCH must not academically clear an unsubmitted special draft.');
+intake_assert_true(false !== strpos((string) $forged_draft_clearance->get_data()['error'], 'direct-acceptance workflow'), 'The rejected draft decision mutation must return the special workflow invariant.');
+intake_assert_same('pending', $GLOBALS['wpdb']->application['reviewerDecision'], 'A rejected draft decision mutation must leave the special draft pending.');
+
+foreach (array('pending', 'hold') as $forged_active_decision) {
+	$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+	$GLOBALS['wpdb']->application = intake_application(array(
+		'programmeCode' => $advancement_code,
+		'status' => 'acceptance-issued',
+		'reviewerDecision' => 'academically-cleared',
+	));
+	$forged_active_response = $plugin->rest_update_operations(new WP_REST_Request(
+		array('application_id' => 'application-1'),
+		array(
+			'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+			'draft' => array('reviewerDecision' => $forged_active_decision),
+		)
+	));
+	intake_assert_same(400, $forged_active_response->get_status(), 'A crafted operations PATCH must not set an active special case to ' . $forged_active_decision . '.');
+	intake_assert_same('academically-cleared', $GLOBALS['wpdb']->application['reviewerDecision'], 'An active special case must remain academically cleared after a rejected ' . $forged_active_decision . ' mutation.');
+}
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'programmeCode' => $advancement_code,
+	'status' => 'rejected',
+	'reviewerDecision' => 'rejected',
+));
+$forged_special_reopen = $plugin->rest_update_operations(new WP_REST_Request(
+	array('application_id' => 'application-1'),
+	array(
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'draft' => array('reviewerDecision' => 'academically-cleared'),
+	)
+));
+intake_assert_same(400, $forged_special_reopen->get_status(), 'A generic operations PATCH must not reopen a rejected Foundation advancement case.');
+intake_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'A rejected special case must not re-enter review through a forged decision PATCH.');
+intake_assert_same('rejected', $GLOBALS['wpdb']->application['reviewerDecision'], 'A rejected special case must retain its rejected decision after a forged reopen attempt.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'));
+$unauthorized_advancement = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'review',
+	'draft' => $advancement_draft,
+)));
+intake_assert_same(403, $unauthorized_advancement->get_status(), 'Ordinary agents must receive a forbidden response for a forged special programme payload. Response: ' . var_export($unauthorized_advancement->get_data(), true));
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$unauthorized_advancement_label = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'review',
+	'draft' => array_merge(
+		$advancement_draft,
+		array('programme' => "Advancement from English Foundation Year to Bachelor’s degree in Business Administration")
+	),
+)));
+intake_assert_same(403, $unauthorized_advancement_label->get_status(), 'Human-readable advancement labels must be normalized before authorization so ordinary agents cannot bypass the restricted programme gate.');
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
+
+$advancement_workflow_application = intake_application(array(
+	'wordpressUserId' => 84,
+	'wordpressUsername' => 'MC-ADMISSIONS-DPT',
+	'wordpressEmail' => 'admissions@example.com',
+	'agencyName' => 'MC Admissions Department',
+	'programmeCode' => $advancement_code,
+	'programmeLabel' => 'Advancement from English Foundation Year to Bachelor’s degree in Business Administration',
+	'status' => 'acceptance-issued',
+	'workflowNote' => 'Issue the Acceptance Letter.',
+));
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = $advancement_workflow_application;
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('immigration-officer'), 12);
+$forbidden_advancement_workflow = $plugin->rest_update_workflow(new WP_REST_Request(array(), array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'status' => 'migration-documents',
+)));
+intake_assert_same(403, $forbidden_advancement_workflow->get_status(), 'Non-authorized internal roles must receive a forbidden response for the restricted Foundation advancement handoff.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = $advancement_workflow_application;
+$dpt_user = array(
+	'id' => 84,
+	'username' => 'MC-ADMISSIONS-DPT',
+	'name' => 'MC Admissions Department',
+	'email' => 'admissions@example.com',
+	'roles' => array('subscriber'),
+);
+intake_assert_throws_contains('Acceptance Letter before moving', static function () use ($update_workflow, $plugin, $dpt_user) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'migration-documents',
+		'note' => 'Acceptance issued; begin migration preparation.',
+		'user' => $dpt_user,
+	));
+}, 'Foundation advancement must remain in Acceptance until its Acceptance Letter is actually issued.');
+intake_assert_throws_contains('Acceptance Letter before moving', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'entry-permit-processing',
+		'note' => 'Attempt to skip the Acceptance and Migration handoffs.',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'Administrators must not bypass special Acceptance issuance by jumping directly to a later operational stage.');
+$GLOBALS['wpdb']->generatedLetters[] = array(
+	'id' => 'foundation-acceptance-1',
+	'applicationId' => 'application-1',
+	'templateId' => 'acceptance-letter',
+	'templateLabel' => 'Acceptance letter',
+	'templateVersion' => 'foundation-offline-v1',
+	'stageKeySnapshot' => 'acceptance-issued',
+	'fileName' => 'foundation-acceptance-letter.pdf',
+	'outputFormat' => 'pdf',
+	'generatedByName' => 'Migration Officer',
+	'createdAt' => '2026-08-20 10:00:00.000',
+);
+$advancement_migration_handoff = $update_workflow->invoke($plugin, array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'status' => 'migration-documents',
+	'note' => 'Acceptance issued; begin migration preparation.',
+	'user' => $dpt_user,
+));
+intake_assert_same('migration-documents', $GLOBALS['wpdb']->application['status'], 'MC-ADMISSIONS-DPT must be able to move its accepted advancement case to Migration.');
+intake_assert_same(true, $advancement_migration_handoff['stageChanged'], 'The dedicated-owner Migration handoff must be recorded as a workflow stage change.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array('status' => 'acceptance-issued'));
+$normal_migration_handoff = $update_workflow->invoke($plugin, array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'status' => 'migration-documents',
+	'note' => 'Begin ordinary migration preparation.',
+	'user' => $migration_user,
+));
+intake_assert_same(true, $normal_migration_handoff['stageChanged'], 'Ordinary accepted cases must retain their existing Migration transition without a generated-letter existence gate.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = array_merge($advancement_workflow_application, array(
+	'status' => 'migration-documents',
+	'reviewerDecision' => 'academically-cleared',
+));
+$legacy_migration_note = $update_workflow->invoke($plugin, array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'status' => 'migration-documents',
+	'note' => 'Legacy Migration follow-up without changing stage.',
+	'user' => intake_user(array('administrator')),
+));
+intake_assert_same(false, $legacy_migration_note['stageChanged'], 'The Acceptance-letter gate must not block a same-stage note correction on a legacy Migration case.');
+intake_assert_same('Legacy Migration follow-up without changing stage.', $GLOBALS['wpdb']->application['workflowNote'], 'A permitted legacy same-stage note correction must persist.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = $advancement_workflow_application;
+foreach (array('review-pending', 'offer-issued', 'prepayment-pending') as $forbidden_advancement_status) {
+	intake_assert_throws_contains('skip academic review', static function () use ($update_workflow, $plugin, $forbidden_advancement_status) {
+		$update_workflow->invoke($plugin, array(
+			'applicationId' => 'application-1',
+			'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+			'status' => $forbidden_advancement_status,
+			'note' => '',
+			'user' => intake_user(array('administrator')),
+		));
+	}, 'Foundation advancement must not move backward into the ordinary assessment, offer, or payment queues.');
+}
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = $advancement_workflow_application;
+intake_assert_throws_contains('cannot return to profile preparation', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'profile-preparation',
+		'note' => 'Attempt to reopen the intake wizard.',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'A submitted special case must not move backward into profile preparation.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = array_merge($advancement_workflow_application, array(
+	'status' => 'Application in progress',
+	'reviewerDecision' => 'pending',
+));
+intake_assert_throws_contains('Submit the Foundation advancement intake form', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'migration-documents',
+		'note' => '',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'A special draft must not bypass final form validation through the generic workflow endpoint.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = array_merge($advancement_workflow_application, array(
+	'status' => 'trashed',
+	'reviewerDecision' => 'pending',
+));
+intake_assert_throws_contains('Restore the unsubmitted Foundation advancement draft to preparation', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'acceptance-issued',
+		'note' => '',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'Trashing an unsubmitted special draft must not create a workflow route around final form validation.');
+$restored_advancement_draft = $update_workflow->invoke($plugin, array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'status' => 'profile-preparation',
+	'note' => 'Restore the draft for completion.',
+	'user' => intake_user(array('administrator')),
+));
+intake_assert_same('profile-preparation', $GLOBALS['wpdb']->application['status'], 'An unsubmitted trashed special draft may be restored only to preparation.');
+intake_assert_same(true, $restored_advancement_draft['stageChanged'], 'The safe special-draft restore must remain an audited workflow transition.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = array_merge($advancement_workflow_application, array(
+	'status' => 'trashed',
+	'reviewerDecision' => 'rejected',
+));
+intake_assert_throws_contains('cannot be reopened through the generic workflow', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'profile-preparation',
+		'note' => 'Attempt to misclassify a rejected case as an unsubmitted draft.',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'A trashed rejected special case must not use the pending-draft restore path.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = array_merge($advancement_workflow_application, array(
+	'status' => 'rejected',
+	'reviewerDecision' => 'rejected',
+));
+$GLOBALS['wpdb']->generatedLetters = array($advancement_acceptance_letter_record);
+intake_assert_throws_contains('cannot be reopened through the generic workflow', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'migration-documents',
+		'note' => 'Attempt to bypass rejected-state restoration through Migration.',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'A rejected special case must not jump to a later stage even when an old Acceptance Letter exists.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = array_merge($advancement_workflow_application, array(
+	'status' => 'trashed',
+	'reviewerDecision' => 'academically-cleared',
+));
+intake_assert_throws_contains('Acceptance Letter before moving', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'migration-documents',
+		'note' => 'Attempt to skip Acceptance Letter issuance.',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'A submitted special case restored from Trash must not jump directly to Migration without an Acceptance Letter.');
+$restored_submitted_advancement = $update_workflow->invoke($plugin, array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'status' => 'acceptance-issued',
+	'note' => 'Restore the previously submitted advancement case.',
+	'user' => intake_user(array('administrator')),
+));
+intake_assert_same('acceptance-issued', $GLOBALS['wpdb']->application['status'], 'A previously submitted and academically cleared special case may be restored to Acceptance.');
+intake_assert_same(true, $restored_submitted_advancement['stageChanged'], 'Restoring a previously submitted special case must remain an audited workflow transition.');
+intake_assert_true(false !== strpos((string) $GLOBALS['wpdb']->application['workflowNote'], 'Issue the Acceptance Letter'), 'Restoring a submitted special case without an Acceptance Letter must persist the pending-letter note.');
+intake_assert_same(false, false !== stripos((string) $GLOBALS['wpdb']->application['workflowNote'], 'Payment Receipt'), 'The special Acceptance restore must not use generic payment-stage wording.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = array_merge($advancement_workflow_application, array(
+	'status' => 'migration-documents',
+	'reviewerDecision' => 'academically-cleared',
+	'isTestData' => 0,
+));
+$GLOBALS['wpdb']->generatedLetters = array($advancement_acceptance_letter_record);
+$returned_to_issued_acceptance = $update_workflow->invoke($plugin, array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'status' => 'acceptance-issued',
+	'note' => 'Generic caller-provided acceptance note.',
+	'user' => intake_user(array('administrator')),
+));
+intake_assert_same(true, $returned_to_issued_acceptance['stageChanged'], 'A submitted special case with an issued letter may move back to Acceptance for correction.');
+intake_assert_true(false !== strpos((string) $GLOBALS['wpdb']->application['workflowNote'], 'Acceptance Letter was issued'), 'A special Acceptance correction with a generated letter must persist the issued-letter note.');
+intake_assert_same(1, count($GLOBALS['wpdb']->activities), 'Moving a special case back to Acceptance must suppress generic stage/note email audit rows; the letter issuance owns delivery.');
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
 
 // Transaction Confirmation is PDF-only and readiness reflects a real PDF record.
 $valid_pdf = tempnam(sys_get_temp_dir(), 'mc-intake-pdf-');
@@ -859,6 +1650,9 @@ intake_assert_true(false !== strpos($payment_response->get_data()['error'], 'Tra
 $annual_fixtures = array(
 	intake_application(array('id' => 'spring-accepted', 'semester' => 'spring', 'year' => '2026', 'isTestData' => 0, 'status' => 'offer-issued', 'reviewerDecision' => 'academically-cleared')),
 	intake_application(array('id' => 'fall-accepted', 'semester' => 'fall', 'year' => '2026', 'isTestData' => 0, 'programmeCode' => 'hotel-casino-resort-management', 'status' => 'Acceptance Confirmed', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'advancement-business-accepted', 'semester' => 'spring', 'year' => '2026', 'isTestData' => 0, 'programmeCode' => 'foundation-advancement-business-administration', 'status' => 'acceptance-issued', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'advancement-hotel-accepted', 'semester' => 'summer', 'year' => '2026', 'isTestData' => 0, 'programmeCode' => 'foundation-advancement-hotel-casino-resort-management', 'status' => 'migration-documents', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'advancement-draft-excluded', 'semester' => 'fall', 'year' => '2026', 'isTestData' => 0, 'programmeCode' => 'foundation-advancement-business-administration', 'status' => 'Application in progress', 'reviewerDecision' => 'pending')),
 	intake_application(array('id' => 'next-year-accepted', 'semester' => 'summer', 'year' => '2027', 'isTestData' => 0, 'status' => 'review-pending', 'reviewerDecision' => 'academically-cleared')),
 	intake_application(array('id' => 'test-excluded', 'year' => '2027', 'isTestData' => 1, 'reviewerDecision' => 'academically-cleared')),
 	intake_application(array('id' => 'rejected-excluded', 'year' => '2027', 'isTestData' => 0, 'status' => 'Rejected', 'reviewerDecision' => 'academically-cleared')),
@@ -870,8 +1664,8 @@ $annual_fixtures = array(
 );
 $annual_summary = $build_annual_seat_summary->invoke($plugin, $annual_fixtures, 2026);
 intake_assert_same(array(2026, 2027), array_column($annual_summary, 'intakeYear'), 'Annual cards must include the current year and valid Bachelor intake years only, sorted ascending.');
-intake_assert_same(2, $annual_summary[0]['acceptedPlacements'], 'Spring and Fall accepted Bachelor applications must aggregate into one annual count.');
-intake_assert_same(150, $annual_summary[0]['availablePlacements'], 'Annual availability must subtract accepted Bachelor applications from 152.');
+intake_assert_same(4, $annual_summary[0]['acceptedPlacements'], 'Ordinary and both Foundation advancement Bachelor programmes must aggregate into one annual count after academic clearance, while drafts remain excluded.');
+intake_assert_same(148, $annual_summary[0]['availablePlacements'], 'Annual availability must subtract ordinary and Foundation advancement Bachelor applications from 152.');
 intake_assert_same(0, $annual_summary[0]['overCapacity'], 'An in-capacity year must not report an excess.');
 intake_assert_same(1, $annual_summary[1]['acceptedPlacements'], 'Rejected, trashed, test, and non-cleared applications must not consume the annual count.');
 
@@ -919,11 +1713,39 @@ $GLOBALS['wpdb']->boardApplications = array(
 		'wordpressUserId' => 77,
 		'passportNumber' => 'FOREIGN-PASSPORT',
 	)),
+	intake_application(array(
+		'id' => 'foundation-board-draft',
+		'referenceCode' => 'MC-FOUNDATION-DRAFT',
+		'wordpressUserId' => 84,
+		'programmeCode' => $advancement_code,
+		'status' => 'profile-preparation',
+		'reviewerDecision' => 'pending',
+	)),
+	intake_application(array(
+		'id' => 'foundation-board-issued',
+		'referenceCode' => 'MC-FOUNDATION-ISSUED',
+		'wordpressUserId' => 84,
+		'programmeCode' => $advancement_code,
+		'status' => 'acceptance-issued',
+		'reviewerDecision' => 'academically-cleared',
+	)),
 );
+$GLOBALS['wpdb']->generatedLetters = array(array_merge(
+	$advancement_acceptance_letter_record,
+	array('id' => 'foundation-board-letter', 'applicationId' => 'foundation-board-issued')
+));
 $GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
 $internal_board = $plugin->rest_list_applications();
 intake_assert_same(200, $internal_board->get_status(), 'Internal staff must be able to load the application board with annual seats.');
 intake_assert_same(1, $internal_board->get_data()['annualSeatSummary'][0]['acceptedPlacements'], 'Internal annual seats must be computed globally from the application table.');
+$foundation_board_rows = array_column($internal_board->get_data()['applications'], null, 'recordId');
+intake_assert_same(0, $foundation_board_rows['foundation-board-draft']['totalIntakeDocuments'], 'Board rows must expose an empty required intake pack for special drafts.');
+intake_assert_same(0, $foundation_board_rows['foundation-board-draft']['intakeMissingDocs'], 'Board rows must not report optional special intake uploads as missing.');
+intake_assert_same(0, $foundation_board_rows['foundation-board-draft']['missingDocs'], 'The active board pack for a special draft must have no missing intake documents.');
+intake_assert_same($advancement_code, $foundation_board_rows['foundation-board-draft']['programmeCode'], 'Internal board rows must expose the canonical special programme code.');
+intake_assert_same(1, $foundation_board_rows['foundation-board-issued']['acceptanceLetterCount'], 'Board rows must expose the per-case Acceptance Letter count without a detail request.');
+intake_assert_same(4, $foundation_board_rows['foundation-board-issued']['totalMigrationDocuments'], 'An issued special board row must retain the normal Migration document total.');
+intake_assert_same(4, $foundation_board_rows['foundation-board-issued']['migrationMissingDocs'], 'An issued special board row must retain missing Migration requirements.');
 $GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
 $agent_board = $plugin->rest_list_applications();
 intake_assert_same(200, $agent_board->get_status(), 'Agents must retain their scoped application board access.');
@@ -933,9 +1755,24 @@ intake_assert_same(1, count($agent_board_applications), 'Agents must receive onl
 intake_assert_same('agent-owned-case', $agent_board_applications[0]['recordId'], 'The scoped board must retain the owning agent application.');
 intake_assert_same('OWNED-PASSPORT', $agent_board_applications[0]['passportNumber'], 'The scoped board must retain passport-number search data.');
 intake_assert_same('approved', $agent_board_applications[0]['permitStatus'], 'The scoped board must retain the current permit status.');
+intake_assert_same(0, $agent_board_applications[0]['acceptanceLetterCount'], 'Scoped board rows must expose the safe per-case Acceptance Letter count.');
 foreach (array('permitReference', 'commissionStatus', 'refundStatus', 'workflowNote', 'updatedByName') as $internal_field) {
 	intake_assert_same(false, array_key_exists($internal_field, $agent_board_applications[0]), 'The agent board must not expose internal field ' . $internal_field . '.');
 }
+$GLOBALS['mc_intake_current_user'] = (object) array(
+	'ID' => 84,
+	'user_login' => 'MC-ADMISSIONS-DPT',
+	'display_name' => 'MC Admissions Department',
+	'user_email' => 'admissions@example.com',
+	'roles' => array('mc_agent'),
+	'allcaps' => array(),
+);
+$dpt_board = $plugin->rest_list_applications();
+intake_assert_same(200, $dpt_board->get_status(), 'Exact DPT must retain its externally scoped board response.');
+$dpt_board_rows = array_column($dpt_board->get_data()['applications'], null, 'recordId');
+intake_assert_same(2, count($dpt_board_rows), 'Exact DPT must receive only its two owned special cases in the board fixture.');
+intake_assert_same($advancement_code, $dpt_board_rows['foundation-board-draft']['programmeCode'], 'The scoped DPT board must expose the canonical special programme code.');
+intake_assert_same(1, $dpt_board_rows['foundation-board-issued']['acceptanceLetterCount'], 'The scoped DPT board must expose whether its Acceptance Letter has been issued.');
 $GLOBALS['wpdb']->failAnnualSeatQuery = true;
 $GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
 $failed_internal_board = $plugin->rest_list_applications();
