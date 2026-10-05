@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.69
+ * Version: 0.2.70
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -34,6 +34,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const NOTIFICATION_DOCUMENT_ACTIVITY_KIND = 'agent-document-upload';
 		const PRESIDENT_ACTIVITY_ALERT_EMAIL = 'president@mesoyios.ac.cy';
 		const PRESIDENT_ACTIVITY_ALERT_NAME = 'Theodoros';
+		const FOUNDATION_ADVANCEMENT_OWNER_LOGIN = 'mc-admissions-dpt';
+		const FOUNDATION_ADVANCEMENT_HOTEL_PROGRAMME = 'foundation-advancement-hotel-casino-resort-management';
+		const FOUNDATION_ADVANCEMENT_BUSINESS_PROGRAMME = 'foundation-advancement-business-administration';
 		const DESKTOP_RELEASE_REPOSITORY = 'GeorgeWebDevCy/mc-admissions-app';
 		const RELEASE_NOTIFICATION_SECRET_SETTING = 'release_notification_secret';
 		const RELEASE_NOTIFICATION_STATE_PREFIX = 'release_notification_delivery_';
@@ -134,6 +137,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			'business-administration' => "Bachelor's degree in Business Administration",
 			'business-administration-masters' => "Master's degree in Business Administration (MBA)",
 			'english-foundation' => 'English Foundation Year',
+			'foundation-advancement-hotel-casino-resort-management' => "Advancement from English Foundation Year to Bachelor’s degree in Hotel, Casino and Resort Management",
+			'foundation-advancement-business-administration' => "Advancement from English Foundation Year to Bachelor’s degree in Business Administration",
 		);
 
 		/** @var string[] */
@@ -5338,18 +5343,41 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function rest_list_agents() {
 			global $wpdb;
 			$user = $this->current_session_user();
-			if (!$this->can_assign_application_owner($user)) {
-				return $this->json_error_response('Administrator or Admissions Officer access required.', 403);
+			$can_assign_any_owner = $this->can_assign_application_owner($user);
+			$can_prepare_advancement = $this->can_manage_foundation_advancement($user);
+			if (!$can_assign_any_owner && !$can_prepare_advancement) {
+				return $this->json_error_response('Administrator, Admissions Officer, or Foundation advancement access required.', 403);
 			}
 
-			$agents = array_values(array_filter(
-				get_users(array('role__in' => array('mc_agent'), 'orderby' => 'display_name', 'order' => 'ASC')),
-				function ($agent) {
-					return $this->is_external_agent_user(
-						array('roles' => array_values((array) $agent->roles))
-					);
+			$agents = $can_assign_any_owner
+				? array_values(array_filter(
+					get_users(array('role__in' => array('mc_agent'), 'orderby' => 'display_name', 'order' => 'ASC')),
+					function ($agent) {
+						return $this->is_external_agent_user(
+							array('roles' => array_values((array) $agent->roles))
+						);
+					}
+				))
+				: array();
+			if ($can_prepare_advancement) {
+				$advancement_owner = get_user_by('login', self::FOUNDATION_ADVANCEMENT_OWNER_LOGIN);
+				if (!$advancement_owner || empty($advancement_owner->ID)) {
+					if (!$can_assign_any_owner) {
+						return $this->json_error_response('The MC-ADMISSIONS-DPT WordPress account is not available.', 409);
+					}
+				} else {
+					$already_listed = false;
+					foreach ($agents as $agent) {
+						if ((int) $agent->ID === (int) $advancement_owner->ID) {
+							$already_listed = true;
+							break;
+						}
+					}
+					if (!$already_listed) {
+						$agents[] = $advancement_owner;
+					}
 				}
-			));
+			}
 			$profiles_by_user = array();
 			if (!empty($agents)) {
 				$agent_ids = array_map('absint', wp_list_pluck($agents, 'ID'));
@@ -5510,10 +5538,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					200
 				);
 			} catch (Exception $error) {
-				$status = self::STALE_APPLICATION_ERROR === $error->getMessage()
-					|| $this->is_capacity_conflict_message($error->getMessage())
+				$message = $error->getMessage();
+				$status = self::STALE_APPLICATION_ERROR === $message
+					|| $this->is_capacity_conflict_message($message)
 					? 409
-					: 400;
+					: (
+						false !== stripos($message, 'foundation advancement')
+						&& false !== stripos($message, 'permission')
+							? 403
+							: 400
+					);
 				return $this->json_error_response($error->getMessage(), $status);
 			}
 		}
@@ -5552,7 +5586,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					200
 				);
 			} catch (Exception $error) {
-				$status = self::STALE_APPLICATION_ERROR === $error->getMessage() ? 409 : 400;
+				$status = self::STALE_APPLICATION_ERROR === $error->getMessage()
+					? 409
+					: (
+						false !== stripos($error->getMessage(), 'foundation advancement')
+						&& false !== stripos($error->getMessage(), 'permission')
+							? 403
+							: 400
+					);
 				return $this->json_error_response($error->getMessage(), $status);
 			}
 		}
@@ -6176,6 +6217,43 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				|| $this->user_has_any_role($user, array('admissions-officer'));
 		}
 
+		private function is_foundation_advancement_programme($programme_code) {
+			return in_array(
+				$this->normalize_programme_code((string) $programme_code),
+				array(
+					self::FOUNDATION_ADVANCEMENT_HOTEL_PROGRAMME,
+					self::FOUNDATION_ADVANCEMENT_BUSINESS_PROGRAMME,
+				),
+				true
+			);
+		}
+
+		private function is_foundation_advancement_owner_user($user) {
+			return isset($user['username'])
+				&& self::FOUNDATION_ADVANCEMENT_OWNER_LOGIN === strtolower(trim((string) $user['username']));
+		}
+
+		private function can_manage_foundation_advancement($user) {
+			return $this->is_admin_user($user)
+				|| $this->user_has_any_role($user, array('admissions-officer', 'migration-officer'))
+				|| $this->is_foundation_advancement_owner_user($user);
+		}
+
+		private function foundation_advancement_owner() {
+			$owner = get_user_by('login', self::FOUNDATION_ADVANCEMENT_OWNER_LOGIN);
+			if (!$owner || empty($owner->ID)) {
+				throw new Exception('The MC-ADMISSIONS-DPT WordPress account is not available. Ask an administrator to restore it before creating a Foundation advancement application.');
+			}
+
+			return array(
+				'id' => (int) $owner->ID,
+				'username' => (string) $owner->user_login,
+				'name' => $this->authoritative_agency_name($owner),
+				'email' => (string) $owner->user_email,
+				'roles' => array_values((array) $owner->roles),
+			);
+		}
+
 		private function can_access_agent_media($user) {
 			if ($this->is_admin_user($user)) {
 				return true;
@@ -6221,7 +6299,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				&& ($this->is_agent_user($user) || $this->can_continue_assigned_preparation($user, $status));
 		}
 
-		private function resolve_application_owner($user, $assigned_agent_id) {
+		private function resolve_application_owner($user, $assigned_agent_id, $programme_code = '') {
+			if ($this->is_foundation_advancement_programme($programme_code)) {
+				if (!$this->can_manage_foundation_advancement($user)) {
+					throw new Exception('You do not have permission to create a Foundation advancement application. Use an Administrator, Admissions Officer, Migration Officer, or MC-ADMISSIONS-DPT account.');
+				}
+
+				return $this->foundation_advancement_owner();
+			}
+
 			if ($this->can_assign_application_owner($user)) {
 				if (!$assigned_agent_id) {
 					throw new Exception('Select an agent before creating the application.');
@@ -6561,6 +6647,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				strtolower("Business Administration (Master's)") => 'business-administration-masters',
 				strtolower("Master's degree in Business Administration (MBA)") => 'business-administration-masters',
 				strtolower('English Foundation Year') => 'english-foundation',
+				strtolower("Advancement from English Foundation Year to Bachelor’s degree in Hotel, Casino and Resort Management") => self::FOUNDATION_ADVANCEMENT_HOTEL_PROGRAMME,
+				strtolower("Advancement from English Foundation Year to Bachelor's degree in Hotel, Casino and Resort Management") => self::FOUNDATION_ADVANCEMENT_HOTEL_PROGRAMME,
+				strtolower("Advancement from English Foundation Year to Bachelor’s degree in Business Administration") => self::FOUNDATION_ADVANCEMENT_BUSINESS_PROGRAMME,
+				strtolower("Advancement from English Foundation Year to Bachelor's degree in Business Administration") => self::FOUNDATION_ADVANCEMENT_BUSINESS_PROGRAMME,
 			);
 			$key = strtolower($value);
 			if (isset($aliases[$key])) {
@@ -6693,7 +6783,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		private function is_bachelor_programme($programme_code) {
 			return in_array(
 				(string) $programme_code,
-				array('hotel-casino-resort-management', 'business-administration'),
+				array(
+					'hotel-casino-resort-management',
+					'business-administration',
+					self::FOUNDATION_ADVANCEMENT_HOTEL_PROGRAMME,
+					self::FOUNDATION_ADVANCEMENT_BUSINESS_PROGRAMME,
+				),
 				true
 			);
 		}
@@ -6896,6 +6991,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Accept all required declarations: ' . implode(', ', $missing_declarations) . '.');
 			}
 
+			// Existing Foundation students already have their source documents on
+			// file with the College. Keep every application field and declaration
+			// mandatory, but do not make duplicate uploads a submission gate.
+			if ($this->is_foundation_advancement_programme((string) $draft['programme'])) {
+				return;
+			}
+
 			$required_documents = array(
 				'passport',
 				'secondaryMarksheet',
@@ -7060,6 +7162,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				default:
 					return 'Application is being prepared. Complete the profile and document pack before review.';
 			}
+		}
+
+		private function foundation_advancement_acceptance_pending_note() {
+			return 'Foundation advancement accepted by policy. Issue the Acceptance Letter, then move the case to Migration.';
+		}
+
+		private function foundation_advancement_acceptance_issued_note() {
+			return 'The Foundation advancement Acceptance Letter was issued. Continue with the standard Migration handoff.';
 		}
 
 		private function next_action_for_status($application, $ready_documents, $total_documents) {
@@ -7363,6 +7473,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$where_sql = '';
 			$query_args = array();
+			$acceptance_letter_count_sql = '0';
 			$commission_status_sql = "'not-applicable'";
 			$commission_amount_sql = 'NULL';
 			$commission_currency_sql = "'EUR'";
@@ -7372,6 +7483,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$permit_expiry_sql = self::MIGRATION_CASE_SCHEMA_VERSION === get_option('mc_admissions_migration_case_schema_version')
 				? 'migration.entryPermitExpiryDate'
 				: 'NULL';
+			if ($this->table_exists('mc_generated_letters')) {
+				$acceptance_letter_count_sql = "(SELECT COUNT(*) FROM mc_generated_letters acceptance_letter WHERE acceptance_letter.applicationId = app.id AND acceptance_letter.templateId = 'acceptance-letter')";
+			}
 
 			if (
 				$this->commission_records_table ===
@@ -7418,7 +7532,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					COALESCE(document_stats.readyDocumentCount, 0) AS readyDocumentCount,
 					COALESCE(document_stats.readyIntakeDocumentCount, 0) AS readyIntakeDocumentCount,
 					COALESCE(document_stats.readyMigrationDocumentCount, 0) AS readyMigrationDocumentCount,
-					COALESCE(document_stats.readyImmigrationDocumentCount, 0) AS readyImmigrationDocumentCount
+					COALESCE(document_stats.readyImmigrationDocumentCount, 0) AS readyImmigrationDocumentCount,
+					{$acceptance_letter_count_sql} AS acceptanceLetterCount
 				FROM {$this->applications_table} app
 				LEFT JOIN {$this->migration_cases_table} migration
 					ON migration.applicationId = app.id
@@ -7449,10 +7564,17 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$application = $this->application_with_authoritative_agency_identity($application);
 			}
 			$status = $this->normalize_status($application['status']);
-			$intake_total = isset($application['applicationRoute']) && 'postgraduate' === $application['applicationRoute'] ? 8 : 6;
+			$is_foundation_advancement = $this->is_foundation_advancement_programme(
+				isset($application['programmeCode']) ? (string) $application['programmeCode'] : ''
+			);
+			$intake_total = $is_foundation_advancement
+				? 0
+				: (isset($application['applicationRoute']) && 'postgraduate' === $application['applicationRoute'] ? 8 : 6);
 			$migration_total = 4;
 			$immigration_total = 10;
-			$intake_ready = isset($application['readyIntakeDocumentCount']) ? (int) $application['readyIntakeDocumentCount'] : 0;
+			$intake_ready = $is_foundation_advancement
+				? 0
+				: (isset($application['readyIntakeDocumentCount']) ? (int) $application['readyIntakeDocumentCount'] : 0);
 			$migration_ready = isset($application['readyMigrationDocumentCount']) ? (int) $application['readyMigrationDocumentCount'] : 0;
 			$immigration_ready = isset($application['readyImmigrationDocumentCount']) ? (int) $application['readyImmigrationDocumentCount'] : 0;
 			$lane = $this->get_lane_for_status($status);
@@ -7468,6 +7590,18 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			$missing_docs = max(0, $total_documents - $ready_documents);
+			$acceptance_letter_count = isset($application['acceptanceLetterCount'])
+				? max(0, (int) $application['acceptanceLetterCount'])
+				: count(
+					array_filter(
+						isset($application['generatedLetters']) && is_array($application['generatedLetters'])
+							? $application['generatedLetters']
+							: array(),
+						function ($letter) {
+							return 'acceptance-letter' === (string) ($letter['templateId'] ?? '');
+						}
+					)
+				);
 
 			return array(
 				'recordId' => $application['id'],
@@ -7476,6 +7610,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'passportNumber' => isset($application['passportNumber']) ? (string) $application['passportNumber'] : '',
 				'agentName' => $application['agencyName'],
 				'programme' => $this->resolve_programme_label($application),
+				'programmeCode' => $this->normalize_programme_code($application['programmeCode'] ?? ''),
 				'semester' => trim($application['semester'] . ' ' . $application['year']),
 				'stage' => $status,
 				'stageKey' => isset($application['status']) ? (string) $application['status'] : $status,
@@ -7500,6 +7635,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'totalIntakeDocuments' => $intake_total,
 				'intakeMissingDocs' => max(0, $intake_total - $intake_ready),
 				'intakeReadyDocuments' => $intake_ready,
+				'acceptanceLetterCount' => $acceptance_letter_count,
 				'totalMigrationDocuments' => $migration_total,
 				'migrationMissingDocs' => max(0, $migration_total - $migration_ready),
 				'migrationReadyDocuments' => $migration_ready,
@@ -7537,6 +7673,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'passportNumber',
 					'agentName',
 					'programme',
+					'programmeCode',
 					'semester',
 					'stage',
 					'stageKey',
@@ -7548,6 +7685,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'totalIntakeDocuments',
 					'intakeMissingDocs',
 					'intakeReadyDocuments',
+					'acceptanceLetterCount',
 					'totalMigrationDocuments',
 					'migrationMissingDocs',
 					'migrationReadyDocuments',
@@ -7630,6 +7768,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if ($this->can_view_all_applications($user)) {
 				return $application;
 			}
+			$is_dpt_special_case = $this->is_foundation_advancement_owner_user($user)
+				&& $this->is_foundation_advancement_programme($application['programmeCode'] ?? '')
+				&& isset($application['wordpressUsername'])
+				&& self::FOUNDATION_ADVANCEMENT_OWNER_LOGIN === strtolower(trim((string) $application['wordpressUsername']));
 
 			$filtered = $this->response_field_subset(
 				$application,
@@ -7651,6 +7793,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'totalIntakeDocuments',
 					'intakeMissingDocs',
 					'intakeReadyDocuments',
+					'acceptanceLetterCount',
 					'totalMigrationDocuments',
 					'migrationMissingDocs',
 					'migrationReadyDocuments',
@@ -7751,6 +7894,19 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'immigrationCase' => null,
 				)
 			);
+			if ($is_dpt_special_case) {
+				// The dedicated owner renders the same special Acceptance input as
+				// internal staff without exposing any other staff-only operations data.
+				$filtered['classesStartDate'] = isset($application['classesStartDate'])
+					? $application['classesStartDate']
+					: null;
+				$filtered['tuitionFeeFirstYear'] = isset($application['tuitionFeeFirstYear'])
+					? $application['tuitionFeeFirstYear']
+					: null;
+				$filtered['tuitionFeeFollowingYears'] = isset($application['tuitionFeeFollowingYears'])
+					? $application['tuitionFeeFollowingYears']
+					: null;
+			}
 
 			return $filtered;
 		}
@@ -7807,7 +7963,19 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
-		private function can_generate_admission_letter($user, $template_id) {
+		private function can_generate_admission_letter($user, $template_id, $application = null) {
+			if (
+				is_array($application)
+				&& $this->is_foundation_advancement_programme($application['programmeCode'] ?? '')
+			) {
+				if (in_array($template_id, array('offer-letter', 'payment-receipt'), true)) {
+					return false;
+				}
+				if ('acceptance-letter' === $template_id) {
+					return $this->can_manage_foundation_advancement($user);
+				}
+			}
+
 			if ($this->is_admin_user($user)) {
 				return true;
 			}
@@ -7829,13 +7997,82 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		private function can_manage_admission_letter_draft($user, $template_id, $application = null) {
+			if (
+				is_array($application)
+				&& $this->is_foundation_advancement_programme($application['programmeCode'] ?? '')
+				&& in_array((string) $template_id, array('offer-letter', 'payment-receipt'), true)
+			) {
+				return false;
+			}
+			if ($this->is_admin_user($user)) {
+				return true;
+			}
+
+			switch ((string) $template_id) {
+				case 'offer-letter':
+					return $this->user_has_any_role($user, array('admissions-officer'));
+				case 'acceptance-letter':
+				case 'letter-of-assurance':
+				case 'late-arrival-affirmation-letter':
+					return $this->user_has_any_role(
+						$user,
+						array('admissions-officer', 'migration-officer', 'immigration-officer')
+					);
+				case 'payment-receipt':
+					return $this->user_has_any_role($user, array('finance-officer'));
+				default:
+					return false;
+			}
+		}
+
+		private function generated_admission_letter_exists($application_id, $template_id) {
+			global $wpdb;
+
+			if (!$this->table_exists('mc_generated_letters')) {
+				return false;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			return 0 < (int) $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(1) FROM mc_generated_letters WHERE applicationId = %s AND templateId = %s",
+					$application_id,
+					$template_id
+				)
+			);
+		}
+
 		private function assert_admission_letter_generation_available($application, $template_id) {
 			$case = $this->to_admission_case($application);
 			$payment_status = isset($case['paymentStatus']) ? (string) $case['paymentStatus'] : 'awaiting-invoice';
 			$payment_amount = isset($case['paymentAmount']) ? $this->trim_to_null($case['paymentAmount']) : null;
+			$is_foundation_advancement = $this->is_foundation_advancement_programme(
+				isset($application['programmeCode']) ? (string) $application['programmeCode'] : ''
+			);
 			$bank_confirmation_ready = $this->bank_transaction_confirmation_ready(
 				isset($application['documents']) ? $application['documents'] : array()
 			);
+
+			if ($is_foundation_advancement) {
+				if ('offer-letter' === $template_id) {
+					throw new Exception('Foundation advancement applications do not use an Offer Letter.');
+				}
+				if ('payment-receipt' === $template_id) {
+					throw new Exception('Foundation advancement applications do not use a Payment Receipt.');
+				}
+				if ('acceptance-letter' === $template_id) {
+					$stage_key = $this->canonical_status_key($case['stageKey']);
+					if (
+						in_array($stage_key, array('rejected', 'trashed'), true)
+						|| $this->workflow_status_rank($stage_key) < $this->workflow_status_rank('acceptance-issued')
+					) {
+						throw new Exception('Submit the Foundation advancement application to the Acceptance Letter section first.');
+					}
+
+					return $case;
+				}
+			}
 
 			switch ($template_id) {
 				case 'offer-letter':
@@ -7924,7 +8161,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if (!in_array($action, $valid_actions, true)) {
 				throw new Exception('A valid letter draft action is required.');
 			}
-			if (!$this->can_generate_admission_letter($user, $template_id)) {
+			$authorized_application = $this->get_authorized_application_base($application_id, $user);
+			if (!$this->can_manage_admission_letter_draft($user, $template_id, $authorized_application)) {
 				throw new Exception('You do not have permission to update this letter draft.');
 			}
 
@@ -7936,7 +8174,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Letter draft body is too large.');
 			}
 
-			$this->get_authorized_application_base($application_id, $user);
 			$template_label = $template_labels[$template_id];
 			$now = $this->current_notification_event_mysql_datetime();
 			$application = null;
@@ -8338,13 +8575,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$application_id = sanitize_text_field((string) $application_id);
 			$expected_version = $this->iso_to_mysql_datetime($expected_updated_at);
-			$this->get_authorized_application_base($application_id, $user);
+			$authorized_application = $this->get_authorized_application_base($application_id, $user);
 			$template_id = isset($generated['templateId']) ? sanitize_key((string) $generated['templateId']) : '';
 			$template_labels = $this->generated_admission_letter_template_labels();
 			if (!isset($template_labels[$template_id])) {
 				throw new Exception('A valid generated letter template is required.');
 			}
-			if (!$this->can_generate_admission_letter($user, $template_id)) {
+			if (!$this->can_generate_admission_letter($user, $template_id, $authorized_application)) {
 				throw new Exception('You do not have permission to generate this letter.');
 			}
 
@@ -8372,6 +8609,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$letter_id = wp_generate_uuid4();
 			$committed_application = null;
+			$acceptance_workflow_note = $this->workflow_note_for_status('acceptance-issued');
 			if (false === $wpdb->query('START TRANSACTION')) {
 				throw new Exception('Unable to start generated letter persistence.');
 			}
@@ -8383,6 +8621,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				}
 				$application = $this->get_detailed_application_record($application_id);
 				$this->assert_admission_letter_generation_available($application, $template_id);
+				$is_foundation_advancement = $this->is_foundation_advancement_programme(
+					isset($application['programmeCode']) ? (string) $application['programmeCode'] : ''
+				);
+				$is_first_foundation_advancement_acceptance_issuance =
+					$is_foundation_advancement
+					&& 'acceptance-letter' === $template_id
+					&& !$this->generated_admission_letter_exists($application_id, 'acceptance-letter');
+				if ($is_first_foundation_advancement_acceptance_issuance) {
+					$acceptance_workflow_note = $this->foundation_advancement_acceptance_issued_note();
+				}
 				$offer_reservation_audit_created = false;
 				if ('offer-letter' === $template_id) {
 					$offer_reservation_audit_created = $this->reserve_offer_placement_for_generated_letter(
@@ -8415,16 +8663,29 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 				$acceptance_stage_advanced = false;
 				if ('acceptance-letter' === $template_id) {
-					$acceptance_stage_result = $wpdb->query(
-						$wpdb->prepare(
-							"UPDATE {$this->applications_table}
-							 SET status = 'acceptance-issued', workflowNote = %s, lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3)
-							 WHERE id = %s AND status IN ('offer-issued', 'prepayment-pending', 'Offer letter issued', 'Payment pending')",
-							$this->workflow_note_for_status('acceptance-issued'),
-							$user['name'],
-							$application_id
-						)
-					);
+					if ($is_first_foundation_advancement_acceptance_issuance) {
+						$acceptance_stage_result = $wpdb->query(
+							$wpdb->prepare(
+								"UPDATE {$this->applications_table}
+								 SET status = 'acceptance-issued', workflowNote = %s, lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3)
+								 WHERE id = %s AND status IN ('offer-issued', 'prepayment-pending', 'Offer letter issued', 'Payment pending', 'acceptance-issued', 'Acceptance confirmed')",
+								$acceptance_workflow_note,
+								$user['name'],
+								$application_id
+							)
+						);
+					} else {
+						$acceptance_stage_result = $wpdb->query(
+							$wpdb->prepare(
+								"UPDATE {$this->applications_table}
+								 SET status = 'acceptance-issued', workflowNote = %s, lastUpdatedByName = %s, updatedAt = CURRENT_TIMESTAMP(3)
+								 WHERE id = %s AND status IN ('offer-issued', 'prepayment-pending', 'Offer letter issued', 'Payment pending')",
+								$acceptance_workflow_note,
+								$user['name'],
+								$application_id
+							)
+						);
+					}
 					if (false === $acceptance_stage_result) {
 						throw new Exception('Unable to update the workflow after Acceptance Letter generation.');
 					}
@@ -8465,8 +8726,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						$application_id,
 						$user,
 						'workflow',
-						'Stage moved to Acceptance issued',
-						$this->workflow_note_for_status('acceptance-issued'),
+						$is_foundation_advancement
+							? 'Foundation advancement acceptance letter issued'
+							: 'Stage moved to Acceptance issued',
+						$is_foundation_advancement
+							? 'The directly accepted Foundation advancement case completed Acceptance Letter issuance and the standard migration handoff notification was triggered.'
+							: $this->workflow_note_for_status('acceptance-issued'),
 						'Unable to record the acceptance workflow activity.'
 					);
 				}
@@ -8505,7 +8770,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 			if ($acceptance_stage_advanced) {
 				$post_commit_application['status'] = 'acceptance-issued';
-				$post_commit_application['workflowNote'] = $this->workflow_note_for_status('acceptance-issued');
+				$post_commit_application['workflowNote'] = $acceptance_workflow_note;
 				$role_payload = $this->workflow_role_notification_payload(
 					$post_commit_application,
 					$user,
@@ -10469,7 +10734,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'review' === (string) $params['mode']
 			);
 			$mode = 'review' === $params['mode'] ? 'review' : 'draft';
-			$status = 'review' === $mode ? 'Under review' : self::INITIAL_APPLICATION_STATUS;
+			$is_foundation_advancement = $this->is_foundation_advancement_programme(
+				isset($draft['programme']) ? (string) $draft['programme'] : ''
+			);
+			if ($is_foundation_advancement && !$this->can_manage_foundation_advancement($user)) {
+				throw new Exception('You do not have permission to create a Foundation advancement application. Use an Administrator, Admissions Officer, Migration Officer, or MC-ADMISSIONS-DPT account.');
+			}
+			$status = 'review' === $mode
+				? ($is_foundation_advancement ? 'acceptance-issued' : 'Under review')
+				: self::INITIAL_APPLICATION_STATUS;
 			$record_id = !empty($params['applicationId']) ? $params['applicationId'] : null;
 			$expected_updated_at = isset($params['expectedUpdatedAt']) ? trim((string) $params['expectedUpdatedAt']) : '';
 			if ($record_id && '' === $expected_updated_at) {
@@ -10494,8 +10767,22 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					if ((string) $existing_application['updatedAt'] !== (string) $expected_version) {
 						throw new Exception(self::STALE_APPLICATION_ERROR);
 					}
+					$existing_is_foundation_advancement = $this->is_foundation_advancement_programme(
+						isset($existing_application['programmeCode']) ? (string) $existing_application['programmeCode'] : ''
+					);
+					if ($existing_is_foundation_advancement !== $is_foundation_advancement) {
+						throw new Exception('The Foundation advancement application type cannot be changed after the first save. Start a new application instead.');
+					}
+					if ($is_foundation_advancement) {
+						$advancement_owner = $this->foundation_advancement_owner();
+						if ((int) ($existing_application['wordpressUserId'] ?? 0) !== (int) $advancement_owner['id']) {
+							throw new Exception('Foundation advancement applications must be owned by MC-ADMISSIONS-DPT. Start a new application so ownership can be assigned correctly.');
+						}
+					}
 					$can_continue_assigned_preparation = $this->can_continue_assigned_preparation($user, $existing_application['status']);
-					if (!$this->can_edit_application_data($user) && !$can_continue_assigned_preparation) {
+					$can_edit_foundation_advancement = $is_foundation_advancement
+						&& $this->can_manage_foundation_advancement($user);
+					if (!$this->can_edit_application_data($user) && !$can_continue_assigned_preparation && !$can_edit_foundation_advancement) {
 						throw new Exception('You do not have permission to edit application data.');
 					}
 					$owner_identity = $this->authoritative_agency_contact(
@@ -10512,8 +10799,24 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'consultantPhone' => $owner_identity['consultantPhone'],
 						)
 					);
-					$is_submitting_prepared_application = 'review' === $mode && $this->can_submit_prepared_application($user, $existing_application['status']);
-					$should_notify_review_submission = $is_submitting_prepared_application && $this->is_external_agent_user($user);
+					$is_foundation_advancement_submission =
+						'review' === $mode
+						&& $is_foundation_advancement
+						&& $this->can_manage_foundation_advancement($user)
+						&& in_array(
+							trim((string) $existing_application['status']),
+							array('profile-preparation', 'Draft', 'Application in progress'),
+							true
+						);
+					$is_submitting_prepared_application = 'review' === $mode
+						&& (
+							$is_foundation_advancement_submission
+							|| $this->can_submit_prepared_application($user, $existing_application['status'])
+						);
+					$should_notify_review_submission =
+						$is_submitting_prepared_application
+						&& !$is_foundation_advancement
+						&& $this->is_external_agent_user($user);
 					$next_is_test_data = $this->resolve_application_test_data(
 						$identity_safe_draft,
 						$user,
@@ -10610,12 +10913,18 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 
 					if ($is_submitting_prepared_application) {
+						$submission_update = array(
+							'status' => $is_foundation_advancement ? 'acceptance-issued' : 'Under review',
+							'workflowNote' => $is_foundation_advancement
+								? $this->foundation_advancement_acceptance_pending_note()
+								: $this->workflow_note_for_status('Under review'),
+						);
+						if ($is_foundation_advancement) {
+							$submission_update['reviewerDecision'] = 'academically-cleared';
+						}
 						$status_written = $wpdb->update(
 							$this->applications_table,
-							array(
-								'status' => 'Under review',
-								'workflowNote' => $this->workflow_note_for_status('Under review'),
-							),
+							$submission_update,
 							array('id' => $record_id)
 						);
 						if (false === $status_written || 0 === $status_written) {
@@ -10629,14 +10938,22 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						$record_id,
 						$user,
 						$is_submitting_prepared_application ? 'workflow' : 'application',
-						$is_submitting_prepared_application ? 'Application submitted for review' : 'Application details corrected',
+						$is_foundation_advancement_submission
+							? 'Foundation advancement ready for Acceptance Letter'
+							: ($is_submitting_prepared_application ? 'Application submitted for review' : 'Application details corrected'),
 						$is_submitting_prepared_application
-							? 'The completed application was submitted into the admissions review queue.'
+							? ($is_foundation_advancement
+								? 'The existing Foundation student was accepted by policy and routed directly to the Acceptance Letter queue without an Offer Letter or Payment Receipt.'
+								: 'The completed application was submitted into the admissions review queue.')
 							: 'Application data was updated without changing the current workflow stage.',
 						'Unable to record the application activity.'
 					);
 				} else {
-					$owner = $this->resolve_application_owner($user, $assigned_agent_id);
+					$owner = $this->resolve_application_owner(
+						$user,
+						$assigned_agent_id,
+						isset($draft['programme']) ? (string) $draft['programme'] : ''
+					);
 					$owner_identity = $this->authoritative_agency_contact(
 						isset($owner['id']) ? (int) $owner['id'] : 0,
 						array(
@@ -10659,6 +10976,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 					$record_id = wp_generate_uuid4();
 					$should_notify_review_submission = 'review' === $mode && $this->is_external_agent_user($user);
+					if ($is_foundation_advancement) {
+						$should_notify_review_submission = false;
+					}
 					$next_is_test_data = $this->resolve_application_test_data(
 						$identity_safe_draft,
 						$user,
@@ -10705,8 +11025,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							'offerTermsAcknowledged' => !empty($draft['offerTermsAcknowledged']) ? 1 : 0,
 							'gdprAcknowledged' => !empty($draft['gdprAcknowledged']) ? 1 : 0,
 							'isTestData' => $next_is_test_data ? 1 : 0,
+							'reviewerDecision' => $is_foundation_advancement && 'review' === $mode ? 'academically-cleared' : 'pending',
 							'status' => $status,
-							'workflowNote' => $this->workflow_note_for_status($status),
+							'workflowNote' => $is_foundation_advancement && 'review' === $mode
+								? $this->foundation_advancement_acceptance_pending_note()
+								: $this->workflow_note_for_status($status),
 							'lastUpdatedByName' => $user['name'],
 							'source' => self::DEFAULT_SOURCE,
 							'createdAt' => current_time('mysql', true),
@@ -10723,9 +11046,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						$record_id,
 						$user,
 						'review' === $mode ? 'workflow' : 'application',
-						'review' === $mode ? 'Application submitted for review' : 'Application created',
+						$is_foundation_advancement && 'review' === $mode
+							? 'Foundation advancement ready for Acceptance Letter'
+							: ('review' === $mode ? 'Application submitted for review' : 'Application created'),
 						'review' === $mode
-							? 'A new application was submitted into the review queue from the intake form.'
+							? ($is_foundation_advancement
+								? 'The existing Foundation student was accepted by policy and routed directly to the Acceptance Letter queue without an Offer Letter or Payment Receipt.'
+								: 'A new application was submitted into the review queue from the intake form.')
 							: 'A new admissions case was created from the desktop intake form.',
 						'Unable to record the application activity.'
 					);
@@ -10779,7 +11106,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$status = $this->normalize_status($params['status']);
 			$existing = $wpdb->get_row(
 				$wpdb->prepare(
-					"SELECT id, wordpressUserId, status, workflowNote, updatedAt FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+					"SELECT id, wordpressUserId, status, programmeCode, reviewerDecision, workflowNote, updatedAt FROM {$this->applications_table} WHERE id = %s LIMIT 1",
 					$application_id
 				),
 				ARRAY_A
@@ -10796,14 +11123,115 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('You are not allowed to update this application.');
 			}
 
-			if (!$this->can_manage_workflow_status($user, $status)) {
-				throw new Exception('You do not have permission to move this application to the requested stage.');
+			$is_foundation_advancement = $this->is_foundation_advancement_programme(
+				isset($existing['programmeCode']) ? (string) $existing['programmeCode'] : ''
+			);
+			$existing_status_key = $this->canonical_status_key((string) $existing['status']);
+			$target_status_key = $this->canonical_status_key((string) $status);
+			$can_manage_foundation_advancement = $is_foundation_advancement
+				&& $this->can_manage_foundation_advancement($user);
+
+			if (
+				$is_foundation_advancement
+				&& (
+					in_array($existing_status_key, array('profile-preparation', 'acceptance-issued'), true)
+					|| 'acceptance-issued' === $target_status_key
+				)
+				&& !$can_manage_foundation_advancement
+			) {
+				throw new Exception('You do not have permission to manage this Foundation advancement workflow.');
+			}
+			if (
+				$is_foundation_advancement
+				&& 'profile-preparation' === $existing_status_key
+				&& !in_array($target_status_key, array('profile-preparation', 'trashed'), true)
+			) {
+				throw new Exception('Submit the Foundation advancement intake form so required fields are validated and direct acceptance is audited.');
+			}
+			if (
+				$is_foundation_advancement
+				&& 'trashed' === $existing_status_key
+				&& 'pending' === strtolower(trim((string) ($existing['reviewerDecision'] ?? '')))
+				&& !in_array($target_status_key, array('profile-preparation', 'trashed'), true)
+			) {
+				throw new Exception('Restore the unsubmitted Foundation advancement draft to preparation before submitting it so required fields are validated.');
+			}
+			if (
+				$is_foundation_advancement
+				&& 'trashed' === $existing_status_key
+				&& 'rejected' === strtolower(trim((string) ($existing['reviewerDecision'] ?? '')))
+				&& 'trashed' !== $target_status_key
+			) {
+				throw new Exception('A rejected Foundation advancement case cannot be reopened through the generic workflow.');
+			}
+			if (
+				$is_foundation_advancement
+				&& 'rejected' === $existing_status_key
+				&& !in_array($target_status_key, array('rejected', 'trashed'), true)
+			) {
+				throw new Exception('A rejected Foundation advancement case cannot be reopened through the generic workflow.');
+			}
+			if (
+				$is_foundation_advancement
+				&& 'profile-preparation' === $target_status_key
+				&& 'profile-preparation' !== $existing_status_key
+				&& !(
+					'trashed' === $existing_status_key
+					&& 'pending' === strtolower(trim((string) ($existing['reviewerDecision'] ?? '')))
+				)
+			) {
+				throw new Exception('A submitted Foundation advancement case cannot return to profile preparation.');
+			}
+			if (
+				$is_foundation_advancement
+				&& 'acceptance-issued' === $target_status_key
+				&& 'acceptance-issued' !== $existing_status_key
+				&& 'academically-cleared' !== strtolower(trim((string) ($existing['reviewerDecision'] ?? '')))
+			) {
+				throw new Exception('Only an academically cleared Foundation advancement case can be restored to Acceptance.');
+			}
+			if (
+				$is_foundation_advancement
+				&& in_array($target_status_key, array('review-pending', 'offer-issued', 'prepayment-pending'), true)
+			) {
+				throw new Exception('Foundation advancement applications skip academic review, Offer Letter, and payment workflow stages.');
+			}
+
+			$can_advance_owned_foundation_case_to_migration = $can_manage_foundation_advancement
+				&& 'acceptance-issued' === $existing_status_key
+				&& 'migration-documents' === $target_status_key;
+			if (
+				$is_foundation_advancement
+				&& in_array(
+					$target_status_key,
+					array('migration-documents', 'entry-permit-processing', 'arrival-immigration', 'enrollment-complete'),
+					true
+				)
+				&& $target_status_key !== $existing_status_key
+				&& !$this->generated_admission_letter_exists($application_id, 'acceptance-letter')
+			) {
+				throw new Exception('Generate the Foundation advancement Acceptance Letter before moving the case into Migration or a later workflow stage.');
+			}
+			if (!$this->can_manage_workflow_status($user, $status) && !$can_advance_owned_foundation_case_to_migration) {
+				throw new Exception(
+					$is_foundation_advancement
+						? 'You do not have permission to manage this Foundation advancement workflow.'
+						: 'You do not have permission to move this application to the requested stage.'
+				);
 			}
 			if ('rejected' === $status) {
 				throw new Exception('Use the Rejected assessment action and enter the required standalone rejection reason.');
 			}
-			$next_note = $this->trim_to_null($params['note']);
-			$next_note = $next_note ? $next_note : $this->workflow_note_for_status($status);
+			$is_foundation_acceptance_target = $is_foundation_advancement
+				&& 'acceptance-issued' === $target_status_key;
+			if ($is_foundation_acceptance_target) {
+				$next_note = $this->generated_admission_letter_exists($application_id, 'acceptance-letter')
+					? $this->foundation_advancement_acceptance_issued_note()
+					: $this->foundation_advancement_acceptance_pending_note();
+			} else {
+				$next_note = $this->trim_to_null($params['note']);
+				$next_note = $next_note ? $next_note : $this->workflow_note_for_status($status);
+			}
 			$update_sql = "
 				UPDATE {$this->applications_table}
 				SET
@@ -10832,7 +11260,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						throw new Exception(self::STALE_APPLICATION_ERROR);
 					}
 					$activity_source = $locked_application;
-					if ('acceptance-issued' !== $this->canonical_status_key((string) $locked_application['status'])) {
+					if (
+						'acceptance-issued' !== $this->canonical_status_key((string) $locked_application['status'])
+						&& !$is_foundation_advancement
+					) {
 						$this->assert_bank_transaction_confirmation_available($application_id, true);
 					}
 
@@ -10905,22 +11336,24 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			if (!$stale_command_ignored && ($status_changed || $note_changed)) {
-				// Workflow email is a post-save side effect. Delivery or audit failure
-				// must never replay or roll back the authoritative stage transition.
-				$this->run_workflow_notification_delivery(
-					$application,
-					'workflow notification orchestration',
-					function () use ($application, $user, $status_changed, $note_changed, $status, $next_note) {
-						return $this->send_workflow_notifications(
-							$application,
-							$user,
-							$status_changed,
-							$note_changed,
-							$status,
-							$next_note
-						);
-					}
-				);
+				if (!$is_foundation_acceptance_target) {
+					// Workflow email is a post-save side effect. Delivery or audit failure
+					// must never replay or roll back the authoritative stage transition.
+					$this->run_workflow_notification_delivery(
+						$application,
+						'workflow notification orchestration',
+						function () use ($application, $user, $status_changed, $note_changed, $status, $next_note) {
+							return $this->send_workflow_notifications(
+								$application,
+								$user,
+								$status_changed,
+								$note_changed,
+								$status,
+								$next_note
+							);
+						}
+					);
+				}
 			}
 
 			return array(
@@ -11006,7 +11439,35 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Use the Rejected assessment action and enter the required standalone rejection reason.');
 			}
 			$existing_status = $this->canonical_status_key((string) $existing['status']);
+			$is_foundation_advancement = $this->is_foundation_advancement_programme(
+				isset($existing['programmeCode']) ? (string) $existing['programmeCode'] : ''
+			);
 			$normalized = $this->normalize_operations_draft($draft, $existing_status);
+			if ($is_foundation_advancement) {
+				$is_dedicated_rejection = !empty($params['dedicatedReviewRejection'])
+					&& 'rejected' === $assessment_message_kind
+					&& 'academically-cleared' === (string) $existing['reviewerDecision']
+					&& !in_array($existing_status, array('rejected', 'trashed'), true);
+				if ($is_dedicated_rejection) {
+					$required_reviewer_decision = 'rejected';
+				} elseif ('profile-preparation' === $existing_status) {
+					$required_reviewer_decision = 'pending';
+				} elseif ('rejected' === $existing_status) {
+					$required_reviewer_decision = 'rejected';
+				} elseif ('trashed' === $existing_status) {
+					$required_reviewer_decision = (string) $existing['reviewerDecision'];
+				} else {
+					$required_reviewer_decision = 'academically-cleared';
+				}
+
+				if (
+					array_key_exists('reviewerDecision', $normalized)
+					&& $required_reviewer_decision !== (string) $normalized['reviewerDecision']
+				) {
+					throw new Exception('Foundation advancement review state is managed by its direct-acceptance workflow and cannot be changed here.');
+				}
+				$normalized['reviewerDecision'] = $required_reviewer_decision;
+			}
 			$requires_bank_confirmation = array_key_exists('paymentStatus', $normalized)
 				&& in_array((string) $normalized['paymentStatus'], array('receipt-received', 'cleared'), true)
 				&& !in_array((string) $existing['paymentStatus'], array('receipt-received', 'cleared'), true);
