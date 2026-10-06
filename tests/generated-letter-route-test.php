@@ -30,8 +30,12 @@ $required_markers = array(
 	"WHERE id = %s AND status IN ('offer-issued', 'prepayment-pending', 'Offer letter issued', 'Payment pending')",
 	"private function send_generated_admission_letter_email",
 	"private function generated_admission_letter_internal_copy_recipients",
+	"generated_admission_letter_internal_copy_recipients(\$template_id, \$application)",
+	"'president@mesoyios.ac.cy'",
+	"'accounts@mesoyios.ac.cy'",
 	"'pambos.ch@mesoyios.ac.cy'",
 	"'marina.c@mesoyios.ac.cy'",
+	"'migration@mesoyios.ac.cy'",
 	"\$agency_email_is_student = is_email(\$student_email)",
 	"strtolower(\$student_email) === strtolower(\$agency_email)",
 	"The agency email matches the student email, so the agency delivery was skipped.",
@@ -74,6 +78,57 @@ $internal_recipient_end = strpos($source, 'private function can_generate_admissi
 $internal_recipient_source = false !== $internal_recipient_start && false !== $internal_recipient_end
 	? substr($source, $internal_recipient_start, $internal_recipient_end - $internal_recipient_start)
 	: '';
+$foundation_advancement_branch_end = strpos(
+	$internal_recipient_source,
+	"if (!in_array((string) \$template_id, array('offer-letter', 'acceptance-letter', 'payment-receipt'), true))"
+);
+$foundation_advancement_branch = false !== $foundation_advancement_branch_end
+	? substr($internal_recipient_source, 0, $foundation_advancement_branch_end)
+	: '';
+$ordinary_internal_recipient_source = false !== $foundation_advancement_branch_end
+	? substr($internal_recipient_source, $foundation_advancement_branch_end)
+	: '';
+
+foreach (
+	array(
+		"'acceptance-letter' === (string) \$template_id",
+		'is_array($application)',
+		"\$this->is_foundation_advancement_programme(\$application['programmeCode'] ?? '')",
+	) as $advancement_condition_marker
+) {
+	if (false === strpos($foundation_advancement_branch, $advancement_condition_marker)) {
+		fwrite(STDERR, "Missing Foundation Advancement generated-letter condition: {$advancement_condition_marker}.\n");
+		exit(1);
+	}
+}
+
+$foundation_advancement_recipients = array(
+	'president@mesoyios.ac.cy',
+	'accounts@mesoyios.ac.cy',
+	'pambos.ch@mesoyios.ac.cy',
+	'marina.c@mesoyios.ac.cy',
+	'migration@mesoyios.ac.cy',
+);
+foreach ($foundation_advancement_recipients as $recipient) {
+	if (1 !== substr_count($foundation_advancement_branch, "'{$recipient}'")) {
+		fwrite(STDERR, "Foundation Advancement Acceptance Letters must copy exactly one {$recipient} recipient.\n");
+		exit(1);
+	}
+}
+
+foreach (array('president@mesoyios.ac.cy', 'accounts@mesoyios.ac.cy', 'migration@mesoyios.ac.cy') as $advancement_only_recipient) {
+	if (false !== strpos($ordinary_internal_recipient_source, "'{$advancement_only_recipient}'")) {
+		fwrite(STDERR, "Ordinary generated letters must not copy Foundation Advancement recipient {$advancement_only_recipient}.\n");
+		exit(1);
+	}
+}
+foreach (array('pambos.ch@mesoyios.ac.cy', 'marina.c@mesoyios.ac.cy') as $ordinary_recipient) {
+	if (1 !== substr_count($ordinary_internal_recipient_source, "'{$ordinary_recipient}'")) {
+		fwrite(STDERR, "Ordinary copied generated letters must retain exactly one {$ordinary_recipient} recipient.\n");
+		exit(1);
+	}
+}
+
 foreach (array('offer-letter', 'acceptance-letter', 'payment-receipt') as $copied_template) {
 	if (false === strpos($internal_recipient_source, "'{$copied_template}'")) {
 		fwrite(STDERR, "Missing required internal-copy template: {$copied_template}.\n");
@@ -85,6 +140,28 @@ foreach (array('letter-of-assurance', 'late-arrival-affirmation-letter') as $unc
 		fwrite(STDERR, "Unexpected internal-copy template: {$uncopied_template}.\n");
 		exit(1);
 	}
+}
+
+$advancement_programme_start = strpos($source, 'private function is_foundation_advancement_programme');
+$advancement_programme_end = strpos($source, 'private function is_foundation_advancement_owner_user', $advancement_programme_start);
+$advancement_programme_source = false !== $advancement_programme_start && false !== $advancement_programme_end
+	? substr($source, $advancement_programme_start, $advancement_programme_end - $advancement_programme_start)
+	: '';
+foreach (array('FOUNDATION_ADVANCEMENT_HOTEL_PROGRAMME', 'FOUNDATION_ADVANCEMENT_BUSINESS_PROGRAMME') as $programme_constant) {
+	if (false === strpos($advancement_programme_source, $programme_constant)) {
+		fwrite(STDERR, "Foundation Advancement recipient routing must cover {$programme_constant}.\n");
+		exit(1);
+	}
+}
+
+$recipient_deduplication_start = strpos($source, 'private function add_email_recipient');
+$recipient_deduplication_end = strpos($source, 'private function has_application_test_data_marker', $recipient_deduplication_start);
+$recipient_deduplication_source = false !== $recipient_deduplication_start && false !== $recipient_deduplication_end
+	? substr($source, $recipient_deduplication_start, $recipient_deduplication_end - $recipient_deduplication_start)
+	: '';
+if (false === strpos($recipient_deduplication_source, '$key = strtolower($email)')) {
+	fwrite(STDERR, "Generated-letter recipients must remain case-insensitively de-duplicated.\n");
+	exit(1);
 }
 
 echo "Generated letter route contract tests passed.\n";

@@ -733,6 +733,114 @@ foreach ($generated_template_matrix as $template_id => $template_definition) {
 	}
 }
 
+// Foundation Advancement Acceptance Letters use the authoritative canonical
+// programme code to add their dedicated five-address internal handoff. Run the
+// same sender twice for each programme so a regenerated/reissued letter cannot
+// silently fall back to the ordinary acceptance policy.
+$foundation_advancement_programmes = array(
+	'foundation-advancement-hotel-casino-resort-management',
+	'foundation-advancement-business-administration',
+);
+$foundation_advancement_expected_addresses = array(
+	'actor@example.test',
+	'president@mesoyios.ac.cy',
+	'accounts@mesoyios.ac.cy',
+	'pambos.ch@mesoyios.ac.cy',
+	'marina.c@mesoyios.ac.cy',
+	'migration@mesoyios.ac.cy',
+);
+foreach ($foundation_advancement_programmes as $programme_code) {
+	foreach (array('initial issuance', 'reissue') as $issuance_kind) {
+		alert_reset_side_effects();
+		$advancement_acceptance = $send_generated_letter->invoke(
+			$plugin,
+			array_merge($application, array('programmeCode' => $programme_code)),
+			$internal_user,
+			'acceptance-letter',
+			'Acceptance letter',
+			'foundation-advancement-acceptance.pdf',
+			base64_encode('%PDF-offline-generated-letter')
+		);
+		alert_assert_same(
+			$foundation_advancement_expected_addresses,
+			alert_mail_addresses(),
+			$programme_code . ' ' . $issuance_kind . ' must retain the agency and add exactly the five Foundation Advancement recipients.'
+		);
+		alert_assert_same(
+			6,
+			count($advancement_acceptance['sent']),
+			$programme_code . ' ' . $issuance_kind . ' must report all six distinct deliveries.'
+		);
+	}
+}
+
+// Ordinary Acceptance Letters must retain only the established Pambos and
+// Marina copies; the three Foundation Advancement-only addresses cannot leak.
+alert_reset_side_effects();
+$ordinary_acceptance = $send_generated_letter->invoke(
+	$plugin,
+	array_merge($application, array('programmeCode' => 'business-administration')),
+	$internal_user,
+	'acceptance-letter',
+	'Acceptance letter',
+	'ordinary-acceptance.pdf',
+	base64_encode('%PDF-offline-generated-letter')
+);
+alert_assert_same(
+	array('actor@example.test', 'pambos.ch@mesoyios.ac.cy', 'marina.c@mesoyios.ac.cy'),
+	alert_mail_addresses(),
+	'An ordinary Acceptance Letter must retain only the agency, Pambos, and Marina recipient policy.'
+);
+foreach (array('president@mesoyios.ac.cy', 'accounts@mesoyios.ac.cy', 'migration@mesoyios.ac.cy') as $advancement_only_address) {
+	alert_assert_same(
+		false,
+		in_array($advancement_only_address, alert_mail_addresses(), true),
+		'An ordinary Acceptance Letter must exclude ' . $advancement_only_address . '.'
+	);
+}
+alert_assert_same(3, count($ordinary_acceptance['sent']), 'An ordinary Acceptance Letter must report exactly three distinct deliveries.');
+
+// De-duplicate an uppercase agency collision with the direct President copy,
+// and independently remove an uppercase student collision with Accounts.
+$advancement_original_owner_email = $GLOBALS['mc_alert_users'][1]->user_email;
+$GLOBALS['mc_alert_users'][1]->user_email = 'PRESIDENT@MESOYIOS.AC.CY';
+alert_reset_side_effects();
+$advancement_collisions = $send_generated_letter->invoke(
+	$plugin,
+	array_merge(
+		$application,
+		array(
+			'programmeCode' => 'foundation-advancement-business-administration',
+			'wordpressEmail' => 'stale@example.test',
+			'consultantEmail' => 'stale@example.test',
+			'email' => 'ACCOUNTS@MESOYIOS.AC.CY',
+		)
+	),
+	$internal_user,
+	'acceptance-letter',
+	'Acceptance letter',
+	'foundation-advancement-collisions.pdf',
+	base64_encode('%PDF-offline-generated-letter')
+);
+alert_assert_same(
+	array(
+		'president@mesoyios.ac.cy',
+		'pambos.ch@mesoyios.ac.cy',
+		'marina.c@mesoyios.ac.cy',
+		'migration@mesoyios.ac.cy',
+	),
+	alert_mail_addresses(),
+	'Foundation Advancement recipients must de-duplicate agency collisions and exclude student collisions case-insensitively.'
+);
+alert_assert_same(
+	1,
+	count(array_keys(alert_mail_addresses(), 'president@mesoyios.ac.cy', true)),
+	'The agency and direct President copy must collapse to one delivery.'
+);
+alert_assert_same(false, in_array('accounts@mesoyios.ac.cy', alert_mail_addresses(), true), 'A student matching Accounts must not receive the generated letter.');
+alert_assert_same(4, count($advancement_collisions['sent']), 'Only the four distinct non-student advancement addresses must be reported as sent.');
+$GLOBALS['mc_alert_users'][1]->user_email = $advancement_original_owner_email;
+
 // Recipient de-duplication is case-insensitive. When the owning agency mailbox
 // is also Pambos, that address receives one document and Marina receives one.
 $original_owner_email = $GLOBALS['mc_alert_users'][1]->user_email;
@@ -908,6 +1016,6 @@ alert_assert_contains('catch (Throwable $error)', $workflow_delivery_guard_sourc
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
 alert_assert_not_contains('should_send_draft_creation_alert', $plugin_source, 'The obsolete first-draft email gate must be absent from the plugin.');
 alert_assert_not_contains("'new-application-created'", $plugin_source, 'The obsolete first-draft email event must be absent from the plugin.');
-alert_assert_contains('Version: 0.2.70', $plugin_source, 'The plugin header must advertise version 0.2.70.');
+alert_assert_contains('Version: 0.2.71', $plugin_source, 'The plugin header must advertise version 0.2.71.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;
