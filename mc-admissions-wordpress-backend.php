@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.70
+ * Version: 0.2.71
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -7944,7 +7944,41 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 		}
 
-		private function generated_admission_letter_internal_copy_recipients($template_id) {
+		private function generated_admission_letter_internal_copy_recipients($template_id, $application = null) {
+			if (
+				'acceptance-letter' === (string) $template_id
+				&& is_array($application)
+				&& $this->is_foundation_advancement_programme($application['programmeCode'] ?? '')
+			) {
+				return array(
+					array(
+						'email' => 'president@mesoyios.ac.cy',
+						'name' => 'President',
+						'role' => 'internal-document-copy',
+					),
+					array(
+						'email' => 'accounts@mesoyios.ac.cy',
+						'name' => 'Accounts',
+						'role' => 'internal-document-copy',
+					),
+					array(
+						'email' => 'pambos.ch@mesoyios.ac.cy',
+						'name' => 'Pambos',
+						'role' => 'internal-document-copy',
+					),
+					array(
+						'email' => 'marina.c@mesoyios.ac.cy',
+						'name' => 'Marina',
+						'role' => 'internal-document-copy',
+					),
+					array(
+						'email' => 'migration@mesoyios.ac.cy',
+						'name' => 'Migration',
+						'role' => 'internal-document-copy',
+					),
+				);
+			}
+
 			if (!in_array((string) $template_id, array('offer-letter', 'acceptance-letter', 'payment-receipt'), true)) {
 				return array();
 			}
@@ -8907,7 +8941,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if (is_email($agency_email) && !$agency_email_is_student) {
 				$to[] = array('email' => $agency_email, 'name' => $application['consultantName'] ?? $application['agencyName'] ?? null);
 			}
-			$internal_copy_recipients = $this->generated_admission_letter_internal_copy_recipients($template_id);
+			$internal_copy_recipients = $this->generated_admission_letter_internal_copy_recipients($template_id, $application);
 			foreach ($internal_copy_recipients as $internal_recipient) {
 				$to[] = $internal_recipient;
 			}
