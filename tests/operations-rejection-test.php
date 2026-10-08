@@ -40,6 +40,8 @@ final class MC_Rejection_Test_Wpdb {
 	public $application = array();
 	public $activities = array();
 	public $communications = array();
+	public $profile = array();
+	public $documents = array();
 	public $events = array();
 	public $force_stale = false;
 	public $ignore_status_update = false;
@@ -91,6 +93,9 @@ final class MC_Rejection_Test_Wpdb {
 
 			return $this->application;
 		}
+		if (false !== strpos($query, 'FROM mc_agency_profiles')) {
+			return $this->profile;
+		}
 
 		return null;
 	}
@@ -105,6 +110,9 @@ final class MC_Rejection_Test_Wpdb {
 		}
 		if (false !== strpos($query, 'FROM mc_admission_communications')) {
 			return array_reverse($this->communications);
+		}
+		if (false !== strpos($query, 'FROM mc_admission_documents')) {
+			return array_values($this->documents);
 		}
 
 		return array();
@@ -247,6 +255,29 @@ final class MC_Rejection_Test_Wpdb {
 
 	public function reset($application) {
 		$this->application = $application;
+		$this->profile = array(
+			'id' => 'profile-42',
+			'wordpressUserId' => 42,
+			'wordpressUsername' => 'origin-agent',
+			'wordpressEmail' => 'owner@example.invalid',
+			'agencyName' => 'Offline Agency',
+			'consultantName' => 'Origin Consultant',
+			'consultantEmail' => 'owner@example.invalid',
+			'consultantPhone' => '+000000001',
+			'agreementOnFile' => 1,
+			'authorizationOnFile' => 1,
+		);
+		$this->documents = array();
+		foreach (array('passport', 'secondaryMarksheet', 'higherSecondaryMarksheet', 'englishCertificate', 'studentSignature', 'consultantSignature') as $type) {
+			$this->documents[$type] = array(
+				'id' => 'document-' . $type,
+				'type' => $type,
+				'label' => $type,
+				'isReady' => 1,
+				'uploadedUrl' => '/documents/' . $type,
+				'storageItemId' => 'item-' . $type,
+			);
+		}
 		$this->activities = array();
 		$this->communications = array();
 		$this->events = array();
@@ -405,7 +436,7 @@ function rejection_application(array $overrides = array()) {
 			'city' => 'Offline city',
 			'postalCode' => '0000',
 			'country' => 'Offline country',
-			'gender' => 'Other',
+			'gender' => 'male',
 			'programmeCode' => 'business-administration',
 			'programmeLabel' => 'Business Administration',
 			'semester' => 'fall',
@@ -414,7 +445,7 @@ function rejection_application(array $overrides = array()) {
 			'agencyName' => 'Offline Agency',
 			'consultantName' => 'Origin Consultant',
 			'consultantEmail' => 'consultant@example.invalid',
-			'consultantPhone' => null,
+			'consultantPhone' => '+000000001',
 			'submissionDate' => '2026-07-31',
 			'tuitionAcknowledged' => 1,
 			'offerTermsAcknowledged' => 1,
@@ -653,7 +684,15 @@ $GLOBALS['wpdb']->reset(
 	)
 );
 $GLOBALS['mc_rejection_mail_calls'] = array();
+$GLOBALS['mc_rejection_users'][42] = (object) array(
+	'ID' => 42,
+	'user_login' => 'origin-agent',
+	'display_name' => 'Offline Agency',
+	'user_email' => 'owner@example.invalid',
+	'roles' => array('mc_agent'),
+);
 $reopened = invoke_rejection_operations($operations, array('reviewerDecision' => 'hold'));
+unset($GLOBALS['mc_rejection_users'][42]);
 rejection_assert_same('review-pending', $GLOBALS['wpdb']->application['status'], 'A non-rejected explicit decision must reopen the case.');
 rejection_assert_same('review-pending', $reopened['stageKey'], 'The authoritative response must report the reopened stage.');
 rejection_assert_same(
@@ -690,7 +729,15 @@ Email delivery: sent to 1 recipient(s).",
 	'createdAt' => '2026-07-30 10:00:00',
 );
 $GLOBALS['mc_rejection_mail_calls'] = array();
+$GLOBALS['mc_rejection_users'][42] = (object) array(
+	'ID' => 42,
+	'user_login' => 'origin-agent',
+	'display_name' => 'Offline Agency',
+	'user_email' => 'owner@example.invalid',
+	'roles' => array('mc_agent'),
+);
 invoke_rejection_operations($operations, array('reviewerDecision' => 'hold'));
+unset($GLOBALS['mc_rejection_users'][42]);
 invoke_rejection_operations(
 	$operations,
 	array('reviewerDecision' => 'rejected'),

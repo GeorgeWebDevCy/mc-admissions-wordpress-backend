@@ -471,6 +471,7 @@ function wp_generate_uuid4() {
 }
 function current_time($type, $gmt = false) { return '2026-08-20 10:00:30'; }
 function wp_get_current_user() { return $GLOBALS['mc_finance_current_user']; }
+function get_user_meta($user_id, $key = '', $single = false) { return ''; }
 function get_avatar_url($user_id, $args = array()) { return ''; }
 function get_userdata($user_id) {
 	if (42 !== (int) $user_id) {
@@ -1058,7 +1059,7 @@ finance_assert_same(true, $GLOBALS['wpdb']->refund_payment_reference_column, 'Sc
 finance_assert_same('0.2.61', $GLOBALS['mc_finance_options']['mc_admissions_finance_workspace_schema_version'], 'Schema version must be recorded last.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-finance_assert_contains('Version: 0.2.72', $plugin_source, 'Plugin header must advertise 0.2.72.');
+finance_assert_contains('Version: 0.2.73', $plugin_source, 'Plugin header must advertise 0.2.73.');
 finance_assert_contains('ORDER BY commission.updatedAt DESC, commission.createdAt DESC, commission.id DESC', $plugin_source, 'Commission latest reads need deterministic ordering.');
 finance_assert_contains('ORDER BY refund.updatedAt DESC, refund.createdAt DESC, refund.id DESC', $plugin_source, 'Refund latest reads need deterministic ordering.');
 

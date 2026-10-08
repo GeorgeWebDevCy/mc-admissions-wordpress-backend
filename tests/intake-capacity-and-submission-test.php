@@ -380,6 +380,16 @@ final class MC_Intake_Test_Wpdb {
 			return 1;
 		}
 		if (false !== strpos($query, 'UPDATE mc_admission_applications') && false !== strpos($query, 'status = %s')) {
+			if (false !== strpos($query, 'reviewerDecision = %s')) {
+				$expected = isset($args[count($args) - 1]) ? (string) $args[count($args) - 1] : null;
+				if (null !== $expected && $expected !== (string) $this->application['updatedAt']) return 0;
+				$this->version_tick++;
+				$this->application['status'] = (string) ($args[0] ?? $this->application['status']);
+				$this->application['reviewerDecision'] = (string) ($args[1] ?? $this->application['reviewerDecision']);
+				$this->application['lastUpdatedByName'] = (string) ($args[count($args) - 3] ?? '');
+				$this->application['updatedAt'] = sprintf('2026-08-20 10:00:%02d.000', $this->version_tick);
+				return 1;
+			}
 			$expected = isset($args[4]) ? (string) $args[4] : null;
 			if (null !== $expected && $expected !== (string) $this->application['updatedAt']) return 0;
 			$this->version_tick++;
@@ -483,7 +493,7 @@ function intake_application(array $overrides = array()) {
 			'wordpressUsername' => 'agency-owner', 'wordpressEmail' => 'agency@example.com',
 			'fullName' => 'Applicant', 'passportNumber' => 'OFFLINE', 'email' => 'student@example.com',
 			'phone' => '+357000000', 'birthday' => '01/01/2000', 'address' => 'Offline address',
-			'city' => 'Nicosia', 'postalCode' => '1000', 'country' => 'Cyprus', 'gender' => 'Other',
+			'city' => 'Nicosia', 'postalCode' => '1000', 'country' => 'Cyprus', 'gender' => 'male',
 			'semester' => 'fall', 'year' => '2026', 'applicationRoute' => 'standard',
 			'programmeCode' => 'business-administration',
 			'programmeLabel' => "Bachelor's degree in Business Administration",
@@ -526,7 +536,7 @@ function intake_draft(array $overrides = array()) {
 		array(
 			'fullName' => 'Applicant', 'passportNumber' => 'OFFLINE', 'email' => 'student@example.com',
 			'phone' => '+357000000', 'birthday' => '01/01/2000', 'address' => 'Offline address',
-			'city' => 'Nicosia', 'postalCode' => '1000', 'country' => 'Cyprus', 'gender' => 'Other',
+			'city' => 'Nicosia', 'postalCode' => '1000', 'country' => 'Cyprus', 'gender' => 'male',
 			'programme' => 'business-administration', 'semester' => 'fall', 'year' => '2026',
 			'submissionDate' => '20/08/2026', 'tuitionAcknowledged' => true,
 			'offerTermsAcknowledged' => true, 'gdprAcknowledged' => true,
@@ -608,6 +618,7 @@ function absint($value) { return abs((int) $value); }
 function wp_json_encode($value) { return json_encode($value); }
 function wp_get_current_user() { return $GLOBALS['mc_intake_current_user']; }
 function get_avatar_url($user_id, $args = array()) { return ''; }
+function get_user_meta($user_id, $key = '', $single = false) { return ''; }
 function get_userdata($user_id) {
 	if (42 === (int) $user_id) {
 		return (object) array(
@@ -697,6 +708,7 @@ $build_annual_seat_summary = intake_private_method($reflection, 'build_annual_ba
 $update_operations = intake_private_method($reflection, 'update_admission_application_operations');
 $update_workflow = intake_private_method($reflection, 'update_admission_application_workflow');
 $clear_document = intake_private_method($reflection, 'clear_document_record_and_touch_application');
+$required_document_removable = intake_private_method($reflection, 'assert_required_intake_document_removable');
 
 // Canonical intake contract remains compatible with old HTML date values.
 $normalized = $normalize_draft->invoke($plugin, intake_draft(array(
@@ -713,6 +725,18 @@ intake_assert_same('postgraduate', $normalized['applicationRoute'], 'MBA must de
 intake_assert_throws_contains('valid Programme', static function () use ($normalize_draft, $plugin) {
 	$normalize_draft->invoke($plugin, intake_draft(array('programme' => 'invented-programme')), true);
 }, 'Unknown programmes must be rejected by the command layer.');
+intake_assert_throws_contains('valid Semester intake', static function () use ($normalize_draft, $plugin) {
+	$normalize_draft->invoke($plugin, intake_draft(array('semester' => 'winter')), true);
+}, 'Unknown semester choices must be rejected by the command layer.');
+intake_assert_throws_contains('four-digit Intake year', static function () use ($normalize_draft, $plugin) {
+	$normalize_draft->invoke($plugin, intake_draft(array('year' => '26')), true);
+}, 'Invalid intake years must be rejected by the command layer.');
+intake_assert_throws_contains('valid Gender', static function () use ($normalize_draft, $plugin) {
+	$normalize_draft->invoke($plugin, intake_draft(array('gender' => 'invented')), true);
+}, 'Unknown gender choices must be rejected by the command layer.');
+intake_assert_throws_contains('valid calendar date', static function () use ($normalize_draft, $plugin) {
+	$normalize_draft->invoke($plugin, intake_draft(array('birthday' => '31/02/2000')), true);
+}, 'Impossible birth dates must be rejected by the command layer.');
 intake_assert_throws_contains('dd/mm/yyyy', static function () use ($normalize_draft, $plugin) {
 	$normalize_draft->invoke($plugin, intake_draft(array('submissionDate' => '08/20/2026')), true);
 }, 'Ambiguous US submission dates must be rejected.');
@@ -746,6 +770,7 @@ intake_assert_same(409, $stale_save->get_status(), 'A stale existing-application
 intake_assert_same(false, false !== strpos(implode("\n", $GLOBALS['wpdb']->events), 'wordpressUsername = %s'), 'A stale save must not execute the application data UPDATE.');
 
 $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+intake_seed_core_documents();
 $valid_save = $plugin->rest_save_application(new WP_REST_Request(array(), array_merge(
 	$save_body,
 	array('expectedUpdatedAt' => '2026-08-20T10:00:00.000Z')
@@ -777,6 +802,15 @@ $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 // Authoritative field, declaration, owner-profile, and attachment validation.
 intake_seed_core_documents();
 $assert_submission->invoke($plugin, intake_draft(), intake_profile_identity(), 42, 'application-1');
+intake_assert_throws_contains('valid applicant email', static function () use ($assert_submission, $plugin) {
+	$assert_submission->invoke(
+		$plugin,
+		intake_draft(array('email' => 'not-an-email')),
+		intake_profile_identity(),
+		42,
+		'application-1'
+	);
+}, 'Ordinary review submission must reject an invalid applicant email address.');
 $required_submission_fields = array(
 	'fullName' => 'Full name',
 	'passportNumber' => 'Passport number',
@@ -820,6 +854,57 @@ foreach ($required_submission_declarations as $field => $label) {
 		);
 	}, 'Ordinary review submission must require the ' . $label . ' declaration.');
 }
+
+// Exercise the public REST command, not only the private invariant. JSON
+// arrays/objects must never become the non-empty string "Array", and declaration
+// lookalikes must never pass PHP truthiness checks.
+$forged_text_index = 0;
+foreach ($required_submission_fields as $field => $label) {
+	$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+	$GLOBALS['wpdb']->application = intake_application(array('status' => 'profile-preparation'));
+	intake_seed_core_documents();
+	$forged_value = 0 === $forged_text_index++ % 2
+		? array('forged')
+		: (object) array('forged' => true);
+	$forged_text_response = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'mode' => 'review',
+		'draft' => intake_draft(array($field => $forged_value)),
+	)));
+	intake_assert_same(400, $forged_text_response->get_status(), 'REST review submission must reject a non-text ' . $label . ' value.');
+	intake_assert_true(false !== strpos((string) $forged_text_response->get_data()['error'], 'must be text'), 'REST type rejection must explain that ' . $label . ' requires text.');
+}
+foreach ($required_submission_declarations as $field => $label) {
+	foreach (array('false', 0, 1) as $forged_declaration) {
+		$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+		$GLOBALS['wpdb']->application = intake_application(array('status' => 'profile-preparation'));
+		intake_seed_core_documents();
+		$forged_declaration_response = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+			'applicationId' => 'application-1',
+			'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+			'mode' => 'review',
+			'draft' => intake_draft(array($field => $forged_declaration)),
+		)));
+		intake_assert_same(400, $forged_declaration_response->get_status(), 'REST review submission must reject a non-boolean ' . $label . ' value.');
+		intake_assert_true(false !== strpos((string) $forged_declaration_response->get_data()['error'], $label), 'REST declaration rejection must identify ' . $label . '.');
+	}
+}
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'profile-preparation',
+	'tuitionAcknowledged' => 0,
+));
+$forged_draft_declaration = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'mode' => 'draft',
+	'draft' => intake_draft(array('tuitionAcknowledged' => 'false')),
+)));
+intake_assert_same(400, $forged_draft_declaration->get_status(), 'A draft must not persist a truthy string as an accepted declaration for a later workflow bypass.');
+intake_assert_same(0, $GLOBALS['wpdb']->application['tuitionAcknowledged'], 'Rejected declaration lookalikes must not mutate stored acknowledgement state.');
+
 $required_owner_profile_fields = array('agencyName', 'consultantName', 'consultantEmail', 'consultantPhone');
 foreach ($required_owner_profile_fields as $profile_field) {
 	intake_assert_throws_contains('Agency Profile', static function () use ($assert_submission, $plugin, $profile_field) {
@@ -925,6 +1010,7 @@ $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 $GLOBALS['wpdb']->application = intake_application(array(
 	'status' => 'Application in progress',
 	'reviewerDecision' => 'pending',
+	'isTestData' => 0,
 ));
 $ordinary_incomplete_draft = $plugin->rest_save_application(new WP_REST_Request(array(), array(
 	'applicationId' => 'application-1',
@@ -934,6 +1020,163 @@ $ordinary_incomplete_draft = $plugin->rest_save_application(new WP_REST_Request(
 )));
 intake_assert_same(200, $ordinary_incomplete_draft->get_status(), 'Ordinary agents must still be able to save an incomplete resumable draft.');
 intake_assert_same('Application in progress', $GLOBALS['wpdb']->application['status'], 'Saving an incomplete ordinary draft must not submit it for review.');
+intake_assert_same(0, $GLOBALS['wpdb']->application['isTestData'], 'A normal resumable draft must remain a non-test case without triggering submission notification delivery.');
+
+// The generic workflow route used to bypass the final intake validator. Any
+// active stage transition out of preparation must now enforce the exact same
+// authoritative fields and stored-document pack as the Submit command.
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'Application in progress',
+	'reviewerDecision' => 'pending',
+	'address' => '',
+));
+intake_seed_core_documents();
+intake_assert_throws_contains('Home address', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'review-pending',
+		'note' => 'Attempted generic workflow submission.',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'The workflow endpoint must not bypass a missing Home address.');
+intake_assert_same('Application in progress', $GLOBALS['wpdb']->application['status'], 'A rejected workflow bypass must leave the draft in preparation.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'Application in progress',
+	'reviewerDecision' => 'pending',
+));
+$GLOBALS['wpdb']->documents = array();
+intake_assert_throws_contains('Copy of passport', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'offer-issued',
+		'note' => 'Attempted jump beyond review.',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'The workflow endpoint must not jump an upload-incomplete draft to any later active stage.');
+intake_assert_same('Application in progress', $GLOBALS['wpdb']->application['status'], 'A missing-document workflow bypass must leave the draft in preparation.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'review-pending',
+	'reviewerDecision' => 'academically-cleared',
+	'address' => '',
+));
+intake_seed_core_documents();
+intake_assert_throws_contains('Home address', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'offer-issued',
+		'note' => 'Attempted progression of a historically incomplete active case.',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'Every active-to-active workflow progression must revalidate historically incomplete application data.');
+intake_assert_same('review-pending', $GLOBALS['wpdb']->application['status'], 'An incomplete active case must not progress to the next active stage.');
+
+foreach (array('academically-cleared', 'conditional-offer') as $forged_approval_decision) {
+	$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+	$GLOBALS['wpdb']->application = intake_application(array(
+		'status' => 'review-pending',
+		'reviewerDecision' => 'pending',
+		'address' => '',
+	));
+	intake_seed_core_documents();
+	intake_assert_throws_contains('Home address', static function () use ($update_operations, $plugin, $forged_approval_decision) {
+		$update_operations->invoke($plugin, array(
+			'applicationId' => 'application-1',
+			'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+			'draft' => array('reviewerDecision' => $forged_approval_decision),
+			'user' => intake_user(array('administrator')),
+		));
+	}, 'Admissions must not ' . $forged_approval_decision . ' a historically incomplete case.');
+	intake_assert_same('pending', $GLOBALS['wpdb']->application['reviewerDecision'], 'A blocked approval decision must not mutate review state.');
+}
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'review-pending',
+	'reviewerDecision' => 'pending',
+	'address' => '',
+));
+$incomplete_hold = $update_operations->invoke($plugin, array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'draft' => array('reviewerDecision' => 'hold'),
+	'user' => intake_user(array('administrator')),
+));
+intake_assert_same('hold', $GLOBALS['wpdb']->application['reviewerDecision'], 'Staff must still be able to place a historically incomplete case on Pending so corrections can be requested.');
+intake_assert_same('review-pending', $incomplete_hold['stageKey'], 'Pending/hold must not move an incomplete case into another active stage.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'rejected',
+	'reviewerDecision' => 'rejected',
+	'address' => '',
+));
+intake_seed_core_documents();
+intake_assert_throws_contains('Home address', static function () use ($update_workflow, $plugin) {
+	$update_workflow->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'status' => 'review-pending',
+		'note' => 'Attempted workflow reopen.',
+		'user' => intake_user(array('administrator')),
+	));
+}, 'The generic workflow endpoint must validate a rejected case before reopening it into an active stage.');
+intake_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'A rejected incomplete case must remain rejected after a blocked workflow reopen.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'rejected',
+	'reviewerDecision' => 'rejected',
+	'address' => '',
+));
+intake_seed_core_documents();
+intake_assert_throws_contains('Home address', static function () use ($update_operations, $plugin) {
+	$update_operations->invoke($plugin, array(
+		'applicationId' => 'application-1',
+		'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+		'draft' => array('reviewerDecision' => 'pending'),
+		'user' => intake_user(array('administrator')),
+	));
+}, 'The operations endpoint must validate a rejected case before reopening it into review.');
+intake_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'A rejected incomplete case must remain rejected after a blocked operations reopen.');
+
+// Submitted cases may still be corrected, but a draft-mode save must not make
+// an active standard application incomplete after it passed submission.
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array('status' => 'review-pending'));
+intake_seed_core_documents();
+$submitted_blank_field_save = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'mode' => 'draft',
+	'draft' => intake_draft(array('address' => '')),
+)));
+intake_assert_same(400, $submitted_blank_field_save->get_status(), 'Draft mode must not blank a required field on an active submitted case.');
+intake_assert_true(false !== strpos((string) $submitted_blank_field_save->get_data()['error'], 'Home address'), 'The rejected submitted-case edit must identify the required field.');
+intake_assert_same('Offline address', $GLOBALS['wpdb']->application['address'], 'A rejected submitted-case edit must not persist partial data.');
+
+// Once submitted, required intake evidence is immutable by deletion. Users can
+// still replace the file through the upload path, which preserves completeness.
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array('status' => 'review-pending'));
+intake_seed_core_documents();
+intake_assert_throws_contains('cannot be removed', static function () use ($clear_document, $plugin) {
+	$clear_document->invoke(
+		$plugin,
+		'application-1',
+		intake_document('passport'),
+		'2026-08-20 10:00:00.000',
+		intake_user(array('mc_agent'), 42)
+	);
+}, 'A required Passport attachment must not be deleted after submission.');
+intake_assert_same('2026-08-20 10:00:00.000', $GLOBALS['wpdb']->application['updatedAt'], 'Rejected required-document deletion must not change the case revision.');
 $GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'));
 
 // Foundation advancement keeps every scalar field and declaration required,
@@ -943,6 +1186,11 @@ $advancement_code = 'foundation-advancement-business-administration';
 $advancement_draft = intake_draft(array('programme' => $advancement_code));
 $GLOBALS['wpdb']->documents = array();
 $assert_submission->invoke($plugin, $advancement_draft, intake_profile_identity(), 84, null);
+$required_document_removable->invoke(
+	$plugin,
+	intake_application(array('programmeCode' => $advancement_code, 'status' => 'acceptance-issued', 'wordpressUserId' => 84)),
+	intake_document('passport')
+);
 intake_assert_throws_contains('Agency Profile', static function () use ($assert_submission, $plugin, $advancement_draft) {
 	$assert_submission->invoke($plugin, $advancement_draft, intake_profile_identity(false), 84, null);
 }, 'Foundation advancement must still require the dedicated owner account to have a complete Agency Profile.');
@@ -1065,11 +1313,11 @@ $other_agent_projection = $filter_case_for_user->invoke(
 intake_assert_same(null, $other_agent_projection['tuitionFeeFirstYear'], 'The special tuition projection must not broaden to other external agents.');
 $assert_letter_available->invoke($plugin, $advancement_case, 'acceptance-letter');
 $advancement_before_acceptance = array_merge($advancement_case, array('status' => 'Application in progress'));
-intake_assert_throws_contains('Acceptance Letter section first', static function () use ($assert_letter_available, $plugin, $advancement_before_acceptance) {
+intake_assert_throws_contains('cannot be generated', static function () use ($assert_letter_available, $plugin, $advancement_before_acceptance) {
 	$assert_letter_available->invoke($plugin, $advancement_before_acceptance, 'acceptance-letter');
 }, 'A special draft must not generate its Acceptance Letter before final submission.');
 $rejected_advancement_case = array_merge($advancement_case, array('status' => 'rejected'));
-intake_assert_throws_contains('Acceptance Letter section first', static function () use ($assert_letter_available, $plugin, $rejected_advancement_case) {
+intake_assert_throws_contains('cannot be generated', static function () use ($assert_letter_available, $plugin, $rejected_advancement_case) {
 	$assert_letter_available->invoke($plugin, $rejected_advancement_case, 'acceptance-letter');
 }, 'A rejected Foundation advancement case must not generate an Acceptance Letter.');
 intake_assert_throws_contains('do not use an Offer Letter', static function () use ($assert_letter_available, $plugin, $advancement_case) {
@@ -1343,6 +1591,7 @@ intake_assert_same(true, $advancement_migration_handoff['stageChanged'], 'The de
 
 $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 $GLOBALS['wpdb']->application = intake_application(array('status' => 'acceptance-issued'));
+intake_seed_core_documents();
 $normal_migration_handoff = $update_workflow->invoke($plugin, array(
 	'applicationId' => 'application-1',
 	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
@@ -1575,7 +1824,7 @@ intake_assert_throws_contains('changed since you opened it', static function () 
 // Payment state and official payment/acceptance documents are also guarded
 // server-side; hiding the field in a client cannot bypass these commands.
 $letter_application = array_merge(
-	intake_application(array('paymentStatus' => 'cleared', 'paymentAmount' => '7000.00')),
+	intake_application(array('status' => 'prepayment-pending', 'paymentStatus' => 'cleared', 'paymentAmount' => '7000.00')),
 	array(
 		'documents' => array(), 'activities' => array(), 'communications' => array(),
 		'generatedLetters' => array(), 'letterDrafts' => array(), 'commissionRecords' => array(),
@@ -1586,6 +1835,72 @@ $letter_application = array_merge(
 );
 $legacy_date_case = $to_case->invoke($plugin, array_merge($letter_application, array('submissionDate' => '20/08/2026')), false);
 intake_assert_same('2026-08-20', $legacy_date_case['submissionDate'], 'Reloading a legacy day-first date must hydrate the canonical application draft value.');
+
+// Official letters have an explicit source-stage contract. Terminal and
+// preparation cases can never emit a PDF, while existing letters retain later
+// active-stage regeneration needed after intake corrections in Migration.
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$letter_with_bank = $letter_application;
+$letter_with_bank['documents'][] = intake_document('bankTransactionConfirmation');
+foreach (array('profile-preparation', 'rejected', 'trashed') as $forbidden_letter_stage) {
+	foreach (array('offer-letter', 'payment-receipt', 'acceptance-letter', 'letter-of-assurance', 'late-arrival-affirmation-letter') as $template_id) {
+		intake_assert_throws_contains('cannot be generated', static function () use ($assert_letter_available, $plugin, $letter_with_bank, $forbidden_letter_stage, $template_id) {
+			$assert_letter_available->invoke(
+				$plugin,
+				array_merge($letter_with_bank, array('status' => $forbidden_letter_stage)),
+				$template_id
+			);
+		}, $template_id . ' must be unavailable from ' . $forbidden_letter_stage . '.');
+	}
+}
+$review_acceptance = array_merge($letter_with_bank, array('status' => 'review-pending'));
+intake_assert_throws_contains('first Acceptance Letter', static function () use ($assert_letter_available, $plugin, $review_acceptance) {
+	$assert_letter_available->invoke($plugin, $review_acceptance, 'acceptance-letter');
+}, 'A first Acceptance Letter must not be generated directly from Review.');
+$migration_acceptance = array_merge($letter_with_bank, array('status' => 'migration-documents'));
+intake_assert_throws_contains('first Acceptance Letter', static function () use ($assert_letter_available, $plugin, $migration_acceptance) {
+	$assert_letter_available->invoke($plugin, $migration_acceptance, 'acceptance-letter');
+}, 'A missing first Acceptance Letter must not be backfilled from Migration without the normal issuance stage.');
+$GLOBALS['wpdb']->generatedLetters[] = array(
+	'id' => 'existing-acceptance-letter',
+	'applicationId' => 'application-1',
+	'templateId' => 'acceptance-letter',
+);
+$assert_letter_available->invoke($plugin, $migration_acceptance, 'acceptance-letter');
+
+$migration_offer = array_merge($letter_with_bank, array('status' => 'migration-documents'));
+intake_assert_throws_contains('first Offer Letter', static function () use ($assert_letter_available, $plugin, $migration_offer) {
+	$assert_letter_available->invoke($plugin, $migration_offer, 'offer-letter');
+}, 'A first Offer Letter must not be generated from a later operational stage.');
+$GLOBALS['wpdb']->generatedLetters[] = array(
+	'id' => 'existing-offer-letter',
+	'applicationId' => 'application-1',
+	'templateId' => 'offer-letter',
+);
+$assert_letter_available->invoke($plugin, $migration_offer, 'offer-letter');
+
+$offer_finance_letter = array_merge($letter_with_bank, array('status' => 'offer-issued'));
+intake_assert_throws_contains('Prepayment onward', static function () use ($assert_letter_available, $plugin, $offer_finance_letter) {
+	$assert_letter_available->invoke($plugin, $offer_finance_letter, 'payment-receipt');
+}, 'Payment Receipts must not be generated before Prepayment.');
+intake_assert_throws_contains('Prepayment onward', static function () use ($assert_letter_available, $plugin, $offer_finance_letter) {
+	$assert_letter_available->invoke($plugin, $offer_finance_letter, 'letter-of-assurance');
+}, 'Letters of Assurance must not be generated before Prepayment.');
+$prepayment_late_arrival = array_merge($letter_with_bank, array(
+	'status' => 'prepayment-pending',
+	'enrollmentStatus' => 'enrolled',
+	'lateArrivalReason' => 'Permit timing.',
+));
+intake_assert_throws_contains('arrival and immigration', static function () use ($assert_letter_available, $plugin, $prepayment_late_arrival) {
+	$assert_letter_available->invoke($plugin, $prepayment_late_arrival, 'late-arrival-affirmation-letter');
+}, 'Late-arrival letters must remain limited to Arrival/Immigration and Enrollment.');
+$assert_letter_available->invoke(
+	$plugin,
+	array_merge($prepayment_late_arrival, array('status' => 'arrival-immigration')),
+	'late-arrival-affirmation-letter'
+);
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 foreach (array('payment-receipt', 'acceptance-letter', 'letter-of-assurance') as $template_id) {
 	intake_assert_throws_contains('Transaction Confirmation PDF', static function () use ($assert_letter_available, $plugin, $letter_application, $template_id) {
 		$assert_letter_available->invoke($plugin, $letter_application, $template_id);
@@ -1595,6 +1910,35 @@ $letter_application['documents'][] = intake_document('bankTransactionConfirmatio
 $assert_letter_available->invoke($plugin, $letter_application, 'payment-receipt');
 $assert_letter_available->invoke($plugin, $letter_application, 'acceptance-letter');
 $assert_letter_available->invoke($plugin, $letter_application, 'letter-of-assurance');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'status' => 'prepayment-pending',
+	'paymentStatus' => 'cleared',
+	'paymentAmount' => '7000.00',
+	'address' => '',
+));
+intake_seed_core_documents();
+$GLOBALS['wpdb']->documents['bankTransactionConfirmation'] = intake_document('bankTransactionConfirmation');
+$standard_acceptance_payload = array(
+	'templateId' => 'acceptance-letter',
+	'templateVersion' => 'offline-v1',
+	'fileName' => 'acceptance-letter.pdf',
+	'outputFormat' => 'pdf',
+	'contentBase64' => base64_encode("%PDF-1.7\n"),
+	'inputSnapshot' => array('source' => 'offline-completeness-test'),
+);
+intake_assert_throws_contains('Home address', static function () use ($persist_letter, $plugin, $standard_acceptance_payload) {
+	$persist_letter->invoke(
+		$plugin,
+		'application-1',
+		$standard_acceptance_payload,
+		intake_user(array('administrator')),
+		'2026-08-20T10:00:00.000Z'
+	);
+}, 'Acceptance Letter persistence must revalidate the authoritative stored application before saving an official PDF.');
+intake_assert_same(array(), $GLOBALS['wpdb']->generatedLetters, 'A historically incomplete case must not persist an Acceptance Letter record.');
+intake_assert_same('prepayment-pending', $GLOBALS['wpdb']->application['status'], 'Blocked Acceptance generation must not advance workflow state.');
 
 $GLOBALS['wpdb']->application = intake_application(array('paymentStatus' => 'awaiting-payment'));
 intake_seed_core_documents();
@@ -2040,6 +2384,9 @@ $GLOBALS['wpdb']->reservations = array();
 // save remains CAS-protected while Programme and intake may be corrected.
 $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 $GLOBALS['wpdb']->application = intake_application(array('isTestData' => 0));
+intake_seed_core_documents();
+$GLOBALS['wpdb']->documents['bachelorDiploma'] = intake_document('bachelorDiploma');
+$GLOBALS['wpdb']->documents['bachelorTranscript'] = intake_document('bachelorTranscript');
 $GLOBALS['wpdb']->reservations['application-1'] = array(
 	'applicationId' => 'application-1', 'programmeCode' => 'business-administration',
 	'semester' => 'fall', 'intakeYear' => 2026, 'status' => 'active',
@@ -2111,6 +2458,8 @@ intake_assert_same(array(), $GLOBALS['wpdb']->capacities, 'Audit reactivation mu
 // skipped and the generated Offer Letter transaction still commits.
 $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 $GLOBALS['wpdb']->application = intake_application(array('isTestData' => 0));
+$GLOBALS['wpdb']->profile = intake_profile();
+intake_seed_core_documents();
 $GLOBALS['wpdb']->missingTables = array('mc_admission_intake_capacities', 'mc_admission_offer_reservations');
 intake_assert_same(false, $reserve_offer->invoke($plugin, $GLOBALS['wpdb']->application, 'letter-without-legacy-tables', $staff), 'Missing legacy tables must degrade to a skipped audit, not a capacity error.');
 $missing_table_letter = $persist_letter->invoke(

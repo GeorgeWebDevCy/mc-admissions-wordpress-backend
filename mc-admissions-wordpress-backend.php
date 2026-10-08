@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.72
+ * Version: 0.2.73
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -28,6 +28,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const STALE_INTAKE_CAPACITY_ERROR = 'This placement availability record changed since you opened it. Refresh and try again.';
 		const AUTH_EPOCH_META_KEY = 'mc_admissions_auth_epoch';
 		const AUTH_EPOCH_CLAIM = 'mcAdmissionsAuthEpoch';
+		const AGENT_ACTIVE_META_KEY = 'mc_admissions_agent_active';
+		const AGENT_STATUS_CHANGED_AT_META_KEY = 'mc_admissions_agent_status_changed_at';
+		const AGENT_STATUS_CHANGED_BY_META_KEY = 'mc_admissions_agent_status_changed_by';
+		const AGENT_DEACTIVATED_AT_META_KEY = 'mc_admissions_agent_deactivated_at';
+		const AGENT_DEACTIVATED_BY_META_KEY = 'mc_admissions_agent_deactivated_by';
+		const AGENT_REACTIVATED_AT_META_KEY = 'mc_admissions_agent_reactivated_at';
+		const AGENT_REACTIVATED_BY_META_KEY = 'mc_admissions_agent_reactivated_by';
 		const PASSWORD_ATTEMPT_LIMIT = 5;
 		const PASSWORD_ATTEMPT_WINDOW_SECONDS = 900;
 		const NOTIFICATION_EVENT_PAGE_SIZE = 50;
@@ -251,6 +258,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			add_action('plugins_loaded', array($this, 'schedule_authoritative_agency_identity_backfill'), 20);
 			add_filter('manage_users_columns', array($this, 'add_agency_display_name_user_column'));
 			add_filter('manage_users_custom_column', array($this, 'render_agency_display_name_user_column'), 10, 3);
+			add_filter('authenticate', array($this, 'block_deactivated_agent_authentication'), 100, 3);
 			add_filter('jwt_auth_token_before_sign', array($this, 'add_jwt_auth_epoch_claim'), 10, 2);
 			add_filter('determine_current_user', array($this, 'enforce_jwt_auth_epoch'), 100, 1);
 			add_filter('rest_authentication_errors', array($this, 'surface_jwt_auth_epoch_error'), 20, 1);
@@ -1993,6 +2001,26 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			register_rest_route(
 				self::API_NAMESPACE,
+				'/agents/manage',
+				array(
+					'methods' => WP_REST_Server::READABLE,
+					'callback' => array($this, 'rest_manage_agents'),
+					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
+				'/agents/(?P<agent_id>[0-9]+)/status',
+				array(
+					'methods' => 'PATCH',
+					'callback' => array($this, 'rest_update_agent_status'),
+					'permission_callback' => array($this, 'permission_authenticated'),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
 				'/profile',
 				array(
 					array(
@@ -2095,7 +2123,22 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				);
 			}
 
+			$current_user = wp_get_current_user();
+			if ($this->is_deactivated_external_agent($current_user)) {
+				return $this->deactivated_agent_error();
+			}
+
 			return true;
+		}
+
+		public function block_deactivated_agent_authentication($user, $_username = '', $_password = '') {
+			if (is_wp_error($user) || !is_object($user) || empty($user->ID)) {
+				return $user;
+			}
+
+			return $this->is_deactivated_external_agent($user)
+				? $this->deactivated_agent_error()
+				: $user;
 		}
 
 		public function add_jwt_auth_epoch_claim($token, $user = null) {
@@ -2143,6 +2186,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return false;
 			}
 
+			$resolved_user = get_userdata($resolved_user_id);
+			if ($this->is_deactivated_external_agent($resolved_user)) {
+				$this->jwt_auth_epoch_error = $this->deactivated_agent_error();
+				return false;
+			}
+
 			$token_epoch = 0;
 			if (array_key_exists(self::AUTH_EPOCH_CLAIM, $payload)) {
 				$claim = $payload[self::AUTH_EPOCH_CLAIM];
@@ -2166,8 +2215,21 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		public function surface_jwt_auth_epoch_error($result) {
-			return $this->jwt_auth_epoch_error instanceof WP_Error
-				? $this->jwt_auth_epoch_error
+			if ($result instanceof WP_Error) {
+				return $result;
+			}
+
+			if ($this->jwt_auth_epoch_error instanceof WP_Error) {
+				return $this->jwt_auth_epoch_error;
+			}
+
+			// Application Passwords and other WordPress authentication mechanisms may
+			// resolve a user without passing through the JWT epoch filter. Enforce the
+			// account status at the common REST boundary as well so deactivation applies
+			// to every REST route, not only this plugin's namespace.
+			$current_user = wp_get_current_user();
+			return $this->is_deactivated_external_agent($current_user)
+				? $this->deactivated_agent_error()
 				: $result;
 		}
 
@@ -2235,6 +2297,14 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'mc_admissions_session_revoked',
 				'Your session has expired. Please sign in again.',
 				array('status' => 401)
+			);
+		}
+
+		private function deactivated_agent_error() {
+			return new WP_Error(
+				'mc_admissions_agent_deactivated',
+				'This agency account has been deactivated. Contact an administrator.',
+				array('status' => 403)
 			);
 		}
 
@@ -5218,8 +5288,33 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		public function rest_save_profile(WP_REST_Request $request) {
 			global $wpdb;
 
-			$params = $request->get_json_params();
-			$draft  = isset($params['draft']) ? (array) $params['draft'] : array();
+			$params = (array) $request->get_json_params();
+			if (isset($params['draft']) && !is_array($params['draft'])) {
+				return $this->json_error_response('Agency Profile details must be an object.', 400);
+			}
+			$draft = isset($params['draft']) ? $params['draft'] : array();
+			foreach (
+				array(
+					'consultantName' => 'Consultant name',
+					'consultantPhone' => 'Consultant phone',
+					'defaultApplicationRoute' => 'Default application route',
+					'notes' => 'Agency Profile notes',
+				) as $field => $label
+			) {
+				if (
+					array_key_exists($field, $draft)
+					&& !(null === $draft[$field] && 'notes' === $field)
+					&& !is_string($draft[$field])
+				) {
+					return $this->json_error_response($label . ' must be text.', 400);
+				}
+			}
+			if (
+				isset($draft['defaultApplicationRoute'])
+				&& !in_array($draft['defaultApplicationRoute'], array('standard', 'postgraduate'), true)
+			) {
+				return $this->json_error_response('Default application route is invalid.', 400);
+			}
 
 			$consultant_name  = isset($draft['consultantName']) ? trim($draft['consultantName']) : '';
 
@@ -5237,12 +5332,24 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return $this->json_error_response('Update the WordPress account display name and email before saving the agency profile.', 400);
 			}
 
-			$existing = $wpdb->get_var(
+			$existing = $wpdb->get_row(
 				$wpdb->prepare(
-					"SELECT id FROM {$this->agency_profiles_table} WHERE wordpressUserId = %d LIMIT 1",
+					"SELECT * FROM {$this->agency_profiles_table} WHERE wordpressUserId = %d LIMIT 1",
 					$user_id
-				)
+				),
+				ARRAY_A
 			);
+			$current_wp_user = wp_get_current_user();
+			$can_manage_trusted_document_flags = $current_wp_user
+				&& !empty($current_wp_user->roles)
+				&& in_array('administrator', (array) $current_wp_user->roles, true);
+			if ($can_manage_trusted_document_flags) {
+				foreach (array('agreementOnFile', 'authorizationOnFile') as $trusted_flag) {
+					if (array_key_exists($trusted_flag, $draft) && !is_bool($draft[$trusted_flag])) {
+						return $this->json_error_response('Agency document status flags must be true or false.', 400);
+					}
+				}
+			}
 
 			$route = isset($draft['defaultApplicationRoute']) && $draft['defaultApplicationRoute'] === 'postgraduate'
 				? 'postgraduate'
@@ -5256,8 +5363,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'consultantEmail'        => $identity['consultantEmail'],
 				'consultantPhone'        => $consultant_phone,
 				'defaultApplicationRoute' => $route,
-				'agreementOnFile'        => !empty($draft['agreementOnFile']) ? 1 : 0,
-				'authorizationOnFile'    => !empty($draft['authorizationOnFile']) ? 1 : 0,
+				'agreementOnFile'        => $can_manage_trusted_document_flags
+					? (!empty($draft['agreementOnFile']) ? 1 : 0)
+					: (!empty($existing['agreementOnFile']) ? 1 : 0),
+				'authorizationOnFile'    => $can_manage_trusted_document_flags
+					? (!empty($draft['authorizationOnFile']) ? 1 : 0)
+					: (!empty($existing['authorizationOnFile']) ? 1 : 0),
 				'notes'                  => isset($draft['notes']) ? trim($draft['notes']) : null,
 				'updatedAt'              => current_time('mysql', true),
 			);
@@ -5271,7 +5382,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				if (false === $written) {
 					return $this->json_error_response('Unable to save the agency profile.', 500);
 				}
-				$profile_id = $existing;
+				$profile_id = $existing['id'];
 			} else {
 				$data['id']              = wp_generate_uuid4();
 				$data['wordpressUserId'] = $user_id;
@@ -5324,6 +5435,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$agency_name = $this->authoritative_agency_name($agent);
 			$consultant_name = $profile && !empty($profile['consultantName']) ? (string) $profile['consultantName'] : '';
 			$consultant_phone = $profile && !empty($profile['consultantPhone']) ? (string) $profile['consultantPhone'] : '';
+			$active = $this->is_agent_account_active((int) $agent->ID);
 			return array(
 				'id' => (int) $agent->ID,
 				'username' => (string) $agent->user_login,
@@ -5337,7 +5449,35 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				'defaultApplicationRoute' => $profile && isset($profile['defaultApplicationRoute']) && 'postgraduate' === $profile['defaultApplicationRoute'] ? 'postgraduate' : 'standard',
 				'agreementOnFile' => $profile && !empty($profile['agreementOnFile']),
 				'authorizationOnFile' => $profile && !empty($profile['authorizationOnFile']),
+				'active' => $active,
+				'deactivatedAt' => $active
+					? null
+					: $this->trim_to_null(get_user_meta((int) $agent->ID, self::AGENT_DEACTIVATED_AT_META_KEY, true)),
 			);
+		}
+
+		private function agent_profiles_by_user($agents) {
+			global $wpdb;
+
+			$profiles_by_user = array();
+			if (empty($agents)) {
+				return $profiles_by_user;
+			}
+
+			$agent_ids = array_values(array_filter(array_map('absint', wp_list_pluck($agents, 'ID'))));
+			if (empty($agent_ids)) {
+				return $profiles_by_user;
+			}
+
+			$id_list = implode(',', $agent_ids);
+			// IDs come only from WP_User objects and are normalized with absint above.
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$profiles = $wpdb->get_results("SELECT * FROM {$this->agency_profiles_table} WHERE wordpressUserId IN ({$id_list})", ARRAY_A);
+			foreach ((array) $profiles as $profile) {
+				$profiles_by_user[(int) $profile['wordpressUserId']] = $profile;
+			}
+
+			return $profiles_by_user;
 		}
 
 		public function rest_list_agents() {
@@ -5351,11 +5491,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			$agents = $can_assign_any_owner
 				? array_values(array_filter(
-					get_users(array('role__in' => array('mc_agent'), 'orderby' => 'display_name', 'order' => 'ASC')),
+					get_users(array('role__in' => $this->external_agent_roles(), 'orderby' => 'display_name', 'order' => 'ASC')),
 					function ($agent) {
-						return $this->is_external_agent_user(
-							array('roles' => array_values((array) $agent->roles))
-						);
+						return $this->is_manageable_external_agent($agent)
+							&& $this->is_agent_account_active((int) $agent->ID);
 					}
 				))
 				: array();
@@ -5378,17 +5517,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 				}
 			}
-			$profiles_by_user = array();
-			if (!empty($agents)) {
-				$agent_ids = array_map('absint', wp_list_pluck($agents, 'ID'));
-				$id_list = implode(',', $agent_ids);
-				// IDs come only from WP_User objects and are normalized with absint above.
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-				$profiles = $wpdb->get_results("SELECT * FROM {$this->agency_profiles_table} WHERE wordpressUserId IN ({$id_list})", ARRAY_A);
-				foreach ($profiles as $profile) {
-					$profiles_by_user[(int) $profile['wordpressUserId']] = $profile;
-				}
-			}
+			$profiles_by_user = $this->agent_profiles_by_user($agents);
 
 			return new WP_REST_Response(array(
 				'ok' => true,
@@ -5396,6 +5525,115 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					return $this->agent_summary($agent, isset($profiles_by_user[(int) $agent->ID]) ? $profiles_by_user[(int) $agent->ID] : null);
 				}, $agents)),
 			), 200);
+		}
+
+		public function rest_manage_agents() {
+			$user = $this->current_session_user();
+			if (!$this->is_admin_user($user)) {
+				return $this->json_error_response('Administrator access required.', 403);
+			}
+
+			$agents = array_values(array_filter(
+				get_users(array('role__in' => $this->external_agent_roles(), 'orderby' => 'display_name', 'order' => 'ASC')),
+				function ($agent) {
+					return $this->is_manageable_external_agent($agent);
+				}
+			));
+			$profiles_by_user = $this->agent_profiles_by_user($agents);
+
+			return new WP_REST_Response(array(
+				'ok' => true,
+				'agents' => array_values(array_map(function ($agent) use ($profiles_by_user) {
+					return $this->agent_summary($agent, isset($profiles_by_user[(int) $agent->ID]) ? $profiles_by_user[(int) $agent->ID] : null);
+				}, $agents)),
+			), 200);
+		}
+
+		public function rest_update_agent_status(WP_REST_Request $request) {
+			$user = $this->current_session_user();
+			if (!$this->is_admin_user($user)) {
+				return $this->json_error_response('Administrator access required.', 403);
+			}
+
+			$params = $request->get_json_params();
+			if (!array_key_exists('active', (array) $params) || !is_bool($params['active'])) {
+				return $this->json_error_response('Agent active status must be true or false.', 400);
+			}
+
+			$agent_id = absint($request['agent_id']);
+			$agent = get_userdata($agent_id);
+			if (!$this->is_manageable_external_agent($agent)) {
+				return $this->json_error_response('The selected account is not an external agency account.', 400);
+			}
+
+			$active = (bool) $params['active'];
+			$current_active = $this->is_agent_account_active($agent_id);
+			if ($active !== $current_active) {
+				$changed_at = current_time('mysql', true);
+				$next_epoch = $this->auth_epoch_for_user($agent_id) + 1;
+				$actor_id = (int) $user['id'];
+
+				if (!$active) {
+					// Fail closed: persist and verify the inactive flag before attempting
+					// revocation or audit metadata. Any later failure leaves the account
+					// unusable rather than reporting a misleading successful transition.
+					if (!$this->write_verified_user_meta($agent_id, self::AGENT_ACTIVE_META_KEY, '0')) {
+						return $this->json_error_response('Agent status could not be safely updated.', 500);
+					}
+					$this->destroy_user_sessions($agent_id);
+					if (
+						!$this->write_verified_user_meta($agent_id, self::AUTH_EPOCH_META_KEY, $next_epoch)
+						|| !$this->write_verified_user_meta($agent_id, self::AGENT_STATUS_CHANGED_AT_META_KEY, $changed_at)
+						|| !$this->write_verified_user_meta($agent_id, self::AGENT_STATUS_CHANGED_BY_META_KEY, $actor_id)
+						|| !$this->write_verified_user_meta($agent_id, self::AGENT_DEACTIVATED_AT_META_KEY, $changed_at)
+						|| !$this->write_verified_user_meta($agent_id, self::AGENT_DEACTIVATED_BY_META_KEY, $actor_id)
+					) {
+						return $this->json_error_response('Agent status could not be safely updated.', 500);
+					}
+				} else {
+					// Revoke every old credential and record the audit trail before making
+					// the account active. A partial failure therefore remains fail closed.
+					if (
+						!$this->write_verified_user_meta($agent_id, self::AUTH_EPOCH_META_KEY, $next_epoch)
+						|| !$this->write_verified_user_meta($agent_id, self::AGENT_STATUS_CHANGED_AT_META_KEY, $changed_at)
+						|| !$this->write_verified_user_meta($agent_id, self::AGENT_STATUS_CHANGED_BY_META_KEY, $actor_id)
+						|| !$this->write_verified_user_meta($agent_id, self::AGENT_REACTIVATED_AT_META_KEY, $changed_at)
+						|| !$this->write_verified_user_meta($agent_id, self::AGENT_REACTIVATED_BY_META_KEY, $actor_id)
+					) {
+						return $this->json_error_response('Agent status could not be safely updated.', 500);
+					}
+					$this->destroy_user_sessions($agent_id);
+					if (!$this->write_verified_user_meta($agent_id, self::AGENT_ACTIVE_META_KEY, '1')) {
+						return $this->json_error_response('Agent status could not be safely updated.', 500);
+					}
+				}
+
+				if (
+					$this->is_agent_account_active($agent_id) !== $active
+					|| $this->auth_epoch_for_user($agent_id) !== $next_epoch
+				) {
+					return $this->json_error_response('Agent status could not be safely updated.', 500);
+				}
+			}
+
+			$profile = $this->owner_agency_profile($agent_id);
+
+			return new WP_REST_Response(array(
+				'ok' => true,
+				'agent' => $this->agent_summary($agent, $profile),
+			), 200);
+		}
+
+		private function write_verified_user_meta($user_id, $key, $value) {
+			update_user_meta((int) $user_id, (string) $key, $value);
+
+			return (string) get_user_meta((int) $user_id, (string) $key, true) === (string) $value;
+		}
+
+		private function destroy_user_sessions($user_id) {
+			if (class_exists('WP_Session_Tokens')) {
+				WP_Session_Tokens::get_instance((int) $user_id)->destroy_all();
+			}
 		}
 
 		public function rest_create_agent(WP_REST_Request $request) {
@@ -6191,6 +6429,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			if (!$user || empty($user->ID)) {
 				throw new Exception('Authentication required.');
 			}
+			if ($this->is_deactivated_external_agent($user)) {
+				throw new Exception('This agency account has been deactivated. Contact an administrator.');
+			}
 
 			return array(
 				'id' => (int) $user->ID,
@@ -6263,13 +6504,91 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return !empty($user['roles']) && count(array_intersect($agent_roles, (array) $user['roles'])) > 0;
 		}
 
+		private function external_agent_roles() {
+			return array('mc_agent', 'mc-agent', 'agency', 'agent', 'consultant', 'admissions-agent', 'subscriber');
+		}
+
+		private function explicit_external_agent_roles() {
+			return array('mc_agent', 'mc-agent', 'agency', 'agent', 'consultant', 'admissions-agent');
+		}
+
 		private function is_agent_user($user) {
-			$agent_roles = array('mc_agent', 'mc-agent', 'agency', 'agent', 'consultant', 'admissions-agent', 'subscriber');
-			return !empty($user['roles']) && count(array_intersect($agent_roles, (array) $user['roles'])) > 0;
+			return !empty($user['roles']) && count(array_intersect($this->external_agent_roles(), (array) $user['roles'])) > 0;
 		}
 
 		private function is_external_agent_user($user) {
 			return $this->is_agent_user($user) && !$this->can_view_all_applications($user);
+		}
+
+		private function is_external_agent_wp_user($user) {
+			return is_object($user)
+				&& !empty($user->ID)
+				&& $this->is_external_agent_user(
+					array(
+						'roles' => array_values(array_map(
+							'strval',
+							isset($user->roles) ? (array) $user->roles : array()
+						)),
+					)
+				);
+		}
+
+		private function is_manageable_external_agent($user) {
+			if (
+				!$this->is_external_agent_wp_user($user)
+				|| self::FOUNDATION_ADVANCEMENT_OWNER_LOGIN === strtolower(trim((string) $user->user_login))
+			) {
+				return false;
+			}
+
+			$roles = isset($user->roles) ? array_values(array_map('strval', (array) $user->roles)) : array();
+			if (count(array_intersect($this->explicit_external_agent_roles(), $roles)) > 0) {
+				return true;
+			}
+
+			if (!in_array('subscriber', $roles, true)) {
+				return false;
+			}
+
+			// This plugin writes the status flag only after an administrator has
+			// selected a verified admissions agent. Treat either explicit value as
+			// durable legacy-agent identity so a temporary profile/application query
+			// failure can never let an inactive subscriber authenticate.
+			$status_meta = get_user_meta((int) $user->ID, self::AGENT_ACTIVE_META_KEY, true);
+			if ('' !== (string) $status_meta) {
+				return true;
+			}
+
+			return $this->subscriber_has_admissions_identity((int) $user->ID);
+		}
+
+		private function subscriber_has_admissions_identity($user_id) {
+			global $wpdb;
+
+			if ($this->owner_agency_profile((int) $user_id)) {
+				return true;
+			}
+
+			$count = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(1) FROM {$this->applications_table} WHERE wordpressUserId = %d",
+					(int) $user_id
+				)
+			);
+
+			return (int) $count > 0;
+		}
+
+		private function is_agent_account_active($user_id) {
+			$status = get_user_meta((int) $user_id, self::AGENT_ACTIVE_META_KEY, true);
+
+			// Existing accounts predate this flag, so an absent value is active.
+			return '0' !== (string) $status;
+		}
+
+		private function is_deactivated_external_agent($user) {
+			return $this->is_manageable_external_agent($user)
+				&& !$this->is_agent_account_active((int) $user->ID);
 		}
 
 		private function can_edit_application_data($user) {
@@ -6314,10 +6633,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				}
 
 				$agent = get_userdata((int) $assigned_agent_id);
-				$agent_user = $agent
-					? array('roles' => array_values((array) $agent->roles))
-					: array('roles' => array());
-				if (!$agent || !$this->is_external_agent_user($agent_user)) {
+				if (
+					!$agent
+					|| !$this->is_manageable_external_agent($agent)
+					|| !$this->is_agent_account_active((int) $agent->ID)
+				) {
 					throw new Exception('The selected application owner is not a valid agent.');
 				}
 
@@ -6334,7 +6654,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Only an administrator or Admissions Officer can assign an application to another agent.');
 			}
 
-			if (!$this->is_external_agent_user($user)) {
+			$current_owner = !empty($user['id']) ? get_userdata((int) $user['id']) : false;
+			if (
+				!$this->is_manageable_external_agent($current_owner)
+				|| !$this->is_agent_account_active((int) $current_owner->ID)
+			) {
 				throw new Exception('Only an external agent, administrator, or Admissions Officer can create an application.');
 			}
 
@@ -6687,6 +7011,52 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return $value;
 		}
 
+		private function normalize_gender_code($value, $strict = false) {
+			$value = strtolower(trim((string) $value));
+			if (in_array($value, array('male', 'female'), true)) {
+				return $value;
+			}
+
+			if ($strict) {
+				throw new Exception('Select a valid Gender.');
+			}
+
+			return $value;
+		}
+
+		private function normalize_birth_date($value, $strict = false) {
+			$value = trim((string) $value);
+			if ('' === $value) {
+				if ($strict) {
+					throw new Exception('Birthday is required.');
+				}
+				return '';
+			}
+
+			$formats = array('!Y-m-d', '!d/m/Y');
+			$candidates = array($value, $value);
+			if (1 === preg_match('/^([0-9]{4}-[0-9]{2}-[0-9]{2})(?:[T\s].*)?$/', $value, $matches)) {
+				$candidates[0] = $matches[1];
+			}
+
+			foreach ($formats as $index => $format) {
+				$date = DateTimeImmutable::createFromFormat($format, $candidates[$index], new DateTimeZone('UTC'));
+				$errors = DateTimeImmutable::getLastErrors();
+				if (
+					$date instanceof DateTimeImmutable
+					&& (false === $errors || (0 === (int) $errors['warning_count'] && 0 === (int) $errors['error_count']))
+				) {
+					return $date->format('Y-m-d');
+				}
+			}
+
+			if ($strict) {
+				throw new Exception('Birthday must be a valid calendar date.');
+			}
+
+			return $value;
+		}
+
 		private function normalize_intake_year($value, $strict = false) {
 			$value = trim((string) $value);
 			if (1 === preg_match('/^[0-9]{4}$/', $value)) {
@@ -6769,6 +7139,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function normalize_application_intake_draft($draft, $strict = false) {
 			$draft = (array) $draft;
+			$this->assert_application_text_field_types($draft);
+			$this->assert_application_declaration_types($draft);
+			$draft['birthday'] = $this->normalize_birth_date(isset($draft['birthday']) ? $draft['birthday'] : '', $strict);
+			$draft['gender'] = $this->normalize_gender_code(isset($draft['gender']) ? $draft['gender'] : '', $strict);
 			$draft['programme'] = $this->normalize_programme_code(isset($draft['programme']) ? $draft['programme'] : '', $strict);
 			$draft['semester'] = $this->normalize_semester_code(isset($draft['semester']) ? $draft['semester'] : '', $strict);
 			$draft['year'] = $this->normalize_intake_year(isset($draft['year']) ? $draft['year'] : '', $strict);
@@ -6778,6 +7152,51 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				: 'standard';
 
 			return $draft;
+		}
+
+		private function required_application_text_fields() {
+			return array(
+				'fullName' => 'Full name',
+				'passportNumber' => 'Passport number',
+				'email' => 'Applicant email',
+				'phone' => 'Phone number',
+				'birthday' => 'Birthday',
+				'address' => 'Home address',
+				'city' => 'City',
+				'postalCode' => 'Postal code',
+				'country' => 'Country',
+				'gender' => 'Gender',
+				'programme' => 'Programme',
+				'semester' => 'Semester intake',
+				'year' => 'Intake year',
+				'submissionDate' => 'Date of submission',
+			);
+		}
+
+		private function assert_application_text_field_types($draft) {
+			foreach ($this->required_application_text_fields() as $field => $label) {
+				if (
+					array_key_exists($field, (array) $draft)
+					&& null !== $draft[$field]
+					&& !is_string($draft[$field])
+				) {
+					throw new Exception($label . ' must be text.');
+				}
+			}
+		}
+
+		private function assert_application_declaration_types($draft) {
+			foreach (
+				array(
+					'tuitionAcknowledged' => 'Tuition fee policy acknowledged',
+					'offerTermsAcknowledged' => 'Offer letter terms accepted',
+					'gdprAcknowledged' => 'GDPR note reviewed',
+				) as $field => $label
+			) {
+				if (array_key_exists($field, (array) $draft) && !is_bool($draft[$field])) {
+					throw new Exception($label . ' must be true or false.');
+				}
+			}
 		}
 
 		private function is_bachelor_programme($programme_code) {
@@ -6936,23 +7355,31 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return $uploaded;
 		}
 
-		private function assert_review_submission_complete($draft, $owner_identity, $owner_user_id, $application_id = null) {
-			$required_fields = array(
-				'fullName' => 'Full name',
-				'passportNumber' => 'Passport number',
-				'email' => 'Applicant email',
-				'phone' => 'Phone number',
-				'birthday' => 'Birthday',
-				'address' => 'Home address',
-				'city' => 'City',
-				'postalCode' => 'Postal code',
-				'country' => 'Country',
-				'gender' => 'Gender',
-				'programme' => 'Programme',
-				'semester' => 'Semester intake',
-				'year' => 'Intake year',
-				'submissionDate' => 'Date of submission',
+		private function application_record_to_review_draft($application) {
+			return array(
+				'fullName' => isset($application['fullName']) ? $application['fullName'] : '',
+				'passportNumber' => isset($application['passportNumber']) ? $application['passportNumber'] : '',
+				'email' => isset($application['email']) ? $application['email'] : '',
+				'phone' => isset($application['phone']) ? $application['phone'] : '',
+				'birthday' => isset($application['birthday']) ? $application['birthday'] : '',
+				'address' => isset($application['address']) ? $application['address'] : '',
+				'city' => isset($application['city']) ? $application['city'] : '',
+				'postalCode' => isset($application['postalCode']) ? $application['postalCode'] : '',
+				'country' => isset($application['country']) ? $application['country'] : '',
+				'gender' => isset($application['gender']) ? $application['gender'] : '',
+				'programme' => isset($application['programmeCode']) ? $application['programmeCode'] : '',
+				'semester' => isset($application['semester']) ? $application['semester'] : '',
+				'year' => isset($application['year']) ? $application['year'] : '',
+				'submissionDate' => isset($application['submissionDate']) ? $application['submissionDate'] : '',
+				'tuitionAcknowledged' => !empty($application['tuitionAcknowledged']),
+				'offerTermsAcknowledged' => !empty($application['offerTermsAcknowledged']),
+				'gdprAcknowledged' => !empty($application['gdprAcknowledged']),
 			);
+		}
+
+		private function assert_review_submission_complete($draft, $owner_identity, $owner_user_id, $application_id = null) {
+			$draft = $this->normalize_application_intake_draft((array) $draft, true);
+			$required_fields = $this->required_application_text_fields();
 			$missing_fields = array();
 			foreach ($required_fields as $field => $label) {
 				if (!isset($draft[$field]) || '' === trim((string) $draft[$field])) {
@@ -6983,7 +7410,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					'gdprAcknowledged' => 'GDPR note reviewed',
 				) as $field => $label
 			) {
-				if (empty($draft[$field])) {
+				if (!array_key_exists($field, $draft) || true !== $draft[$field]) {
 					$missing_declarations[] = $label;
 				}
 			}
@@ -6998,28 +7425,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return;
 			}
 
-			$required_documents = array(
-				'passport',
-				'secondaryMarksheet',
-				'higherSecondaryMarksheet',
-				'englishCertificate',
-				'studentSignature',
-				'consultantSignature',
+			$required_documents = $this->required_review_document_types(
+				(string) $draft['programme'],
+				(int) $owner_user_id
 			);
-			if ('business-administration-masters' === (string) $draft['programme']) {
-				$required_documents[] = 'bachelorDiploma';
-				$required_documents[] = 'bachelorTranscript';
-			}
 
 			$uploaded = $this->uploaded_document_types($application_id);
-			$profile = $this->owner_agency_profile((int) $owner_user_id);
-			if (empty($profile['agreementOnFile'])) {
-				$required_documents[] = 'agencyAgreement';
-			}
-			if (empty($profile['authorizationOnFile'])) {
-				$required_documents[] = 'authorizationCertificate';
-			}
-
 			$missing_documents = array();
 			foreach ($required_documents as $document_type) {
 				if (empty($uploaded[$document_type])) {
@@ -7030,6 +7441,52 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 			if (!empty($missing_documents)) {
 				throw new Exception('Upload all required documents: ' . implode(', ', $missing_documents) . '.');
+			}
+		}
+
+		private function required_review_document_types($programme_code, $owner_user_id) {
+			if ($this->is_foundation_advancement_programme((string) $programme_code)) {
+				return array();
+			}
+
+			$required_documents = array(
+				'passport',
+				'secondaryMarksheet',
+				'higherSecondaryMarksheet',
+				'englishCertificate',
+				'studentSignature',
+				'consultantSignature',
+			);
+			if ('business-administration-masters' === (string) $programme_code) {
+				$required_documents[] = 'bachelorDiploma';
+				$required_documents[] = 'bachelorTranscript';
+			}
+
+			$profile = $this->owner_agency_profile((int) $owner_user_id);
+			if (empty($profile['agreementOnFile'])) {
+				$required_documents[] = 'agencyAgreement';
+			}
+			if (empty($profile['authorizationOnFile'])) {
+				$required_documents[] = 'authorizationCertificate';
+			}
+			return array_values(array_unique($required_documents));
+		}
+
+		private function assert_required_intake_document_removable($application, $document) {
+			if (
+				!is_array($application)
+				|| $this->is_foundation_advancement_programme((string) ($application['programmeCode'] ?? ''))
+				|| 'profile-preparation' === $this->canonical_status_key((string) ($application['status'] ?? ''))
+			) {
+				return;
+			}
+
+			$required_documents = $this->required_review_document_types(
+				(string) ($application['programmeCode'] ?? ''),
+				isset($application['wordpressUserId']) ? (int) $application['wordpressUserId'] : 0
+			);
+			if (in_array((string) ($document['type'] ?? ''), $required_documents, true)) {
+				throw new Exception('Required intake documents cannot be removed after an application is submitted. Upload a replacement file instead.');
 			}
 		}
 
@@ -7083,6 +7540,23 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			)
 				? $status_key
 				: 'profile-preparation';
+		}
+
+		private function is_active_admissions_status_key($status_key) {
+			return in_array(
+				(string) $status_key,
+				array(
+					'review-pending',
+					'offer-issued',
+					'prepayment-pending',
+					'acceptance-issued',
+					'migration-documents',
+					'entry-permit-processing',
+					'arrival-immigration',
+					'enrollment-complete',
+				),
+				true
+			);
 		}
 
 		private function workflow_status_rank($status) {
@@ -8075,6 +8549,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 		private function assert_admission_letter_generation_available($application, $template_id) {
 			$case = $this->to_admission_case($application);
+			$stage_key = $this->canonical_status_key(isset($case['stageKey']) ? $case['stageKey'] : '');
 			$payment_status = isset($case['paymentStatus']) ? (string) $case['paymentStatus'] : 'awaiting-invoice';
 			$payment_amount = isset($case['paymentAmount']) ? $this->trim_to_null($case['paymentAmount']) : null;
 			$is_foundation_advancement = $this->is_foundation_advancement_programme(
@@ -8082,6 +8557,23 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 			$bank_confirmation_ready = $this->bank_transaction_confirmation_ready(
 				isset($application['documents']) ? $application['documents'] : array()
+			);
+			if (
+				'profile-preparation' === $stage_key
+				|| in_array($stage_key, array('rejected', 'trashed'), true)
+			) {
+				throw new Exception('Official letters cannot be generated while an application is in preparation, rejected, or trashed.');
+			}
+			$application_id = isset($application['id']) ? (string) $application['id'] : '';
+			$has_existing_letter = '' !== $application_id
+				&& $this->generated_admission_letter_exists($application_id, $template_id);
+			$prepayment_or_later_stages = array(
+				'prepayment-pending',
+				'acceptance-issued',
+				'migration-documents',
+				'entry-permit-processing',
+				'arrival-immigration',
+				'enrollment-complete',
 			);
 
 			if ($is_foundation_advancement) {
@@ -8092,10 +8584,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					throw new Exception('Foundation advancement applications do not use a Payment Receipt.');
 				}
 				if ('acceptance-letter' === $template_id) {
-					$stage_key = $this->canonical_status_key($case['stageKey']);
 					if (
-						in_array($stage_key, array('rejected', 'trashed'), true)
-						|| $this->workflow_status_rank($stage_key) < $this->workflow_status_rank('acceptance-issued')
+						$this->workflow_status_rank($stage_key) < $this->workflow_status_rank('acceptance-issued')
 					) {
 						throw new Exception('Submit the Foundation advancement application to the Acceptance Letter section first.');
 					}
@@ -8106,8 +8596,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			switch ($template_id) {
 				case 'offer-letter':
-					if ($this->workflow_status_rank($case['stageKey']) < $this->workflow_status_rank('review-pending')) {
-						throw new Exception('Move the case into assessment before generating an offer.');
+					if (
+						!in_array($stage_key, array('review-pending', 'offer-issued'), true)
+						&& !($has_existing_letter && $this->is_active_admissions_status_key($stage_key))
+					) {
+						throw new Exception('Generate the first Offer Letter from Review or Offer Issued. Existing Offer Letters may be regenerated at later active stages.');
 					}
 					if (!in_array((string) $case['reviewerDecision'], array('academically-cleared', 'conditional-offer'), true)) {
 						throw new Exception('Record a cleared or conditional review decision first.');
@@ -8120,6 +8613,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 					break;
 				case 'acceptance-letter':
+					if (
+						!in_array($stage_key, array('offer-issued', 'prepayment-pending'), true)
+						&& !(
+							$has_existing_letter
+							&& $this->is_active_admissions_status_key($stage_key)
+							&& $this->workflow_status_rank($stage_key) >= $this->workflow_status_rank('offer-issued')
+						)
+					) {
+						throw new Exception('Generate the first Acceptance Letter from Offer Issued or Prepayment. Existing Acceptance Letters may be regenerated at later active stages.');
+					}
 					if (!$bank_confirmation_ready) {
 						throw new Exception('Upload the bank Transaction Confirmation PDF before generating the acceptance letter.');
 					}
@@ -8134,6 +8637,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 					break;
 				case 'payment-receipt':
+					if (!in_array($stage_key, $prepayment_or_later_stages, true)) {
+						throw new Exception('Payment Receipts are available from Prepayment onward.');
+					}
 					if (!$bank_confirmation_ready) {
 						throw new Exception('Upload the bank Transaction Confirmation PDF before generating the payment receipt.');
 					}
@@ -8145,6 +8651,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 					break;
 				case 'letter-of-assurance':
+					if (!in_array($stage_key, $prepayment_or_later_stages, true)) {
+						throw new Exception('Letters of Assurance are available from Prepayment onward.');
+					}
 					if (!$bank_confirmation_ready) {
 						throw new Exception('Upload the bank Transaction Confirmation PDF before generating the letter of assurance.');
 					}
@@ -8156,7 +8665,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					}
 					break;
 				case 'late-arrival-affirmation-letter':
-					if ($this->workflow_status_rank($case['stageKey']) < $this->workflow_status_rank('arrival-immigration')) {
+					if (!in_array($stage_key, array('arrival-immigration', 'enrollment-complete'), true)) {
 						throw new Exception('Move the case into arrival and immigration before generating this letter.');
 					}
 					if ('enrolled' !== (string) $case['enrollmentStatus']) {
@@ -8653,6 +9162,18 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$this->assert_admission_letter_generation_available($application, $template_id);
 				$is_foundation_advancement = $this->is_foundation_advancement_programme(
 					isset($application['programmeCode']) ? (string) $application['programmeCode'] : ''
+				);
+				$owner_user_id = isset($application['wordpressUserId']) ? (int) $application['wordpressUserId'] : 0;
+				$owner_identity = $this->authoritative_agency_contact(
+					$owner_user_id,
+					$application,
+					true
+				);
+				$this->assert_review_submission_complete(
+					$this->application_record_to_review_draft($application),
+					$owner_identity,
+					$owner_user_id,
+					$application_id
 				);
 				$is_first_foundation_advancement_acceptance_issuance =
 					$is_foundation_advancement
@@ -10843,6 +11364,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							$is_foundation_advancement_submission
 							|| $this->can_submit_prepared_application($user, $existing_application['status'])
 						);
+					$existing_status_key = $this->canonical_status_key((string) $existing_application['status']);
+					$requires_complete_active_application = !in_array(
+						$existing_status_key,
+						array('profile-preparation', 'rejected', 'trashed'),
+						true
+					);
 					$should_notify_review_submission =
 						$is_submitting_prepared_application
 						&& !$is_foundation_advancement
@@ -10857,7 +11384,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					if ('review' === $mode && !$is_submitting_prepared_application) {
 						throw new Exception('Only an agent, administrator, or Admissions Officer can submit an application that is still in preparation.');
 					}
-					if ($is_submitting_prepared_application) {
+					if ($is_submitting_prepared_application || $requires_complete_active_application) {
 						$this->assert_review_submission_complete(
 							$draft,
 							$owner_identity,
@@ -11136,7 +11663,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$status = $this->normalize_status($params['status']);
 			$existing = $wpdb->get_row(
 				$wpdb->prepare(
-					"SELECT id, wordpressUserId, status, programmeCode, reviewerDecision, workflowNote, updatedAt FROM {$this->applications_table} WHERE id = %s LIMIT 1",
+					"SELECT * FROM {$this->applications_table} WHERE id = %s LIMIT 1",
 					$application_id
 				),
 				ARRAY_A
@@ -11247,6 +11774,22 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$is_foundation_advancement
 						? 'You do not have permission to manage this Foundation advancement workflow.'
 						: 'You do not have permission to move this application to the requested stage.'
+				);
+			}
+			if (
+				$existing_status_key !== $target_status_key
+				&& $this->is_active_admissions_status_key($target_status_key)
+			) {
+				$owner_identity = $this->authoritative_agency_contact(
+					isset($existing['wordpressUserId']) ? (int) $existing['wordpressUserId'] : 0,
+					$existing,
+					true
+				);
+				$this->assert_review_submission_complete(
+					$this->application_record_to_review_draft($existing),
+					$owner_identity,
+					isset($existing['wordpressUserId']) ? (int) $existing['wordpressUserId'] : 0,
+					$application_id
 				);
 			}
 			if ('rejected' === $status) {
@@ -11526,6 +12069,28 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				if (!array_key_exists('workflowNote', $draft)) {
 					$normalized['workflowNote'] = 'Application has been submitted and is waiting for admissions assessment and document verification.';
 				}
+			}
+			if (
+				(
+					!$this->is_active_admissions_status_key($existing_status)
+					&& $this->is_active_admissions_status_key($next_status)
+				)
+				|| (
+					array_key_exists('reviewerDecision', $normalized)
+					&& in_array($next_reviewer_decision, array('academically-cleared', 'conditional-offer'), true)
+				)
+			) {
+				$owner_identity = $this->authoritative_agency_contact(
+					isset($existing['wordpressUserId']) ? (int) $existing['wordpressUserId'] : 0,
+					$existing,
+					true
+				);
+				$this->assert_review_submission_complete(
+					$this->application_record_to_review_draft($existing),
+					$owner_identity,
+					isset($existing['wordpressUserId']) ? (int) $existing['wordpressUserId'] : 0,
+					$application_id
+				);
 			}
 			$status_changed = $next_status !== $existing_status;
 			if (
@@ -12333,6 +12898,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			try {
+				$locked_application = $this->get_authorized_application_base($application_id, $user, true);
+				if ((string) $locked_application['updatedAt'] !== (string) $expected_version) {
+					throw new Exception(self::STALE_APPLICATION_ERROR);
+				}
+				$this->assert_required_intake_document_removable($locked_application, $document);
+				if ('bankTransactionConfirmation' === (string) ($document['type'] ?? '')) {
+					$this->assert_bank_transaction_confirmation_removable($application_id);
+				}
+
 				$application_written = $wpdb->query(
 					$wpdb->prepare(
 						"
@@ -12351,10 +12925,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				if (0 === $application_written) {
 					throw new Exception(self::STALE_APPLICATION_ERROR);
 				}
-				if ('bankTransactionConfirmation' === (string) ($document['type'] ?? '')) {
-					$this->assert_bank_transaction_confirmation_removable($application_id);
-				}
-
 				$document_written = $wpdb->query(
 					$wpdb->prepare(
 						"
