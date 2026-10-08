@@ -184,6 +184,10 @@ function wp_get_current_user() {
 	return $GLOBALS['mc_document_current_user'];
 }
 
+function get_user_meta($user_id, $key = '', $single = false) {
+	return '';
+}
+
 function get_avatar_url($user_id, $args = array()) {
 	return '';
 }
@@ -510,8 +514,9 @@ document_assert_same(403, $forbidden_agent_delete->get_status(), 'Agents must no
 
 $GLOBALS['mc_document_current_user'] = document_test_user(array('administrator'));
 $stale_delete_db = new MC_Document_Test_Wpdb();
+$preparation_application = document_application_base(array('status' => 'profile-preparation'));
 $stale_delete_db->row_results = array(
-	document_application_base(),
+	$preparation_application,
 	array(
 		'id' => 'passport-document',
 		'type' => 'passport',
@@ -522,6 +527,7 @@ $stale_delete_db->row_results = array(
 		'storageItemId' => 'old-storage-item',
 		'uploadedUrl' => '/document/passport',
 	),
+	$preparation_application,
 );
 $stale_delete_db->query_results = array(1, 0, 1);
 $GLOBALS['wpdb'] = $stale_delete_db;
@@ -1134,6 +1140,7 @@ document_assert_same(true, $assessment_parent_index >= 0 && $assessment_parent_i
 document_assert_same(true, document_event_index($assessment_success_db->events, 'COMMIT') > $assessment_child_index, 'Assessment parent and child writes must commit together.');
 
 $delete_success_db = new MC_Document_Test_Wpdb();
+$delete_success_db->row_results = array(document_application_base(array('status' => 'profile-preparation')));
 $delete_success_db->query_results = array(1, 1, 1, 1);
 $GLOBALS['wpdb'] = $delete_success_db;
 $clear_document->invoke(

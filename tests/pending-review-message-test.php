@@ -404,6 +404,10 @@ function wp_get_current_user() {
 	return $GLOBALS['mc_pending_current_user'];
 }
 
+function get_user_meta($user_id, $key = '', $single = false) {
+	return '';
+}
+
 function get_avatar_url($user_id, $args = array()) {
 	return '';
 }

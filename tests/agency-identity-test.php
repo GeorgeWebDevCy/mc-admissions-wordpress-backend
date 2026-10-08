@@ -362,6 +362,7 @@ function get_users($args = array()) {
 function wp_get_current_user() { return get_userdata($GLOBALS['mc_identity_current_user_id']); }
 function get_current_user_id() { return (int) $GLOBALS['mc_identity_current_user_id']; }
 function get_avatar_url($user_id, $args = array()) { return ''; }
+function get_user_meta($user_id, $key = '', $single = false) { return ''; }
 function current_time($type, $gmt = false) { return '2026-08-13 10:00:00'; }
 function absint($value) { return abs((int) $value); }
 function wp_list_pluck($list, $field) { return array_map(function ($item) use ($field) { return $item->{$field}; }, $list); }
@@ -676,13 +677,41 @@ $response = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => arra
 	'consultantEmail' => 'attacker@example.invalid',
 	'consultantPhone' => '+357 99000000',
 	'defaultApplicationRoute' => 'standard',
+	'agreementOnFile' => true,
+	'authorizationOnFile' => true,
 ))));
 identity_assert_same(200, $response->status, 'A valid Agency Profile update must succeed.');
 identity_assert_same('12th Study Abroad', $response->data['profile']['agencyName'], 'Profile PUT must ignore client agency name.');
 identity_assert_same('owner@example.invalid', $response->data['profile']['consultantEmail'], 'Profile PUT must ignore client consultant email.');
 identity_assert_same('Updated Consultant', $response->data['profile']['consultantName'], 'Profile PUT must preserve editable consultant name.');
 identity_assert_same('+357 99000000', $response->data['profile']['consultantPhone'], 'Profile PUT must preserve editable consultant phone.');
+identity_assert_same(false, $response->data['profile']['agreementOnFile'], 'An external agent must not self-certify that an Agency agreement is on file.');
+identity_assert_same(false, $response->data['profile']['authorizationOnFile'], 'An external agent must not self-certify that an Authorization certificate is on file.');
 identity_assert_same($before_update_calls, count($GLOBALS['mc_identity_wp_update_calls']), 'Profile PUT must never call wp_update_user.');
+
+$GLOBALS['wpdb']->profiles[10]['agreementOnFile'] = 1;
+$GLOBALS['wpdb']->profiles[10]['authorizationOnFile'] = 1;
+$preserved_trusted_flags = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array(
+	'consultantName' => 'Updated Consultant',
+	'consultantPhone' => '+357 99000000',
+	'agreementOnFile' => false,
+	'authorizationOnFile' => false,
+))));
+identity_assert_same(200, $preserved_trusted_flags->status, 'Normal external profile edits must still succeed when trusted flags already exist.');
+identity_assert_same(true, $preserved_trusted_flags->data['profile']['agreementOnFile'], 'An external agent must not clear the trusted Agency agreement flag.');
+identity_assert_same(true, $preserved_trusted_flags->data['profile']['authorizationOnFile'], 'An external agent must not clear the trusted Authorization certificate flag.');
+
+$GLOBALS['mc_identity_current_user_id'] = 13;
+$administrator_trusted_flags = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array(
+	'consultantName' => 'Staff Contact',
+	'consultantPhone' => '+357 25000000',
+	'agreementOnFile' => true,
+	'authorizationOnFile' => true,
+))));
+identity_assert_same(200, $administrator_trusted_flags->status, 'Administrators must retain control of trusted Agency document flags.');
+identity_assert_same(true, $administrator_trusted_flags->data['profile']['agreementOnFile'], 'Administrator Agency agreement changes must persist.');
+identity_assert_same(true, $administrator_trusted_flags->data['profile']['authorizationOnFile'], 'Administrator Authorization certificate changes must persist.');
+$GLOBALS['mc_identity_current_user_id'] = 10;
 
 $missing_phone = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array('consultantName' => 'Contact', 'consultantPhone' => ''))));
 identity_assert_same(400, $missing_phone->status, 'Profile PUT must require consultant phone.');
@@ -690,6 +719,29 @@ identity_assert_contains('Consultant phone is required', $missing_phone->data['e
 $missing_name = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array('consultantName' => '', 'consultantPhone' => '+357 99000000'))));
 identity_assert_same(400, $missing_name->status, 'Profile PUT must require consultant name.');
 identity_assert_contains('Consultant name is required', $missing_name->data['error'], 'Missing name response must be explicit.');
+
+$array_name = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array('consultantName' => array('forged'), 'consultantPhone' => '+357 99000000'))));
+identity_assert_same(400, $array_name->status, 'Profile PUT must reject an array-valued consultant name without a PHP type error.');
+identity_assert_contains('Consultant name must be text', $array_name->data['error'], 'Invalid consultant-name type response must be explicit.');
+$object_phone = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array('consultantName' => 'Contact', 'consultantPhone' => (object) array('value' => '+357 99000000')))));
+identity_assert_same(400, $object_phone->status, 'Profile PUT must reject an object-valued consultant phone.');
+identity_assert_contains('Consultant phone must be text', $object_phone->data['error'], 'Invalid consultant-phone type response must be explicit.');
+$array_route = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array('consultantName' => 'Contact', 'consultantPhone' => '+357 99000000', 'defaultApplicationRoute' => array('standard')))));
+identity_assert_same(400, $array_route->status, 'Profile PUT must reject an array-valued default route.');
+$invalid_route = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array('consultantName' => 'Contact', 'consultantPhone' => '+357 99000000', 'defaultApplicationRoute' => 'forged-route'))));
+identity_assert_same(400, $invalid_route->status, 'Profile PUT must reject a non-canonical default route rather than silently coercing it.');
+$object_notes = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array('consultantName' => 'Contact', 'consultantPhone' => '+357 99000000', 'notes' => (object) array('forged' => true)))));
+identity_assert_same(400, $object_notes->status, 'Profile PUT must reject object-valued notes.');
+
+$GLOBALS['mc_identity_current_user_id'] = 13;
+$forged_trusted_flag = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array(
+	'consultantName' => 'Staff Contact',
+	'consultantPhone' => '+357 25000000',
+	'agreementOnFile' => 'false',
+	'authorizationOnFile' => true,
+))));
+identity_assert_same(400, $forged_trusted_flag->status, 'Administrator trusted-document flags must require real JSON booleans.');
+$GLOBALS['mc_identity_current_user_id'] = 10;
 
 $GLOBALS['mc_identity_current_user_id'] = 15;
 $missing_wp_name = $plugin->rest_save_profile(new WP_REST_Request(array('draft' => array('consultantName' => 'Contact', 'consultantPhone' => '+357 99000000'))));
@@ -802,7 +854,7 @@ $GLOBALS['mc_identity_fail_table_write'] = null;
 $GLOBALS['mc_identity_current_user_id'] = 10;
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-identity_assert_contains('Version: 0.2.72', $plugin_source, 'The plugin header must advertise 0.2.72.');
+identity_assert_contains('Version: 0.2.73', $plugin_source, 'The plugin header must advertise 0.2.73.');
 identity_assert_contains("\$owner_identity['agencyName']", $plugin_source, 'Application saves must use authoritative agency identity.');
 identity_assert_contains("\$owner_identity['consultantName']", $plugin_source, 'Application saves must use the owning Agency Profile contact.');
 identity_assert_contains('$identity_safe_draft', $plugin_source, 'Test-data inference must use the authoritative identity overlay.');
