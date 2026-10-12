@@ -1029,6 +1029,7 @@ $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 $GLOBALS['wpdb']->application = intake_application(array(
 	'status' => 'Application in progress',
 	'reviewerDecision' => 'pending',
+	'wordpressUserId' => 7,
 	'address' => '',
 ));
 intake_seed_core_documents();
@@ -1047,6 +1048,7 @@ $GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
 $GLOBALS['wpdb']->application = intake_application(array(
 	'status' => 'Application in progress',
 	'reviewerDecision' => 'pending',
+	'wordpressUserId' => 7,
 ));
 $GLOBALS['wpdb']->documents = array();
 intake_assert_throws_contains('Copy of passport', static function () use ($update_workflow, $plugin) {
@@ -1928,17 +1930,16 @@ $standard_acceptance_payload = array(
 	'contentBase64' => base64_encode("%PDF-1.7\n"),
 	'inputSnapshot' => array('source' => 'offline-completeness-test'),
 );
-intake_assert_throws_contains('Home address', static function () use ($persist_letter, $plugin, $standard_acceptance_payload) {
-	$persist_letter->invoke(
-		$plugin,
-		'application-1',
-		$standard_acceptance_payload,
-		intake_user(array('administrator')),
-		'2026-08-20T10:00:00.000Z'
-	);
-}, 'Acceptance Letter persistence must revalidate the authoritative stored application before saving an official PDF.');
-intake_assert_same(array(), $GLOBALS['wpdb']->generatedLetters, 'A historically incomplete case must not persist an Acceptance Letter record.');
-intake_assert_same('prepayment-pending', $GLOBALS['wpdb']->application['status'], 'Blocked Acceptance generation must not advance workflow state.');
+$legacy_acceptance = $persist_letter->invoke(
+	$plugin,
+	'application-1',
+	$standard_acceptance_payload,
+	intake_user(array('administrator')),
+	'2026-08-20T10:00:00.000Z'
+);
+intake_assert_same('acceptance-letter', $legacy_acceptance['letter']['templateId'], 'An otherwise eligible historical case must remain able to generate an Acceptance Letter after stricter intake requirements are introduced.');
+intake_assert_same(1, count($GLOBALS['wpdb']->generatedLetters), 'Legacy letter generation must persist exactly one official document record.');
+intake_assert_same('acceptance-issued', $GLOBALS['wpdb']->application['status'], 'The eligible legacy Acceptance Letter must retain the ordinary acceptance-stage handoff.');
 
 $GLOBALS['wpdb']->application = intake_application(array('paymentStatus' => 'awaiting-payment'));
 intake_seed_core_documents();
@@ -1997,6 +1998,8 @@ $annual_fixtures = array(
 	intake_application(array('id' => 'advancement-business-accepted', 'semester' => 'spring', 'year' => '2026', 'isTestData' => 0, 'programmeCode' => 'foundation-advancement-business-administration', 'status' => 'acceptance-issued', 'reviewerDecision' => 'academically-cleared')),
 	intake_application(array('id' => 'advancement-hotel-accepted', 'semester' => 'summer', 'year' => '2026', 'isTestData' => 0, 'programmeCode' => 'foundation-advancement-hotel-casino-resort-management', 'status' => 'migration-documents', 'reviewerDecision' => 'academically-cleared')),
 	intake_application(array('id' => 'advancement-draft-excluded', 'semester' => 'fall', 'year' => '2026', 'isTestData' => 0, 'programmeCode' => 'foundation-advancement-business-administration', 'status' => 'Application in progress', 'reviewerDecision' => 'pending')),
+	intake_application(array('id' => 'reverted-draft-excluded', 'semester' => 'fall', 'year' => '2026', 'isTestData' => 0, 'status' => 'profile-preparation', 'reviewerDecision' => 'academically-cleared')),
+	intake_application(array('id' => 'unknown-stage-excluded', 'semester' => 'fall', 'year' => '2026', 'isTestData' => 0, 'status' => 'future-unknown-status', 'reviewerDecision' => 'academically-cleared')),
 	intake_application(array('id' => 'next-year-accepted', 'semester' => 'summer', 'year' => '2027', 'isTestData' => 0, 'status' => 'review-pending', 'reviewerDecision' => 'academically-cleared')),
 	intake_application(array('id' => 'test-excluded', 'year' => '2027', 'isTestData' => 1, 'reviewerDecision' => 'academically-cleared')),
 	intake_application(array('id' => 'rejected-excluded', 'year' => '2027', 'isTestData' => 0, 'status' => 'Rejected', 'reviewerDecision' => 'academically-cleared')),
@@ -2012,6 +2015,16 @@ intake_assert_same(4, $annual_summary[0]['acceptedPlacements'], 'Ordinary and bo
 intake_assert_same(148, $annual_summary[0]['availablePlacements'], 'Annual availability must subtract ordinary and Foundation advancement Bachelor applications from 152.');
 intake_assert_same(0, $annual_summary[0]['overCapacity'], 'An in-capacity year must not report an excess.');
 intake_assert_same(1, $annual_summary[1]['acceptedPlacements'], 'Rejected, trashed, test, and non-cleared applications must not consume the annual count.');
+
+$private_draft_year_summary = $build_annual_seat_summary->invoke(
+	$plugin,
+	array(
+		intake_application(array('id' => 'private-draft-year', 'year' => '2035', 'status' => 'profile-preparation', 'reviewerDecision' => 'academically-cleared')),
+		intake_application(array('id' => 'foundation-draft-year', 'year' => '2036', 'programmeCode' => 'foundation-advancement-business-administration', 'status' => 'Application in progress', 'reviewerDecision' => 'pending')),
+	),
+	2026
+);
+intake_assert_same(array(2026), array_column($private_draft_year_summary, 'intakeYear'), 'Private and restricted preparation drafts must not reveal otherwise unseen intake years through the annual summary.');
 
 $over_capacity_rows = array();
 for ($index = 0; $index < 153; $index++) {

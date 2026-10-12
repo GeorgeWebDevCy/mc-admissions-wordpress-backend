@@ -1132,7 +1132,7 @@ $persist_assessments->invoke(
 	)),
 	array('passport' => array('id' => 'passport-document', 'isReady' => 1)),
 	'2026-07-29 10:11:12.345',
-	array('name' => 'Offline Admin', 'roles' => array('administrator'))
+	array('id' => 1, 'name' => 'Offline Admin', 'roles' => array('administrator'))
 );
 $assessment_parent_index = document_event_index($assessment_success_db->events, 'UPDATE mc_admission_applications');
 $assessment_child_index = document_event_index($assessment_success_db->events, 'INSERT INTO mc_admission_documents');
@@ -1153,7 +1153,7 @@ $clear_document->invoke(
 		'originalName' => 'passport.pdf',
 	),
 	'2026-07-29 10:11:12.345',
-	array('name' => 'Offline Admin', 'roles' => array('administrator'))
+	array('id' => 1, 'name' => 'Offline Admin', 'roles' => array('administrator'))
 );
 $delete_parent_index = document_event_index($delete_success_db->events, 'UPDATE mc_admission_applications');
 $delete_child_index = document_event_index($delete_success_db->events, 'UPDATE mc_admission_documents');

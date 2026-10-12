@@ -1065,6 +1065,25 @@ pending_assert_same(403, $response->get_status(), 'An agent must not use the sta
 pending_assert_same('pending', $GLOBALS['wpdb']->application['reviewerDecision'], 'A denied rejection must not change the review decision.');
 pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A denied rejection must not call wp_mail.');
 
+reset_pending_case(
+	array(
+		'status' => 'profile-preparation',
+		'reviewerDecision' => 'pending',
+		'wordpressUserId' => 7,
+	)
+);
+$draft_rejection_reason = 'The incomplete preparation draft was cancelled by its internal owner.';
+$draft_rejection = invoke_rejection_command(
+	$rejection_command,
+	'2026-08-11T10:00:00.000Z',
+	$draft_rejection_reason
+);
+pending_assert_same('rejected', $GLOBALS['wpdb']->application['status'], 'A dedicated reasoned rejection may close an owned incomplete preparation draft directly.');
+pending_assert_same('rejected', $GLOBALS['wpdb']->application['reviewerDecision'], 'A rejected preparation draft must retain the rejected decision.');
+pending_assert_same(null, pending_find_activity('Stage moved to review-pending'), 'Rejecting a preparation draft must not synthesize a review submission or active-stage transition.');
+pending_assert_same($draft_rejection_reason, $GLOBALS['wpdb']->communications[0]['detail'], 'The direct draft rejection must retain the exact standalone reason.');
+pending_assert_same(true, $draft_rejection['delivery']['ok'], 'The direct draft rejection must preserve the ordinary post-commit agency notification flow.');
+
 reset_pending_case();
 $typed_reason = 'The submitted qualifications do not meet the programme entry requirements.';
 $response = $plugin->rest_reject_review_application(
@@ -1253,7 +1272,7 @@ pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A rolled-back 
 // Wrong-stage rejection fails before a transaction or email.
 reset_pending_case(array('status' => 'offer-issued'));
 pending_assert_throws_message(
-	'Only an application awaiting review or an active academically-cleared application can be rejected.',
+	'Only a preparation draft, an application awaiting review, or an active academically-cleared application can be rejected.',
 	function () use ($rejection_command) {
 		invoke_rejection_command($rejection_command);
 	},
@@ -1265,7 +1284,7 @@ pending_assert_same(0, count($GLOBALS['mc_pending_mail_calls']), 'A wrong-stage 
 foreach (array('rejected', 'trashed') as $terminal_status) {
 	reset_pending_case(array('status' => $terminal_status, 'reviewerDecision' => 'academically-cleared'));
 	pending_assert_throws_message(
-		'Only an application awaiting review or an active academically-cleared application can be rejected.',
+		'Only a preparation draft, an application awaiting review, or an active academically-cleared application can be rejected.',
 		function () use ($rejection_command) {
 			invoke_rejection_command($rejection_command);
 		},

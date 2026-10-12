@@ -63,6 +63,20 @@ if (false !== strpos($source, 'Mobile web generation currently supports the Offe
 	exit(1);
 }
 
+$persistence_start = strpos($source, 'private function persist_generated_admission_letter');
+$persistence_end = strpos($source, 'private function send_generated_admission_letter_email', $persistence_start);
+$persistence_source = false !== $persistence_start && false !== $persistence_end
+	? substr($source, $persistence_start, $persistence_end - $persistence_start)
+	: '';
+if (false !== strpos($persistence_source, 'assert_review_submission_complete')) {
+	fwrite(STDERR, "Eligible historical cases must not be retroactively blocked by the submission-completeness gate while generating a letter.\n");
+	exit(1);
+}
+if (false === strpos($persistence_source, 'assert_admission_letter_generation_available')) {
+	fwrite(STDERR, "Generated-letter persistence must retain its workflow/template eligibility guard.\n");
+	exit(1);
+}
+
 $email_start = strpos($source, 'private function send_generated_admission_letter_email');
 $email_end = strpos($source, 'private function get_detailed_application_record', $email_start);
 $email_source = false !== $email_start && false !== $email_end

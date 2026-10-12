@@ -40,6 +40,8 @@ final class MC_Alert_Test_Wpdb {
 	public $insert_calls = array();
 	public $throw_on_insert = false;
 	public $throw_on_get_row = false;
+	public $application_row = null;
+	public $bank_document_row = null;
 
 	public function prepare($query, ...$args) {
 		foreach ($args as $arg) {
@@ -65,6 +67,15 @@ final class MC_Alert_Test_Wpdb {
 	public function get_row($query, $output = null) {
 		if ($this->throw_on_get_row) {
 			throw new RuntimeException('Offline authoritative identity failure.');
+		}
+		if (
+			false !== strpos((string) $query, 'mc_admission_documents')
+			&& false !== strpos((string) $query, 'bankTransactionConfirmation')
+		) {
+			return $this->bank_document_row;
+		}
+		if (false !== strpos((string) $query, 'mc_admission_applications')) {
+			return $this->application_row;
 		}
 
 		return null;
@@ -305,6 +316,8 @@ function alert_reset_side_effects() {
 	$GLOBALS['wpdb']->insert_calls = array();
 	$GLOBALS['wpdb']->throw_on_insert = false;
 	$GLOBALS['wpdb']->throw_on_get_row = false;
+	$GLOBALS['wpdb']->application_row = null;
+	$GLOBALS['wpdb']->bank_document_row = null;
 }
 
 function alert_mail_addresses() {
@@ -315,6 +328,17 @@ function alert_method_source($reflection, $method_name) {
 	$method = $reflection->getMethod($method_name);
 	$lines = file($method->getFileName());
 	return implode('', array_slice($lines, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
+}
+
+function alert_assert_throws_with_message($callback, $expected_message, $message) {
+	try {
+		$callback();
+	} catch (Throwable $error) {
+		alert_assert_contains($expected_message, $error->getMessage(), $message);
+		return;
+	}
+
+	throw new RuntimeException($message . ' Expected an exception.');
 }
 
 $plugin = mc_admissions_wordpress_backend();
@@ -329,6 +353,10 @@ $resolve_test_data = $reflection->getMethod('resolve_application_test_data');
 $resolve_test_data->setAccessible(true);
 $payload_method = $reflection->getMethod('application_activity_alert_payload');
 $payload_method->setAccessible(true);
+$authorize_external_email = $reflection->getMethod('authorize_external_agent_email_payload');
+$authorize_external_email->setAccessible(true);
+$bank_confirmation_ready = $reflection->getMethod('bank_transaction_confirmation_ready');
+$bank_confirmation_ready->setAccessible(true);
 $send = $reflection->getMethod('send_application_activity_alert');
 $send->setAccessible(true);
 $workflow_definition = $reflection->getMethod('workflow_stage_notification_definition');
@@ -358,6 +386,7 @@ $application = array(
 	'consultantEmail' => 'actor@example.test',
 	'consultantPhone' => '+357 25000000',
 	'email' => 'student@example.test',
+	'programmeCode' => 'business-administration',
 	'status' => 'review-pending',
 	'isTestData' => 0,
 );
@@ -387,6 +416,171 @@ alert_assert_same(false, $review_gate->invoke($plugin, $application, $dual_role_
 alert_assert_same(false, $review_gate->invoke($plugin, array_merge($application, array('status' => 'profile-preparation')), $agent, true), 'A preparation-stage application must not emit a submission alert.');
 alert_assert_same(false, $review_gate->invoke($plugin, array_merge($application, array('isTestData' => 1)), $agent, true), 'A test application submission must remain silent.');
 alert_assert_same(false, $review_gate->invoke($plugin, $application, $agent, false), 'A normal edit must not emit a submission alert.');
+
+alert_reset_side_effects();
+$draft_activity_result = $send->invoke($plugin, $preparation_application, $agent, 'new-application-submitted');
+alert_assert_same(true, $draft_activity_result['skipped'], 'The delivery layer itself must refuse internal alerts for preparation drafts.');
+alert_assert_same(array(), $GLOBALS['mc_alert_mail_calls'], 'A preparation draft must never reach wp_mail through the activity-alert layer.');
+alert_assert_same(array(), $GLOBALS['wpdb']->insert_calls, 'A suppressed preparation alert must not create delivery-audit noise.');
+
+$review_email_params = array(
+	'to' => array(),
+	'roles' => array('admissions-officer', 'administrator'),
+	'subject' => 'Caller-supplied review subject',
+	'message' => 'Caller-supplied review message',
+	'notificationKind' => 'review-submission',
+	'application' => array('id' => $application['id']),
+	'attachments' => array(),
+);
+foreach (array('profile-preparation', 'Draft', 'Application in progress', 'future-unknown-status') as $private_status) {
+	$GLOBALS['wpdb']->application_row = array_merge($application, array('status' => $private_status));
+	alert_assert_throws_with_message(
+		function () use ($authorize_external_email, $plugin, $review_email_params, $agent) {
+			$authorize_external_email->invoke($plugin, $review_email_params, $agent);
+		},
+		'Draft, inactive, or unknown-status applications cannot send email.',
+		$private_status . ' must fail closed before an external email can resolve recipients.'
+	);
+}
+
+$missing_application_params = $review_email_params;
+$missing_application_params['application'] = array();
+alert_assert_throws_with_message(
+	function () use ($authorize_external_email, $plugin, $missing_application_params, $agent) {
+		$authorize_external_email->invoke($plugin, $missing_application_params, $agent);
+	},
+	'An application is required',
+	'External email delivery must always be tied to an application id.'
+);
+
+$GLOBALS['wpdb']->application_row = array_merge($application, array('wordpressUserId' => 99));
+alert_assert_throws_with_message(
+	function () use ($authorize_external_email, $plugin, $review_email_params, $agent) {
+		$authorize_external_email->invoke($plugin, $review_email_params, $agent);
+	},
+	'not allowed to access',
+	'An external agent must not send mail for another owner\'s application.'
+);
+
+$GLOBALS['wpdb']->application_row = array_merge($application, array('isTestData' => 1));
+alert_assert_throws_with_message(
+	function () use ($authorize_external_email, $plugin, $review_email_params, $agent) {
+		$authorize_external_email->invoke($plugin, $review_email_params, $agent);
+	},
+	'not allowed for this application',
+	'Test applications must remain silent at the generic email boundary.'
+);
+
+$GLOBALS['wpdb']->application_row = $application;
+foreach (
+	array(
+		array('to', array(array('email' => 'arbitrary@example.test'))),
+		array('attachments', array(array('fileName' => 'arbitrary.pdf'))),
+	) as $forbidden_payload
+) {
+	$params = $review_email_params;
+	$params[$forbidden_payload[0]] = $forbidden_payload[1];
+	alert_assert_throws_with_message(
+		function () use ($authorize_external_email, $plugin, $params, $agent) {
+			$authorize_external_email->invoke($plugin, $params, $agent);
+		},
+		'cannot choose direct email recipients or attachments',
+		'Ordinary external agents must not turn the authenticated route into a direct mail relay.'
+	);
+}
+
+$wrong_role_params = $review_email_params;
+$wrong_role_params['roles'] = array('finance-officer');
+alert_assert_throws_with_message(
+	function () use ($authorize_external_email, $plugin, $wrong_role_params, $agent) {
+		$authorize_external_email->invoke($plugin, $wrong_role_params, $agent);
+	},
+	'Review-submission email is allowed only',
+	'Review submission must not accept caller-selected internal role sets.'
+);
+
+$authorized_review_payload = $authorize_external_email->invoke(
+	$plugin,
+	$review_email_params,
+	$agent
+);
+alert_assert_same(
+	array('administrator', 'admissions-officer', 'immigration-officer'),
+	$authorized_review_payload['roles'],
+	'An authorized direct-store submission must be expanded to the server-owned internal recipient policy.'
+);
+alert_assert_same('president@mesoyios.ac.cy', $authorized_review_payload['to'][0]['email'], 'The server-owned submission payload must include the President.');
+alert_assert_same($application['referenceCode'], $authorized_review_payload['application']['referenceCode'], 'Email application context must come from the authoritative record.');
+alert_assert_same(false, 'Caller-supplied review subject' === $authorized_review_payload['subject'], 'An external caller must not control the submitted-application subject.');
+
+$bank_email_params = array(
+	'to' => array(),
+	'roles' => array('finance-officer', 'admissions-officer'),
+	'subject' => 'Caller-supplied bank subject',
+	'message' => 'Caller-supplied bank message',
+	'notificationKind' => 'agent-bank-confirmation-upload',
+	'application' => array('id' => $application['id']),
+	'attachments' => array(),
+);
+$GLOBALS['wpdb']->bank_document_row = null;
+alert_assert_throws_with_message(
+	function () use ($authorize_external_email, $plugin, $bank_email_params, $agent) {
+		$authorize_external_email->invoke($plugin, $bank_email_params, $agent);
+	},
+	'Upload the bank Transaction Confirmation PDF',
+	'The bank alert must require authoritative uploaded evidence.'
+);
+$GLOBALS['wpdb']->bank_document_row = array(
+	'type' => 'bankTransactionConfirmation',
+	'isReady' => 1,
+	'storageItemId' => 'bank-document-item',
+	'uploadedUrl' => null,
+	'originalName' => 'transaction-confirmation.pdf',
+	'mimeType' => 'application/pdf',
+);
+alert_assert_same(true, $bank_confirmation_ready->invoke($plugin, array($GLOBALS['wpdb']->bank_document_row)), 'The valid bank fixture must satisfy the production evidence predicate.');
+$authorized_bank_payload = $authorize_external_email->invoke(
+	$plugin,
+	$bank_email_params,
+	$agent
+);
+alert_assert_same(
+	array('administrator', 'admissions-officer', 'immigration-officer', 'finance-officer'),
+	$authorized_bank_payload['roles'],
+	'An authorized bank upload must use the complete server-owned role policy.'
+);
+alert_assert_same('president@mesoyios.ac.cy', $authorized_bank_payload['to'][0]['email'], 'The authorized bank alert must include the President.');
+
+$dpt_user = array(
+	'id' => 2,
+	'username' => 'mc-admissions-dpt',
+	'name' => 'MC-ADMISSIONS-DPT',
+	'email' => 'actor@example.test',
+	'roles' => array('mc_agent'),
+);
+$GLOBALS['wpdb']->application_row = array_merge(
+	$application,
+	array(
+		'status' => 'acceptance-issued',
+		'programmeCode' => 'foundation-advancement-business-administration',
+	)
+);
+$dpt_generated_payload = array(
+	'to' => array(array('email' => 'migration@mesoyios.ac.cy')),
+	'roles' => array(),
+	'subject' => 'Foundation Advancement acceptance letter',
+	'message' => 'Attached.',
+	'application' => array('id' => $application['id']),
+	'attachments' => array(array('fileName' => 'acceptance-letter.pdf')),
+);
+$authorized_dpt_payload = $authorize_external_email->invoke(
+	$plugin,
+	$dpt_generated_payload,
+	$dpt_user
+);
+alert_assert_same($dpt_generated_payload['to'], $authorized_dpt_payload['to'], 'The exact DPT account must retain its active Foundation generated-letter recipients.');
+alert_assert_same($dpt_generated_payload['attachments'], $authorized_dpt_payload['attachments'], 'The exact DPT account must retain its active Foundation generated-letter attachment.');
+alert_reset_side_effects();
 
 alert_assert_same(true, $gate->invoke($plugin, $application, $agent), 'An agent upload after submission must alert.');
 foreach (array('profile-preparation', 'Application in progress', 'Draft') as $preparation_status) {
@@ -579,6 +773,17 @@ $role_addresses = alert_mail_addresses();
 sort($role_addresses);
 alert_assert_same(array('admissions@example.test', 'finance@example.test'), $role_addresses, 'Each resolved role mailbox must receive exactly one email regardless of WordPress user-query order.');
 alert_assert_same(2, count($GLOBALS['wpdb']->insert_calls), 'A workflow-role delivery must write communication and activity audits.');
+
+alert_reset_side_effects();
+$draft_role_result = $send_role_notification->invoke(
+	$plugin,
+	$preparation_application,
+	$internal_user,
+	array_merge($offer_role_payload, array('roles' => array('admissions-officer', 'finance-officer')))
+);
+alert_assert_same(true, $draft_role_result['skipped'], 'The role-notification layer itself must refuse preparation-draft email.');
+alert_assert_same(array(), $GLOBALS['mc_alert_mail_calls'], 'A preparation draft must never reach wp_mail through the role-notification layer.');
+alert_assert_same(array(), $GLOBALS['wpdb']->insert_calls, 'A suppressed preparation role email must not create delivery-audit noise.');
 
 alert_reset_side_effects();
 $review_results = $send_workflow_notifications->invoke(
@@ -952,6 +1157,7 @@ $workflow_delivery_source = alert_method_source($reflection, 'send_workflow_noti
 $workflow_delivery_guard_source = alert_method_source($reflection, 'run_workflow_notification_delivery');
 $delete_source = alert_method_source($reflection, 'delete_admission_document');
 $rest_email_source = alert_method_source($reflection, 'rest_send_email');
+$external_email_authorization_source = alert_method_source($reflection, 'authorize_external_agent_email_payload');
 alert_assert_contains("array_key_exists('isTestData', \$params)", $rest_save_source, 'The WordPress save route must preserve the test-data flag.');
 alert_assert_contains('ensure_application_test_data_schema', $boot_source, 'Every plugin boot must run the backwards-compatible test-data schema guard.');
 alert_assert_contains('isTestData BOOLEAN NOT NULL DEFAULT 0', $activate_source, 'Fresh installations must create the test-data classification column.');
@@ -990,6 +1196,14 @@ alert_assert_not_contains('send_application_activity_alert', $operations_source,
 alert_assert_not_contains('send_application_activity_alert', $delete_source, 'Document deletion must not emit the urgent upload alert.');
 alert_assert_not_contains('send_application_activity_alert', $rest_email_source, 'The ordinary /email endpoint must remain independent.');
 alert_assert_not_contains('send_generated_admission_letter_email', $rest_email_source, 'The ordinary /email endpoint must not inherit generated-document internal copies.');
+alert_assert_same(
+	true,
+	strpos($rest_email_source, 'authorize_external_agent_email_payload') < strpos($rest_email_source, 'resolve_email_recipients'),
+	'The generic email route must authorize external-agent payloads before resolving recipients.'
+);
+alert_assert_contains("'review-submission'", $external_email_authorization_source, 'The direct-store review notification must use an explicit server-validated kind.');
+alert_assert_contains("'agent-bank-confirmation-upload'", $external_email_authorization_source, 'The direct-store bank notification must use an explicit server-validated kind.');
+alert_assert_contains('assert_bank_transaction_confirmation_available', $external_email_authorization_source, 'Bank alerts must require authoritative stored PDF evidence.');
 alert_assert_contains('if (!$stale_command_ignored && ($status_changed || $note_changed))', $workflow_source, 'Workflow notification delivery must exclude stale and no-op commands.');
 alert_assert_contains('$this->send_workflow_notifications(', $workflow_source, 'The WordPress workflow path must dispatch the same notification classes as the direct-Prisma path.');
 alert_assert_same(
@@ -1007,6 +1221,6 @@ alert_assert_contains('catch (Throwable $error)', $workflow_delivery_guard_sourc
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
 alert_assert_not_contains('should_send_draft_creation_alert', $plugin_source, 'The obsolete first-draft email gate must be absent from the plugin.');
 alert_assert_not_contains("'new-application-created'", $plugin_source, 'The obsolete first-draft email event must be absent from the plugin.');
-alert_assert_contains('Version: 0.2.73', $plugin_source, 'The plugin header must advertise version 0.2.73.');
+alert_assert_contains('Version: 0.2.74', $plugin_source, 'The plugin header must advertise version 0.2.74.');
 
 echo 'Application activity alert tests passed.' . PHP_EOL;
