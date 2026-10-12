@@ -197,6 +197,20 @@ $resolve_programme_label = $reflection->getMethod('resolve_programme_label');
 $resolve_programme_label->setAccessible(true);
 $to_board_application = $reflection->getMethod('to_board_application');
 $to_board_application->setAccessible(true);
+$can_access_application = $reflection->getMethod('can_access_application');
+$can_access_application->setAccessible(true);
+$application_visibility_where_sql = $reflection->getMethod('application_visibility_where_sql');
+$application_visibility_where_sql->setAccessible(true);
+$count_generated_letters_method = $reflection->getMethod('count_generated_letters');
+$count_generated_letters_lines = file($count_generated_letters_method->getFileName());
+$count_generated_letters_source = implode(
+	'',
+	array_slice(
+		$count_generated_letters_lines,
+		$count_generated_letters_method->getStartLine() - 1,
+		$count_generated_letters_method->getEndLine() - $count_generated_letters_method->getStartLine() + 1
+	)
+);
 
 function assert_same($expected, $actual, $message) {
 	if ($expected !== $actual) {
@@ -380,6 +394,51 @@ $users = array(
 	'immigration' => array('roles' => array('immigration-officer')),
 	'registrar' => array('roles' => array('registrar')),
 	'agent' => array('roles' => array('mc_agent')),
+);
+
+$admin_visibility_user = array('id' => 7, 'username' => 'admin', 'roles' => array('administrator'));
+$owner_agent_user = array('id' => 42, 'username' => 'owner-agent', 'roles' => array('mc_agent'));
+$other_agent_user = array('id' => 43, 'username' => 'other-agent', 'roles' => array('mc_agent'));
+$ordinary_draft = array(
+	'wordpressUserId' => 42,
+	'status' => 'profile-preparation',
+	'programmeCode' => 'business-administration',
+);
+$submitted_application = array_merge($ordinary_draft, array('status' => 'review-pending'));
+$foundation_draft = array_merge(
+	$ordinary_draft,
+	array('programmeCode' => 'foundation-advancement-business-administration')
+);
+assert_same(true, $can_access_application->invoke($plugin, $ordinary_draft, $owner_agent_user), 'The owning agent must retain access to its preparation draft.');
+assert_same(false, $can_access_application->invoke($plugin, $ordinary_draft, $other_agent_user), 'Another agent must never see an owner draft.');
+assert_same(false, $can_access_application->invoke($plugin, $ordinary_draft, $admin_visibility_user), 'Internal users must not see an ordinary agent draft before submission.');
+assert_same(true, $can_access_application->invoke($plugin, $submitted_application, $admin_visibility_user), 'Internal users must see the case after successful review submission.');
+assert_same(true, $can_access_application->invoke($plugin, $foundation_draft, $admin_visibility_user), 'Authorized internal staff must retain the restricted Foundation Advancement draft workflow.');
+$admin_visibility_sql = $application_visibility_where_sql->invoke($plugin, $admin_visibility_user, 'app');
+assert_same(array(7), $admin_visibility_sql['args'], 'Internal board visibility must bind only the current user id.');
+assert_same(
+	true,
+	false !== strpos($admin_visibility_sql['sql'], 'app.status IN ('),
+	'Internal board and library queries must fail closed to known submitted and terminal statuses.'
+);
+assert_same(false, false !== strpos($admin_visibility_sql['sql'], 'future-unknown-status'), 'Unknown statuses must not become staff-visible list entries.');
+assert_same(
+	true,
+	false !== strpos($admin_visibility_sql['sql'], 'app.programmeCode IN'),
+	'Authorized Foundation Advancement staff must retain their restricted draft visibility.'
+);
+$agent_visibility_sql = $application_visibility_where_sql->invoke($plugin, $owner_agent_user, 'app');
+assert_same('WHERE app.wordpressUserId = %d', $agent_visibility_sql['sql'], 'Agents must remain scoped to their own applications in every stage.');
+assert_same(array(42), $agent_visibility_sql['args'], 'Agent board visibility must bind the owning account id.');
+assert_same(
+	true,
+	false !== strpos($count_generated_letters_source, "application_visibility_where_sql(\$user, 'app')"),
+	'Generated-letter dashboard counts must reuse the same draft-privacy predicate as the board.'
+);
+assert_same(
+	false,
+	false !== strpos($count_generated_letters_source, 'can_view_all_applications'),
+	'Generated-letter counts must not retain a broad staff-only query branch.'
 );
 
 $admissions_fields = $allowed_operations->invoke($plugin, $users['admissions']);
@@ -684,7 +743,7 @@ assert_same(409, $mutation_error_status->invoke($plugin, new Exception(MC_Admiss
 assert_same(400, $mutation_error_status->invoke($plugin, new Exception('Other write failure.')), 'Non-stale write errors should remain HTTP 400.');
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-assert_string_contains(' * Version: 0.2.73', $plugin_source, 'The plugin release header must be bumped for updater detection.');
+assert_string_contains(' * Version: 0.2.74', $plugin_source, 'The plugin release header must be bumped for updater detection.');
 assert_string_contains('$this->ensure_migration_case_columns();', $plugin_source, 'The migration schema upgrader must run during plugin boot.');
 assert_string_contains("? 'migration.entryPermitExpiryDate'", $plugin_source, 'The board query must select the flattened permit expiry date after schema verification.');
 assert_string_contains("\t\t\t\t: 'NULL';", $plugin_source, 'The board query must safely return a null expiry when the schema upgrade is unavailable.');

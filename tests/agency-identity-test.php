@@ -768,33 +768,22 @@ identity_assert_contains("\$owner_identity['consultantName']", $save_source, 'Ap
 identity_assert_contains("\$owner_identity['consultantPhone']", $save_source, 'Application creates and updates must ignore per-application consultant phones.');
 identity_assert_contains('$assigned_agent_id', $save_source, 'Administrator create must resolve identity from the explicitly selected owner.');
 
-$continue_assigned_preparation = identity_method($reflection, 'can_continue_assigned_preparation');
 $submit_prepared_application = identity_method($reflection, 'can_submit_prepared_application');
 $admissions_user = array('roles' => array('admissions-officer'));
-$finance_user = array('roles' => array('finance-officer'));
+$agent_user = array('roles' => array('mc_agent'));
 identity_assert_same(
 	true,
-	$continue_assigned_preparation->invoke($plugin, $admissions_user, 'profile-preparation'),
-	'Admissions must be able to resume the assigned draft after its first save.'
+	$submit_prepared_application->invoke($plugin, $agent_user, 'profile-preparation'),
+	'The owning agency role must retain preparation submission permission.'
 );
 identity_assert_same(
-	true,
+	false,
 	$submit_prepared_application->invoke($plugin, $admissions_user, 'profile-preparation'),
-	'Admissions must be able to submit the resumed assigned draft for review.'
+	'Admissions must not resume or submit an ordinary draft owned by an agency account.'
 );
 identity_assert_same(
 	false,
-	$continue_assigned_preparation->invoke($plugin, $admissions_user, 'review-pending'),
-	'Admissions assigned-draft editing must end when the case leaves preparation.'
-);
-identity_assert_same(
-	false,
-	$continue_assigned_preparation->invoke($plugin, $admissions_user, 'future-unknown-status'),
-	'Unknown or future statuses must never inherit preparation-stage editing permission.'
-);
-identity_assert_same(
-	false,
-	$submit_prepared_application->invoke($plugin, array('roles' => array('mc_agent')), 'future-unknown-status'),
+	$submit_prepared_application->invoke($plugin, $agent_user, 'future-unknown-status'),
 	'Unknown or future statuses must never inherit agent submission permission.'
 );
 identity_assert_same(
@@ -802,18 +791,8 @@ identity_assert_same(
 	$submit_prepared_application->invoke($plugin, $admissions_user, 'review-pending'),
 	'Admissions must not replay preparation submission after the stage advances.'
 );
-identity_assert_same(
-	false,
-	$continue_assigned_preparation->invoke($plugin, $finance_user, 'profile-preparation'),
-	'Finance must not gain assigned application intake editing.'
-);
-identity_assert_contains('$can_continue_assigned_preparation', $save_source, 'Existing assigned draft saves must use the preparation-only permission gate.');
 identity_assert_contains('can_submit_prepared_application', $save_source, 'Review submission must use the preparation-only permission gate.');
-identity_assert_contains(
-	'$this->is_external_agent_user($user) || $can_continue_assigned_preparation',
-	$save_source,
-	'Admissions continuation must revalidate that the selected owner still has a complete Agency Profile.'
-);
+identity_assert_same(false, false !== strpos($save_source, 'can_continue_assigned_preparation'), 'Assigned agency drafts must not retain an internal continuation bypass.');
 
 $create_agent_source = identity_method($reflection, 'rest_create_agent');
 $create_agent_source = implode('', array_slice($source_lines, $create_agent_source->getStartLine() - 1, $create_agent_source->getEndLine() - $create_agent_source->getStartLine() + 1));
@@ -854,7 +833,7 @@ $GLOBALS['mc_identity_fail_table_write'] = null;
 $GLOBALS['mc_identity_current_user_id'] = 10;
 
 $plugin_source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-identity_assert_contains('Version: 0.2.73', $plugin_source, 'The plugin header must advertise 0.2.73.');
+identity_assert_contains('Version: 0.2.74', $plugin_source, 'The plugin header must advertise 0.2.74.');
 identity_assert_contains("\$owner_identity['agencyName']", $plugin_source, 'Application saves must use authoritative agency identity.');
 identity_assert_contains("\$owner_identity['consultantName']", $plugin_source, 'Application saves must use the owning Agency Profile contact.');
 identity_assert_contains('$identity_safe_draft', $plugin_source, 'Test-data inference must use the authoritative identity overlay.');

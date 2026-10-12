@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.73
+ * Version: 0.2.74
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -2941,6 +2941,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 			try {
 				$user = $this->current_session_user();
+				$params = $this->authorize_external_agent_email_payload($params, $user);
 				$recipients = $this->resolve_email_recipients($params);
 
 				if (empty($recipients)) {
@@ -3003,6 +3004,129 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 
 				return $this->json_error_response($error->getMessage(), 400);
 			}
+		}
+
+		private function normalize_email_role_set($roles) {
+			$normalized = array();
+			foreach ((array) $roles as $role) {
+				$role = sanitize_key((string) $role);
+				if ('' !== $role) {
+					$normalized[] = $role;
+				}
+			}
+
+			$normalized = array_values(array_unique($normalized));
+			sort($normalized, SORT_STRING);
+
+			return $normalized;
+		}
+
+		private function authorize_external_agent_email_payload($params, $user) {
+			global $wpdb;
+
+			if (!$this->is_external_agent_user($user)) {
+				return $params;
+			}
+
+			$application_context = isset($params['application']) && is_array($params['application'])
+				? $params['application']
+				: array();
+			$application_id = sanitize_text_field((string) ($application_context['id'] ?? ''));
+			if ('' === $application_id) {
+				throw new Exception('An application is required for external-agent email delivery.');
+			}
+
+			$application = $this->get_authorized_application_base($application_id, $user);
+			if (
+				(int) ($application['wordpressUserId'] ?? 0) !== (int) ($user['id'] ?? 0)
+				|| !empty($application['isTestData'])
+			) {
+				throw new Exception('External-agent email delivery is not allowed for this application.');
+			}
+
+			$status = $this->canonical_status_key((string) ($application['status'] ?? ''));
+			$active_statuses = array(
+				'review-pending',
+				'offer-issued',
+				'prepayment-pending',
+				'acceptance-issued',
+				'migration-documents',
+				'entry-permit-processing',
+				'arrival-immigration',
+				'enrollment-complete',
+			);
+			if (!in_array($status, $active_statuses, true)) {
+				throw new Exception('Draft, inactive, or unknown-status applications cannot send email.');
+			}
+
+			$authoritative_context = array(
+				'id' => (string) ($application['id'] ?? $application_id),
+				'referenceCode' => (string) ($application['referenceCode'] ?? ''),
+				'fullName' => (string) ($application['fullName'] ?? ''),
+			);
+			if (
+				$this->can_manage_foundation_advancement($user)
+				&& $this->is_foundation_advancement_programme((string) ($application['programmeCode'] ?? ''))
+			) {
+				$params['application'] = $authoritative_context;
+				return $params;
+			}
+
+			if (!empty($params['to']) || !empty($params['attachments'])) {
+				throw new Exception('External agents cannot choose direct email recipients or attachments.');
+			}
+
+			$notification_kind = sanitize_key((string) ($params['notificationKind'] ?? ''));
+			$requested_roles = $this->normalize_email_role_set($params['roles'] ?? array());
+			$payload = null;
+
+			if ('review-submission' === $notification_kind) {
+				$expected_roles = array('administrator', 'admissions-officer');
+				if (
+					'review-pending' !== $status
+					|| $this->normalize_email_role_set($expected_roles) !== $requested_roles
+				) {
+					throw new Exception('Review-submission email is allowed only after the owned application enters review.');
+				}
+
+				$payload = $this->application_activity_alert_payload(
+					$application,
+					$user,
+					'new-application-submitted'
+				);
+			} elseif ('agent-bank-confirmation-upload' === $notification_kind) {
+				$expected_roles = array('admissions-officer', 'finance-officer');
+				if ($this->normalize_email_role_set($expected_roles) !== $requested_roles) {
+					throw new Exception('Bank-confirmation email has invalid role recipients.');
+				}
+
+				$this->assert_bank_transaction_confirmation_available($application_id);
+				$document = $wpdb->get_row(
+					$wpdb->prepare(
+						"SELECT originalName FROM {$this->documents_table} WHERE applicationId = %s AND type = 'bankTransactionConfirmation' AND isReady = 1 LIMIT 1",
+						$application_id
+					),
+					ARRAY_A
+				);
+				$payload = $this->application_activity_alert_payload(
+					$application,
+					$user,
+					'agent-document-uploaded',
+					'bankTransactionConfirmation',
+					is_array($document) ? ($document['originalName'] ?? null) : null
+				);
+			} else {
+				throw new Exception('External-agent email delivery requires an approved notification kind.');
+			}
+
+			return array_merge(
+				$params,
+				$payload,
+				array(
+					'application' => $authoritative_context,
+					'attachments' => array(),
+				)
+			);
 		}
 
 		private function resolve_email_recipients($params) {
@@ -3507,7 +3631,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		private function send_application_activity_alert($application, $user, $event_type, $document_type = null, $file_name = null) {
-			if (!empty($application['isTestData'])) {
+			if (
+				!empty($application['isTestData'])
+				|| 'profile-preparation' === $this->canonical_status_key($application['status'] ?? '')
+			) {
 				return array(
 					'ok' => false,
 					'skipped' => true,
@@ -3592,7 +3719,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		}
 
 		private function send_application_role_notification($application, $user, $payload) {
-			if (!empty($application['isTestData'])) {
+			if (
+				!empty($application['isTestData'])
+				|| 'profile-preparation' === $this->canonical_status_key($application['status'] ?? '')
+			) {
 				return array(
 					'ok' => false,
 					'skipped' => true,
@@ -4298,9 +4428,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
-		// Count generated letters of a given template for the dashboard summary.
-		// Staff see all; agents are scoped to their own applications. Returns 0
-		// defensively if the Prisma-managed letters table is not present.
+		// Count generated letters of a given template for the dashboard summary,
+		// using the same draft-privacy predicate as the application board.
+		// Returns 0 defensively if the Prisma-managed letters table is not present.
 		private function count_generated_letters($user, $template_id) {
 			global $wpdb;
 
@@ -4311,24 +4441,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				return 0;
 			}
 
-			if ($this->can_view_all_applications($user)) {
-				return (int) $wpdb->get_var(
-					$wpdb->prepare(
-						"SELECT COUNT(DISTINCT letter.applicationId) FROM {$letters_table} letter
-						INNER JOIN {$this->applications_table} app ON app.id = letter.applicationId
-						WHERE letter.templateId = %s AND app.status <> 'trashed'",
-						$template_id
-					)
-				);
-			}
+			$visibility = $this->application_visibility_where_sql($user, 'app');
+			$query_args = array_merge($visibility['args'], array($template_id));
 
 			return (int) $wpdb->get_var(
 				$wpdb->prepare(
 					"SELECT COUNT(DISTINCT letter.applicationId) FROM {$letters_table} letter
 					INNER JOIN {$this->applications_table} app ON app.id = letter.applicationId
-					WHERE letter.templateId = %s AND app.wordpressUserId = %d AND app.status <> 'trashed'",
-					$template_id,
-					(int) $user['id']
+					{$visibility['sql']} AND app.status <> 'trashed' AND letter.templateId = %s",
+					$query_args
 				)
 			);
 		}
@@ -4342,13 +4463,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			try {
 				$user = $this->current_session_user();
 				$external_agent_view = !$this->can_view_all_applications($user);
-
-				$where = '';
-				$args = array();
-				if ($external_agent_view) {
-					$where = 'WHERE wordpressUserId = %d';
-					$args[] = (int) $user['id'];
-				}
+				$visibility = $this->application_visibility_where_sql($user);
+				$where = $visibility['sql'];
+				$args = $visibility['args'];
 				$args[] = 50;
 
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
@@ -5136,6 +5253,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$query_args[] = $since['createdAt'];
 					$query_args[] = $since['id'];
 				}
+				$visibility = $this->application_visibility_condition_sql($user, 'app');
+				$query_args = array_merge($query_args, $visibility['args']);
 				$query_args[] = $upper_bound_mysql;
 				$query_args[] = self::NOTIFICATION_EVENT_PAGE_SIZE;
 
@@ -5153,6 +5272,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						INNER JOIN {$this->applications_table} app ON app.id = activity.applicationId
 						WHERE activity.actorRole = 'agent'
 						AND {$cursor_filter_sql}
+						AND {$visibility['sql']}
 						AND activity.createdAt <= %s
 						AND activity.kind IN ('workflow', '{$notification_document_kind}')
 						AND COALESCE(app.isTestData, 0) = 0
@@ -6600,22 +6720,13 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			return !empty($user['roles']) && count(array_intersect($allowed_roles, (array) $user['roles'])) > 0;
 		}
 
-		private function can_continue_assigned_preparation($user, $status) {
-			return $this->can_assign_application_owner($user)
-				&& in_array(
-					trim((string) $status),
-					array('profile-preparation', 'Draft', 'Application in progress'),
-					true
-				);
-		}
-
 		private function can_submit_prepared_application($user, $status) {
 			return in_array(
 				trim((string) $status),
 				array('profile-preparation', 'Draft', 'Application in progress'),
 				true
 			)
-				&& ($this->is_agent_user($user) || $this->can_continue_assigned_preparation($user, $status));
+				&& $this->is_agent_user($user);
 		}
 
 		private function resolve_application_owner($user, $assigned_agent_id, $programme_code = '') {
@@ -6759,6 +6870,56 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			);
 
 			return count(array_intersect($staff_roles, (array) $user['roles'])) > 0;
+		}
+
+		private function can_access_application($application, $user) {
+			$user_id = (int) ($user['id'] ?? 0);
+			$owner_user_id = (int) ($application['wordpressUserId'] ?? 0);
+			if ($user_id > 0 && $owner_user_id === $user_id) {
+				return true;
+			}
+
+			return (
+				$this->can_manage_foundation_advancement($user)
+				&& $this->is_foundation_advancement_programme(
+					(string) ($application['programmeCode'] ?? '')
+				)
+			) || (
+				$this->can_view_all_applications($user)
+				&& 'profile-preparation' !== $this->canonical_status_key(
+					(string) ($application['status'] ?? '')
+				)
+			);
+		}
+
+		private function application_visibility_condition_sql($user, $table_alias = '') {
+			$prefix = '' !== (string) $table_alias ? (string) $table_alias . '.' : '';
+			if (!$this->can_view_all_applications($user)) {
+				return array(
+					'sql' => $prefix . 'wordpressUserId = %d',
+					'args' => array((int) $user['id']),
+				);
+			}
+
+			$conditions = array(
+				$prefix . 'wordpressUserId = %d',
+				$prefix . "status IN ('review-pending', 'offer-issued', 'prepayment-pending', 'acceptance-issued', 'migration-documents', 'entry-permit-processing', 'arrival-immigration', 'enrollment-complete', 'rejected', 'trashed', 'Under review', 'Offer letter issued', 'Payment pending', 'Acceptance confirmed', 'Entry permit processing', 'Ready to enroll')",
+			);
+			if ($this->can_manage_foundation_advancement($user)) {
+				$conditions[] = $prefix . "programmeCode IN ('foundation-advancement-hotel-casino-resort-management', 'foundation-advancement-business-administration')";
+			}
+
+			return array(
+				'sql' => '(' . implode(' OR ', $conditions) . ')',
+				'args' => array((int) $user['id']),
+			);
+		}
+
+		private function application_visibility_where_sql($user, $table_alias = '') {
+			$visibility = $this->application_visibility_condition_sql($user, $table_alias);
+			$visibility['sql'] = 'WHERE ' . $visibility['sql'];
+
+			return $visibility;
 		}
 
 		private function user_has_any_role($user, $roles) {
@@ -7789,6 +7950,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			foreach ((array) $applications as $application) {
+				$status = $this->canonical_status_key($application['status'] ?? '');
+				if (!empty($application['isTestData']) || 'profile-preparation' === $status) {
+					continue;
+				}
+
 				$year = $this->normalize_intake_year($application['year'] ?? '');
 				if (1 !== preg_match('/^[0-9]{4}$/', $year)) {
 					continue;
@@ -7805,11 +7971,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					$accepted_by_year[$year] = 0;
 				}
 
-				$status = $this->canonical_status_key($application['status'] ?? '');
 				$reviewer_decision = strtolower(trim((string) ($application['reviewerDecision'] ?? '')));
 				if (
-					!empty($application['isTestData'])
-					|| in_array($status, array('rejected', 'trashed'), true)
+					in_array($status, array('rejected', 'trashed'), true)
 					|| 'academically-cleared' !== $reviewer_decision
 				) {
 					continue;
@@ -7979,10 +8143,9 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$refund_currency_sql = "COALESCE((SELECT refund.currency FROM {$this->refund_records_table} refund WHERE refund.applicationId = app.id ORDER BY refund.updatedAt DESC, refund.createdAt DESC, refund.id DESC LIMIT 1), 'EUR')";
 			}
 
-			if (!$this->can_view_all_applications($user)) {
-				$where_sql = 'WHERE app.wordpressUserId = %d';
-				$query_args[] = (int) $user['id'];
-			}
+			$visibility = $this->application_visibility_where_sql($user, 'app');
+			$where_sql = $visibility['sql'];
+			$query_args = $visibility['args'];
 
 			// High safety cap only; the board shows every application (matches the desktop, which has no limit).
 			$query_args[] = 5000;
@@ -8401,7 +8564,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Application not found.');
 			}
 
-			if (!$this->can_view_all_applications($user) && (int) $application['wordpressUserId'] !== (int) $user['id']) {
+			if (!$this->can_access_application($application, $user)) {
 				throw new Exception('You are not allowed to access this application.');
 			}
 
@@ -9162,18 +9325,6 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				$this->assert_admission_letter_generation_available($application, $template_id);
 				$is_foundation_advancement = $this->is_foundation_advancement_programme(
 					isset($application['programmeCode']) ? (string) $application['programmeCode'] : ''
-				);
-				$owner_user_id = isset($application['wordpressUserId']) ? (int) $application['wordpressUserId'] : 0;
-				$owner_identity = $this->authoritative_agency_contact(
-					$owner_user_id,
-					$application,
-					true
-				);
-				$this->assert_review_submission_complete(
-					$this->application_record_to_review_draft($application),
-					$owner_identity,
-					$owner_user_id,
-					$application_id
 				);
 				$is_first_foundation_advancement_acceptance_issuance =
 					$is_foundation_advancement
@@ -11330,16 +11481,15 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 							throw new Exception('Foundation advancement applications must be owned by MC-ADMISSIONS-DPT. Start a new application so ownership can be assigned correctly.');
 						}
 					}
-					$can_continue_assigned_preparation = $this->can_continue_assigned_preparation($user, $existing_application['status']);
 					$can_edit_foundation_advancement = $is_foundation_advancement
 						&& $this->can_manage_foundation_advancement($user);
-					if (!$this->can_edit_application_data($user) && !$can_continue_assigned_preparation && !$can_edit_foundation_advancement) {
+					if (!$this->can_edit_application_data($user) && !$can_edit_foundation_advancement) {
 						throw new Exception('You do not have permission to edit application data.');
 					}
 					$owner_identity = $this->authoritative_agency_contact(
 						isset($existing_application['wordpressUserId']) ? (int) $existing_application['wordpressUserId'] : 0,
 						$existing_application,
-						$this->is_external_agent_user($user) || $can_continue_assigned_preparation
+						$this->is_external_agent_user($user)
 					);
 					$identity_safe_draft = array_merge(
 						$draft,
@@ -11382,7 +11532,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 					);
 
 					if ('review' === $mode && !$is_submitting_prepared_application) {
-						throw new Exception('Only an agent, administrator, or Admissions Officer can submit an application that is still in preparation.');
+						throw new Exception('Only the owning agency account can submit an application that is still in preparation.');
 					}
 					if ($is_submitting_prepared_application || $requires_complete_active_application) {
 						$this->assert_review_submission_complete(
@@ -11676,7 +11826,7 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				throw new Exception('Only an administrator can move applications to or restore them from Trash.');
 			}
 
-			if (!$this->can_view_all_applications($user) && (int) $existing['wordpressUserId'] !== (int) $user['id']) {
+			if (!$this->can_access_application($existing, $user)) {
 				throw new Exception('You are not allowed to update this application.');
 			}
 
@@ -12416,11 +12566,12 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			$existing = $this->get_authorized_application_base($application_id, $user);
 
 			$existing_status = $this->canonical_status_key((string) $existing['status']);
+			$is_preparation_draft = 'profile-preparation' === $existing_status;
 			$is_review_stage = 'review-pending' === $existing_status;
 			$is_accepted_active_case = 'academically-cleared' === (string) $existing['reviewerDecision']
 				&& !in_array($existing_status, array('rejected', 'trashed'), true);
-			if (!$is_review_stage && !$is_accepted_active_case) {
-				throw new Exception('Only an application awaiting review or an active academically-cleared application can be rejected.');
+			if (!$is_preparation_draft && !$is_review_stage && !$is_accepted_active_case) {
+				throw new Exception('Only a preparation draft, an application awaiting review, or an active academically-cleared application can be rejected.');
 			}
 
 			$application = $this->update_admission_application_operations(
