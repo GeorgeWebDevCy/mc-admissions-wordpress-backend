@@ -776,6 +776,28 @@ $agent_case_fixture = array_merge(
 			'uploadedByName' => 'Internal Staff',
 			'storageItemId' => 'private-storage-id',
 		), array(
+			'id' => 'agency-agreement-document',
+			'type' => 'agencyAgreement',
+			'label' => 'Agency agreement',
+			'isReady' => true,
+			'uploadedUrl' => '/api/admissions/application-1/documents/agency-agreement-document/file',
+			'originalName' => 'agency-agreement.pdf',
+			'mimeType' => 'application/pdf',
+			'fileSizeBytes' => 18,
+			'uploadedAt' => '2026-07-29T12:05:00.000Z',
+			'uploadedByName' => 'Offline Agent',
+		), array(
+			'id' => 'authorization-certificate-document',
+			'type' => 'authorizationCertificate',
+			'label' => 'Authorization certificate',
+			'isReady' => true,
+			'uploadedUrl' => '/api/admissions/application-1/documents/authorization-certificate-document/file',
+			'originalName' => 'authorization-certificate.pdf',
+			'mimeType' => 'application/pdf',
+			'fileSizeBytes' => 20,
+			'uploadedAt' => '2026-07-29T12:06:00.000Z',
+			'uploadedByName' => 'Offline Agent',
+		), array(
 			'id' => 'medical-document',
 			'type' => 'medicalCertificate',
 			'label' => 'Medical certificate',
@@ -837,7 +859,12 @@ foreach (array(
 	);
 }
 document_assert_same('approved', $filtered_agent_case['permitStatus'], 'Agent case responses must expose the current permit status.');
-document_assert_same(1, count($filtered_agent_case['documents']), 'Agent case responses must retain submitted document metadata.');
+document_assert_same(3, count($filtered_agent_case['documents']), 'Agent case responses must retain every agency-side submitted document.');
+document_assert_same(
+	array('passport', 'agencyAgreement', 'authorizationCertificate'),
+	array_column($filtered_agent_case['documents'], 'type'),
+	'Agent case responses must retain application-level agency onboarding uploads for edit hydration.'
+);
 document_assert_same(
 	'/api/admissions/application-1/documents/passport-document/file',
 	$filtered_agent_case['documents'][0]['uploadedUrl'],
@@ -940,6 +967,28 @@ $agent_library_db->rows_results = array(
 			'uploadedUrl' => '/api/admissions/application-1/documents/passport-document/file',
 		),
 		array(
+			'id' => 'agency-agreement-document',
+			'type' => 'agencyAgreement',
+			'label' => 'Agency agreement',
+			'originalName' => 'agency-agreement.pdf',
+			'uploadedByName' => 'Offline Agent',
+			'uploadedAt' => '2026-07-29 12:05:00.000',
+			'createdAt' => '2026-07-29 12:05:00.000',
+			'mimeType' => 'application/pdf',
+			'uploadedUrl' => '/api/admissions/application-1/documents/agency-agreement-document/file',
+		),
+		array(
+			'id' => 'authorization-certificate-document',
+			'type' => 'authorizationCertificate',
+			'label' => 'Authorization certificate',
+			'originalName' => 'authorization-certificate.pdf',
+			'uploadedByName' => 'Offline Agent',
+			'uploadedAt' => '2026-07-29 12:06:00.000',
+			'createdAt' => '2026-07-29 12:06:00.000',
+			'mimeType' => 'application/pdf',
+			'uploadedUrl' => '/api/admissions/application-1/documents/authorization-certificate-document/file',
+		),
+		array(
 			'id' => 'medical-document',
 			'type' => 'medicalCertificate',
 			'label' => 'Medical certificate',
@@ -957,8 +1006,12 @@ $GLOBALS['wpdb'] = $agent_library_db;
 $agent_library = $plugin->rest_get_document_library();
 document_assert_same(200, $agent_library->get_status(), 'Agents must retain their scoped document library.');
 $agent_library_application = $agent_library->get_data()['applications'][0];
-document_assert_same(1, count($agent_library_application['documents']), 'The agent document library must exclude staff-side migration and immigration documents.');
-document_assert_same('passport', $agent_library_application['documents'][0]['type'], 'The agent document library must retain intake-side documents.');
+document_assert_same(3, count($agent_library_application['documents']), 'The agent document library must retain agency-side documents while excluding staff-side migration and immigration documents.');
+document_assert_same(
+	array('passport', 'agencyAgreement', 'authorizationCertificate'),
+	array_column($agent_library_application['documents'], 'type'),
+	'The agent document library must retain intake and agency-onboarding documents.'
+);
 document_assert_same(false, array_key_exists('uploadedByName', $agent_library_application['documents'][0]), 'The agent document library must not expose internal uploader identity.');
 document_assert_same(false, array_key_exists('generatedByName', $agent_library_application['generatedLetters'][0]), 'The agent document library must not expose internal letter generator identity.');
 $agent_library_events = implode("\n", $agent_library_db->events);
