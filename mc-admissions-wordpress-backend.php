@@ -3,7 +3,7 @@
  * Plugin Name: MC Admissions WordPress Backend
  * Plugin URI: https://www.mesoyios.ac.cy/
  * Description: WordPress REST backend for the MC Admissions desktop app.
- * Version: 0.2.75
+ * Version: 0.2.76
  * Requires at least: 6.2
  * Author: Mesoyios College
  * Author URI: https://www.mesoyios.ac.cy/
@@ -25,6 +25,8 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 		const DEFAULT_SOURCE = 'mc-admissions-wordpress';
 		const INITIAL_APPLICATION_STATUS = 'Application in progress';
 		const STALE_APPLICATION_ERROR = 'This application changed since you opened it. Refresh and try again.';
+		const DUPLICATE_PASSPORT_ERROR = 'A student with this passport number already has an active application.';
+		const PASSPORT_CHECK_UNAVAILABLE_ERROR = 'Unable to verify this passport number right now. Please try again.';
 		const STALE_INTAKE_CAPACITY_ERROR = 'This placement availability record changed since you opened it. Refresh and try again.';
 		const AUTH_EPOCH_META_KEY = 'mc_admissions_auth_epoch';
 		const AUTH_EPOCH_CLAIM = 'mcAdmissionsAuthEpoch';
@@ -1726,6 +1728,16 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						'callback' => array($this, 'rest_update_workflow'),
 						'permission_callback' => array($this, 'permission_authenticated'),
 					),
+				)
+			);
+
+			register_rest_route(
+				self::API_NAMESPACE,
+				'/applications/passport-check',
+				array(
+					'methods' => WP_REST_Server::CREATABLE,
+					'callback' => array($this, 'rest_check_application_passport'),
+					'permission_callback' => array($this, 'permission_authenticated'),
 				)
 			);
 
@@ -5859,6 +5871,78 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 		}
 
+		public function rest_check_application_passport(WP_REST_Request $request) {
+			$params = $request->get_json_params();
+			$passport_number = is_array($params) && array_key_exists('passportNumber', $params)
+				? $params['passportNumber']
+				: null;
+
+			if (!is_string($passport_number) || '' === $this->normalize_passport_number_for_duplicate_check($passport_number)) {
+				return new WP_REST_Response(
+					array(
+						'ok' => false,
+						'duplicate' => false,
+						'error' => 'A passport number is required.',
+					),
+					400
+				);
+			}
+
+			try {
+				$user = $this->current_session_user();
+				if (!$this->is_external_agent_user($user)) {
+					return new WP_REST_Response(array('ok' => true, 'duplicate' => false), 200);
+				}
+
+				$exclude_application_id = null;
+				$requested_application_id = is_array($params) && isset($params['applicationId'])
+					? trim((string) $params['applicationId'])
+					: '';
+				if ('' !== $requested_application_id) {
+					try {
+						$current_application = $this->get_authorized_application_base(
+							$requested_application_id,
+							$user
+						);
+						$exclude_application_id = isset($current_application['id'])
+							? (string) $current_application['id']
+							: null;
+					} catch (Exception $authorization_error) {
+						// Do not reveal whether a record owned by another agency exists.
+						// Ignoring an unauthorized exclusion also prevents it from being
+						// used to hide a real duplicate from this preflight check.
+						$exclude_application_id = null;
+					}
+				}
+
+				$duplicate = $this->duplicate_passport_application_exists(
+					$passport_number,
+					$exclude_application_id
+				);
+				if ($duplicate) {
+					return new WP_REST_Response(
+						array(
+							'ok' => false,
+							'duplicate' => true,
+							'error' => self::DUPLICATE_PASSPORT_ERROR,
+						),
+						409
+					);
+				}
+
+				return new WP_REST_Response(array('ok' => true, 'duplicate' => false), 200);
+			} catch (Exception $error) {
+				return new WP_REST_Response(
+					array(
+						'ok' => false,
+						'duplicate' => false,
+						'error' => self::PASSPORT_CHECK_UNAVAILABLE_ERROR,
+					),
+					503
+				);
+			}
+		}
+
 		public function rest_save_application(WP_REST_Request $request) {
 			$params = $request->get_json_params();
 
@@ -5898,13 +5982,17 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			} catch (Exception $error) {
 				$message = $error->getMessage();
 				$status = self::STALE_APPLICATION_ERROR === $message
+					|| self::DUPLICATE_PASSPORT_ERROR === $message
 					|| $this->is_capacity_conflict_message($message)
 					? 409
-					: (
+					: (self::PASSPORT_CHECK_UNAVAILABLE_ERROR === $message
+						? 503
+						: (
 						false !== stripos($message, 'foundation advancement')
 						&& false !== stripos($message, 'permission')
 							? 403
 							: 400
+						)
 					);
 				return $this->json_error_response($error->getMessage(), $status);
 			}
@@ -7661,6 +7749,95 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			}
 
 			return in_array($status, $this->pipeline_stages, true) ? $status : self::INITIAL_APPLICATION_STATUS;
+		}
+
+		private function normalize_passport_number_for_duplicate_check($passport_number) {
+			if (!is_scalar($passport_number)) {
+				return '';
+			}
+
+			$normalized = preg_replace('/[^A-Z0-9]+/', '', strtoupper(trim((string) $passport_number)));
+
+			return is_string($normalized) ? $normalized : '';
+		}
+
+		private function passport_duplicate_lock_name($normalized_passport_number) {
+			return 'mc_passport_' . substr(hash('sha256', (string) $normalized_passport_number), 0, 40);
+		}
+
+		private function acquire_passport_duplicate_lock($normalized_passport_number) {
+			global $wpdb;
+
+			$lock_name = $this->passport_duplicate_lock_name($normalized_passport_number);
+			$acquired = $wpdb->get_var(
+				$wpdb->prepare('SELECT GET_LOCK(%s, 10)', $lock_name)
+			);
+			if (1 !== (int) $acquired) {
+				throw new Exception(self::PASSPORT_CHECK_UNAVAILABLE_ERROR);
+			}
+
+			return $lock_name;
+		}
+
+		private function release_passport_duplicate_lock($lock_name) {
+			global $wpdb;
+
+			if ('' === trim((string) $lock_name)) {
+				return;
+			}
+
+			$wpdb->get_var(
+				$wpdb->prepare('SELECT RELEASE_LOCK(%s)', (string) $lock_name)
+			);
+		}
+
+		private function duplicate_passport_application_exists($passport_number, $exclude_application_id = null) {
+			global $wpdb;
+
+			$normalized_passport_number = $this->normalize_passport_number_for_duplicate_check($passport_number);
+			if ('' === $normalized_passport_number) {
+				return false;
+			}
+
+			$sql = "
+				SELECT id, passportNumber, status
+				FROM {$this->applications_table}
+				WHERE COALESCE(isTestData, 0) = 0
+					AND passportNumber IS NOT NULL
+					AND TRIM(passportNumber) <> ''
+				ORDER BY createdAt ASC
+			";
+
+			// Normalize only the minimal private fields in-process instead of relying
+			// on a database-specific regular-expression function. The REST response
+			// never receives or exposes these rows.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$matches = $wpdb->get_results($sql, ARRAY_A);
+			if (!is_array($matches)) {
+				throw new Exception(self::PASSPORT_CHECK_UNAVAILABLE_ERROR);
+			}
+
+			foreach ($matches as $match) {
+				if (
+					null !== $exclude_application_id
+					&& (string) $exclude_application_id === (string) ($match['id'] ?? '')
+				) {
+					continue;
+				}
+				if (
+					$normalized_passport_number !== $this->normalize_passport_number_for_duplicate_check(
+						isset($match['passportNumber']) ? $match['passportNumber'] : ''
+					)
+				) {
+					continue;
+				}
+				$status_key = $this->canonical_status_key(isset($match['status']) ? (string) $match['status'] : '');
+				if ('rejected' !== $status_key) {
+					return true;
+				}
+			}
+
+			return false;
 		}
 
 		private function canonical_status_key($status) {
@@ -11460,16 +11637,40 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 				? (bool) $params['isTestData']
 				: null;
 			$should_notify_review_submission = false;
+			$passport_lock_name = null;
+			$next_normalized_passport = $this->normalize_passport_number_for_duplicate_check(
+				isset($draft['passportNumber']) ? $draft['passportNumber'] : ''
+			);
+			$should_guard_passport = $this->is_external_agent_user($user)
+				&& !$is_foundation_advancement
+				&& '' !== $next_normalized_passport;
 
 			if (false === $wpdb->query('START TRANSACTION')) {
 				throw new Exception('Unable to start the application save transaction.');
 			}
 
 			try {
+				if ($should_guard_passport) {
+					// Acquire before any transactional application/profile read. A second
+					// same-passport save cannot establish an older consistent snapshot
+					// while it waits for the first save to commit.
+					$passport_lock_name = $this->acquire_passport_duplicate_lock($next_normalized_passport);
+				}
 				if ($record_id) {
 					$existing_application = $this->get_authorized_application_base($record_id, $user, true);
 					if ((string) $existing_application['updatedAt'] !== (string) $expected_version) {
 						throw new Exception(self::STALE_APPLICATION_ERROR);
+					}
+					$existing_normalized_passport = $this->normalize_passport_number_for_duplicate_check(
+						isset($existing_application['passportNumber']) ? $existing_application['passportNumber'] : ''
+					);
+					if (
+						$should_guard_passport
+						&& $next_normalized_passport !== $existing_normalized_passport
+					) {
+						if ($this->duplicate_passport_application_exists($next_normalized_passport, $record_id)) {
+							throw new Exception(self::DUPLICATE_PASSPORT_ERROR);
+						}
 					}
 					$existing_is_foundation_advancement = $this->is_foundation_advancement_programme(
 						isset($existing_application['programmeCode']) ? (string) $existing_application['programmeCode'] : ''
@@ -11658,6 +11859,11 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 						'Unable to record the application activity.'
 					);
 				} else {
+					if ($should_guard_passport) {
+						if ($this->duplicate_passport_application_exists($next_normalized_passport)) {
+							throw new Exception(self::DUPLICATE_PASSPORT_ERROR);
+						}
+					}
 					$owner = $this->resolve_application_owner(
 						$user,
 						$assigned_agent_id,
@@ -11773,6 +11979,10 @@ if (!class_exists('MC_Admissions_WordPress_Backend')) {
 			} catch (Exception $error) {
 				$wpdb->query('ROLLBACK');
 				throw $error;
+			} finally {
+				if (null !== $passport_lock_name) {
+					$this->release_passport_duplicate_lock($passport_lock_name);
+				}
 			}
 
 			$application = $this->get_detailed_application_record($record_id);

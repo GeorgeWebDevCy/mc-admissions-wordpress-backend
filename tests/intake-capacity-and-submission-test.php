@@ -62,6 +62,7 @@ final class MC_Intake_Test_Wpdb {
 	public $reservations = array();
 	public $generatedLetters = array();
 	public $annualSeatApplications = array();
+	public $duplicateApplications = array();
 	public $historicalOfferCandidates = array();
 	public $lockedHistoricalApplications = array();
 	public $paymentTransactions = array();
@@ -71,8 +72,11 @@ final class MC_Intake_Test_Wpdb {
 	public $fail_activity_write = false;
 	public $fail_post_commit_reload = false;
 	public $failAnnualSeatQuery = false;
+	public $forcePassportLockBusy = false;
+	public $failPassportQuery = false;
 	public $last_error = '';
 	public $missingTables = array();
+	public $locks = array();
 	private $snapshot = null;
 	private $committed = false;
 	private $version_tick = 0;
@@ -108,6 +112,19 @@ final class MC_Intake_Test_Wpdb {
 
 	public function get_var($prepared) {
 		$call = $this->unpack($prepared);
+		if (false !== strpos($call['query'], 'SELECT GET_LOCK')) {
+			$lock_name = (string) ($call['args'][0] ?? '');
+			$this->events[] = 'lock:' . $lock_name;
+			if ($this->forcePassportLockBusy || isset($this->locks[$lock_name])) return 0;
+			$this->locks[$lock_name] = true;
+			return 1;
+		}
+		if (false !== strpos($call['query'], 'SELECT RELEASE_LOCK')) {
+			$lock_name = (string) ($call['args'][0] ?? '');
+			$this->events[] = 'unlock:' . $lock_name;
+			unset($this->locks[$lock_name]);
+			return 1;
+		}
 		if (false !== strpos($call['query'], 'SHOW TABLES LIKE')) {
 			$table = isset($call['args'][0]) ? (string) $call['args'][0] : '';
 			return in_array($table, $this->missingTables, true) ? null : $table;
@@ -201,6 +218,17 @@ final class MC_Intake_Test_Wpdb {
 		$call = $this->unpack($prepared);
 		$query = $call['query'];
 		$args = $call['args'];
+		if (
+			false !== strpos($query, 'SELECT id, passportNumber, status')
+			&& false !== strpos($query, 'passportNumber IS NOT NULL')
+		) {
+			$this->events[] = 'passport_lookup:' . trim((string) preg_replace('/\s+/', ' ', $query));
+			if ($this->failPassportQuery) return null;
+			return array_values(array_filter($this->duplicateApplications, static function ($application) {
+				return empty($application['isTestData'])
+					&& '' !== trim((string) ($application['passportNumber'] ?? ''));
+			}));
+		}
 		if (false !== strpos($query, 'SELECT year, programmeCode, status, reviewerDecision, isTestData')) {
 			if ($this->failAnnualSeatQuery) {
 				$this->last_error = 'Offline annual seat query failure.';
@@ -476,8 +504,12 @@ final class MC_Intake_Test_Wpdb {
 		$this->fail_activity_write = false;
 		$this->fail_post_commit_reload = false;
 		$this->failAnnualSeatQuery = false;
+		$this->forcePassportLockBusy = false;
+		$this->failPassportQuery = false;
 		$this->last_error = '';
 		$this->missingTables = array();
+		$this->duplicateApplications = array();
+		$this->locks = array();
 	}
 }
 
@@ -740,6 +772,339 @@ intake_assert_throws_contains('valid calendar date', static function () use ($no
 intake_assert_throws_contains('dd/mm/yyyy', static function () use ($normalize_draft, $plugin) {
 	$normalize_draft->invoke($plugin, intake_draft(array('submissionDate' => '08/20/2026')), true);
 }, 'Ambiguous US submission dates must be rejected.');
+
+// An external agent may not create a second live case for the same passport.
+// The preflight response must remain deliberately generic: it may say that a
+// duplicate exists, but must never disclose its case, student, or agency data.
+$blocking_passport_statuses = array(
+	'Application in progress',
+	'Under review',
+	'offer-issued',
+	'prepayment-pending',
+	'acceptance-issued',
+	'migration-documents',
+	'entry-permit-processing',
+	'arrival-immigration',
+	'enrollment-complete',
+	'trashed',
+	'Unexpected legacy state',
+);
+foreach ($blocking_passport_statuses as $blocking_status) {
+	$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+	$GLOBALS['wpdb']->duplicateApplications = array(intake_application(array(
+		'id' => 'private-case-id',
+		'wordpressUserId' => 99,
+		'passportNumber' => 'ab-12 3/xy',
+		'status' => $blocking_status,
+		'isTestData' => 0,
+		'fullName' => 'Private Student Name',
+		'agencyName' => 'Private Agency Name',
+	)));
+	$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
+	$duplicate_preflight = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+		'passportNumber' => ' AB 123-XY ',
+	)));
+	intake_assert_same(409, $duplicate_preflight->get_status(), 'Every non-rejected status, including Trash and unknown legacy values, must block an external agent duplicate.');
+	intake_assert_same(
+		array('ok' => false, 'duplicate' => true, 'error' => MC_Admissions_WordPress_Backend::DUPLICATE_PASSPORT_ERROR),
+		$duplicate_preflight->get_data(),
+		'The duplicate preflight must return only its generic conflict contract.'
+	);
+	$serialized_duplicate_preflight = json_encode($duplicate_preflight->get_data());
+	intake_assert_true(false === strpos($serialized_duplicate_preflight, 'private-case-id'), 'The duplicate preflight must not disclose a matching application id.');
+	intake_assert_true(false === strpos($serialized_duplicate_preflight, 'Private Student Name'), 'The duplicate preflight must not disclose a matching student name.');
+	intake_assert_true(false === strpos($serialized_duplicate_preflight, 'Private Agency Name'), 'The duplicate preflight must not disclose a matching agency name.');
+}
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->duplicateApplications = array(intake_application(array(
+	'id' => 'rejected-case',
+	'passportNumber' => 'AB-123-XY',
+	'status' => 'rejected',
+	'isTestData' => 0,
+)));
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
+$rejected_preflight = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+	'passportNumber' => 'ab 123 xy',
+)));
+intake_assert_same(200, $rejected_preflight->get_status(), 'A rejected application must permit a new application for the same normalized passport.');
+intake_assert_same(array('ok' => true, 'duplicate' => false), $rejected_preflight->get_data(), 'Rejected-only matches must not report a duplicate.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->duplicateApplications = array(
+	intake_application(array(
+		'id' => 'rejected-mixed-case',
+		'wordpressUserId' => 99,
+		'passportNumber' => 'MIXED-123',
+		'status' => 'rejected',
+		'isTestData' => 0,
+	)),
+	intake_application(array(
+		'id' => 'active-mixed-case',
+		'wordpressUserId' => 100,
+		'passportNumber' => 'mixed 123',
+		'status' => 'migration-documents',
+		'isTestData' => 0,
+	)),
+);
+$mixed_preflight = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+	'passportNumber' => 'mixed/123',
+)));
+intake_assert_same(409, $mixed_preflight->get_status(), 'A rejected match must not hide another non-rejected match for the same normalized passport.');
+intake_assert_same(MC_Admissions_WordPress_Backend::DUPLICATE_PASSPORT_ERROR, $mixed_preflight->get_data()['error'], 'Mixed matches must retain the generic conflict message.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->duplicateApplications = array(intake_application(array(
+	'id' => 'test-case',
+	'passportNumber' => 'AB-123-XY',
+	'status' => 'acceptance-issued',
+	'isTestData' => 1,
+)));
+$test_data_preflight = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+	'passportNumber' => 'AB123XY',
+)));
+intake_assert_same(200, $test_data_preflight->get_status(), 'Stored test-data applications must not block a real external-agent passport.');
+intake_assert_same(array('ok' => true, 'duplicate' => false), $test_data_preflight->get_data(), 'Test-data-only matches must not report a duplicate.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'id' => 'application-1',
+	'wordpressUserId' => 42,
+	'passportNumber' => 'SELF-123',
+	'isTestData' => 0,
+));
+$GLOBALS['wpdb']->duplicateApplications = array($GLOBALS['wpdb']->application);
+$self_preflight = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+	'passportNumber' => 'self 123',
+	'applicationId' => 'application-1',
+)));
+intake_assert_same(200, $self_preflight->get_status(), 'Editing an application must exclude that same application from the duplicate check.');
+intake_assert_same(array('ok' => true, 'duplicate' => false), $self_preflight->get_data(), 'A self-edit must not report itself as a duplicate.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'id' => 'other-agency-case',
+	'wordpressUserId' => 99,
+	'passportNumber' => 'FORGED-123',
+	'status' => 'offer-issued',
+	'isTestData' => 0,
+));
+$GLOBALS['wpdb']->duplicateApplications = array($GLOBALS['wpdb']->application);
+$forged_exclusion_preflight = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+	'passportNumber' => 'forged 123',
+	'applicationId' => 'other-agency-case',
+)));
+intake_assert_same(409, $forged_exclusion_preflight->get_status(), 'An external agent must not suppress a conflict by supplying another agency\'s application id as the exclusion.');
+intake_assert_same(
+	array('ok' => false, 'duplicate' => true, 'error' => MC_Admissions_WordPress_Backend::DUPLICATE_PASSPORT_ERROR),
+	$forged_exclusion_preflight->get_data(),
+	'An unauthorized exclusion must still return only the generic conflict contract.'
+);
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->duplicateApplications = array(intake_application(array(
+	'id' => 'active-case',
+	'passportNumber' => 'INTERNAL-1',
+	'status' => 'enrollment-complete',
+	'isTestData' => 0,
+)));
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'), 7);
+$internal_preflight = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+	'passportNumber' => 'internal 1',
+)));
+intake_assert_same(200, $internal_preflight->get_status(), 'Internal staff must remain outside the external-agent duplicate-passport restriction.');
+intake_assert_same(array('ok' => true, 'duplicate' => false), $internal_preflight->get_data(), 'Internal preflight must not expose another case or report an external-agent conflict.');
+
+$GLOBALS['mc_intake_current_user'] = get_userdata(84);
+$advancement_owner_preflight = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+	'passportNumber' => 'internal 1',
+)));
+intake_assert_same(409, $advancement_owner_preflight->get_status(), 'The generic preflight must treat an ordinary MC-ADMISSIONS-DPT passport check like any external-agent check; the app skips this endpoint only for recognized Advancement programmes.');
+intake_assert_same(MC_Admissions_WordPress_Backend::DUPLICATE_PASSPORT_ERROR, $advancement_owner_preflight->get_data()['error'], 'The MC-ADMISSIONS-DPT ordinary preflight must retain the generic conflict message.');
+
+$missing_passport_preflight = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+	'passportNumber' => ' -- ',
+)));
+intake_assert_same(400, $missing_passport_preflight->get_status(), 'A passport preflight with no alphanumeric identifier must be rejected.');
+intake_assert_same(
+	array('ok' => false, 'duplicate' => false, 'error' => 'A passport number is required.'),
+	$missing_passport_preflight->get_data(),
+	'Invalid passport checks must retain the generic response shape.'
+);
+
+// The save command repeats the check under a per-passport advisory lock, so a
+// stale or bypassed UI preflight cannot create a duplicate. Client-supplied
+// test-data intent is never trusted to bypass this invariant.
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->duplicateApplications = array(intake_application(array(
+	'id' => 'active-save-conflict',
+	'passportNumber' => 'SAVE-123',
+	'status' => 'review-pending',
+	'isTestData' => 0,
+)));
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
+$blocked_new_draft = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'draft',
+	'isTestData' => true,
+	'draft' => intake_draft(array('passportNumber' => 'save 123', 'fullName' => 'Test Student')),
+)));
+intake_assert_same(409, $blocked_new_draft->get_status(), 'A direct new-draft save with a duplicate passport must return HTTP 409.');
+intake_assert_same(MC_Admissions_WordPress_Backend::DUPLICATE_PASSPORT_ERROR, $blocked_new_draft->get_data()['error'], 'The save conflict must use the same generic duplicate message as preflight.');
+intake_assert_same('application-1', $GLOBALS['wpdb']->application['id'], 'A blocked duplicate save must not insert an application.');
+intake_assert_same(array(), $GLOBALS['wpdb']->locks, 'The per-passport advisory lock must be released after rollback.');
+$blocked_save_events = implode("\n", $GLOBALS['wpdb']->events);
+intake_assert_true(false !== strpos($blocked_save_events, 'query:START TRANSACTION'), 'Duplicate enforcement must execute inside the application transaction.');
+$blocked_lock_position = strpos($blocked_save_events, 'lock:mc_passport_');
+$blocked_lookup_position = strpos($blocked_save_events, 'passport_lookup:');
+$blocked_rollback_position = strpos($blocked_save_events, 'query:ROLLBACK');
+$blocked_unlock_position = strpos($blocked_save_events, 'unlock:mc_passport_');
+intake_assert_true(false !== $blocked_lock_position, 'Duplicate enforcement must acquire a normalized-passport advisory lock.');
+intake_assert_true(false !== $blocked_lookup_position && $blocked_lock_position < $blocked_lookup_position, 'The advisory lock must be acquired before reading potential duplicates.');
+intake_assert_true(false !== $blocked_rollback_position && $blocked_lookup_position < $blocked_rollback_position, 'A duplicate conflict must roll back only after the protected lookup.');
+intake_assert_true(false !== $blocked_unlock_position && $blocked_rollback_position < $blocked_unlock_position, 'The advisory lock must remain held through rollback and be released in finally.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->forcePassportLockBusy = true;
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
+$lock_busy_save = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'draft',
+	'draft' => intake_draft(array('passportNumber' => 'LOCK-FAIL-1')),
+)));
+intake_assert_same(503, $lock_busy_save->get_status(), 'A passport advisory-lock timeout must fail closed with a retryable service response.');
+intake_assert_same(MC_Admissions_WordPress_Backend::PASSPORT_CHECK_UNAVAILABLE_ERROR, $lock_busy_save->get_data()['error'], 'A lock timeout must use the stable generic verification error.');
+intake_assert_same('application-1', $GLOBALS['wpdb']->application['id'], 'A lock timeout must not insert an application.');
+intake_assert_same(array(), $GLOBALS['wpdb']->locks, 'A failed lock acquisition must not leave a lock behind.');
+$lock_busy_events = implode("\n", $GLOBALS['wpdb']->events);
+intake_assert_true(false !== strpos($lock_busy_events, 'query:ROLLBACK'), 'A lock timeout must roll back the save transaction.');
+intake_assert_true(false === strpos($lock_busy_events, 'passport_lookup:'), 'A lock timeout must not perform an unprotected duplicate read.');
+intake_assert_true(false === strpos($lock_busy_events, 'unlock:mc_passport_'), 'A lock that was never acquired must not be released as if it were owned.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->failPassportQuery = true;
+$passport_query_failure = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'draft',
+	'draft' => intake_draft(array('passportNumber' => 'QUERY-FAIL-1')),
+)));
+intake_assert_same(503, $passport_query_failure->get_status(), 'A failed duplicate lookup must fail closed with a retryable service response.');
+intake_assert_same('application-1', $GLOBALS['wpdb']->application['id'], 'A failed duplicate lookup must not insert an application.');
+intake_assert_same(array(), $GLOBALS['wpdb']->locks, 'A query failure must release the acquired advisory lock.');
+$query_failure_events = implode("\n", $GLOBALS['wpdb']->events);
+intake_assert_true(false !== strpos($query_failure_events, 'passport_lookup:'), 'The query-failure fixture must reach the protected duplicate lookup.');
+intake_assert_true(false !== strpos($query_failure_events, 'query:ROLLBACK'), 'A duplicate lookup failure must roll back the transaction.');
+intake_assert_true(false !== strpos($query_failure_events, 'unlock:mc_passport_'), 'A duplicate lookup failure must release its advisory lock in finally.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->duplicateApplications = array(intake_application(array(
+	'id' => 'rejected-save-match',
+	'passportNumber' => 'REUSE-123',
+	'status' => 'rejected',
+	'isTestData' => 0,
+)));
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
+$allowed_after_rejection = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'draft',
+	'draft' => intake_draft(array('passportNumber' => 'reuse 123')),
+)));
+intake_assert_same(200, $allowed_after_rejection->get_status(), 'A rejected prior case must permit a new external-agent draft.');
+intake_assert_same('reuse 123', $GLOBALS['wpdb']->application['passportNumber'], 'The permitted replacement draft must be persisted.');
+intake_assert_same(array(), $GLOBALS['wpdb']->locks, 'The advisory lock must also be released after a successful commit.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->duplicateApplications = array(intake_application(array(
+	'id' => 'prior-active-case',
+	'wordpressUserId' => 99,
+	'passportNumber' => 'INTERNAL-CREATED-1',
+	'status' => 'arrival-immigration',
+	'isTestData' => 0,
+)));
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('administrator'), 7);
+$internal_duplicate_create = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'draft',
+	'assignedAgentId' => 42,
+	'draft' => intake_draft(array('passportNumber' => 'internal created 1')),
+)));
+intake_assert_same(200, $internal_duplicate_create->get_status(), 'Internal staff must remain able to create an ordinary duplicate when their operational workflow requires it.');
+$internally_created_application = $GLOBALS['wpdb']->application;
+intake_assert_same(0, (int) $internally_created_application['isTestData'], 'The internally created ordinary case must remain production data.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->duplicateApplications = array($internally_created_application);
+$GLOBALS['mc_intake_current_user'] = intake_wp_user(array('mc_agent'), 42);
+$agent_sees_internal_duplicate = $plugin->rest_check_application_passport(new WP_REST_Request(array(), array(
+	'passportNumber' => 'INTERNAL-CREATED-1',
+)));
+intake_assert_same(409, $agent_sees_internal_duplicate->get_status(), 'A non-test case created by internal staff must still block a later external-agent duplicate.');
+intake_assert_same(MC_Admissions_WordPress_Backend::DUPLICATE_PASSPORT_ERROR, $agent_sees_internal_duplicate->get_data()['error'], 'An internally created blocking row must remain private in the agent response.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'id' => 'application-1',
+	'wordpressUserId' => 42,
+	'passportNumber' => 'OLD-999',
+	'status' => 'Application in progress',
+	'isTestData' => 0,
+));
+$GLOBALS['wpdb']->duplicateApplications = array(intake_application(array(
+	'id' => 'other-application',
+	'passportNumber' => 'CHANGE-123',
+	'status' => 'offer-issued',
+	'isTestData' => 0,
+)));
+$blocked_passport_change = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'mode' => 'draft',
+	'draft' => intake_draft(array('passportNumber' => 'change 123')),
+)));
+intake_assert_same(409, $blocked_passport_change->get_status(), 'Changing an existing external-agent case to another active passport must return HTTP 409.');
+intake_assert_same('OLD-999', $GLOBALS['wpdb']->application['passportNumber'], 'A blocked passport change must leave the current record untouched.');
+intake_assert_same(array(), $GLOBALS['wpdb']->locks, 'The changed-passport conflict must not leak its advisory lock.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->application = intake_application(array(
+	'id' => 'application-1',
+	'wordpressUserId' => 42,
+	'passportNumber' => 'SELF-123',
+	'status' => 'Application in progress',
+	'isTestData' => 0,
+));
+$GLOBALS['wpdb']->duplicateApplications = array($GLOBALS['wpdb']->application);
+$same_passport_edit = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'applicationId' => 'application-1',
+	'expectedUpdatedAt' => '2026-08-20T10:00:00.000Z',
+	'mode' => 'draft',
+	'draft' => intake_draft(array('passportNumber' => 'self 123', 'fullName' => 'Edited Student')),
+)));
+intake_assert_same(200, $same_passport_edit->get_status(), 'A separator-only edit of the current passport must remain a valid self-edit.');
+intake_assert_same('Edited Student', $GLOBALS['wpdb']->application['fullName'], 'A self-edit must persist ordinary application changes.');
+
+$GLOBALS['wpdb'] = new MC_Intake_Test_Wpdb();
+$GLOBALS['wpdb']->duplicateApplications = array(intake_application(array(
+	'id' => 'advancement-existing-case',
+	'passportNumber' => 'ADVANCE-123',
+	'status' => 'enrollment-complete',
+	'isTestData' => 0,
+)));
+$GLOBALS['mc_intake_current_user'] = get_userdata(84);
+$dpt_ordinary_duplicate = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'draft',
+	'draft' => intake_draft(array(
+		'passportNumber' => 'advance 123',
+		'programme' => 'business-administration',
+	)),
+)));
+intake_assert_same(409, $dpt_ordinary_duplicate->get_status(), 'MC-ADMISSIONS-DPT must not receive an ordinary-programme duplicate bypass.');
+intake_assert_same(MC_Admissions_WordPress_Backend::DUPLICATE_PASSPORT_ERROR, $dpt_ordinary_duplicate->get_data()['error'], 'The DPT ordinary-programme conflict must use the generic duplicate message.');
+
+$advancement_duplicate_bypass = $plugin->rest_save_application(new WP_REST_Request(array(), array(
+	'mode' => 'draft',
+	'draft' => intake_draft(array(
+		'passportNumber' => 'advance 123',
+		'programme' => MC_Admissions_WordPress_Backend::FOUNDATION_ADVANCEMENT_BUSINESS_PROGRAMME,
+	)),
+)));
+intake_assert_same(200, $advancement_duplicate_bypass->get_status(), 'The authorized MC-ADMISSIONS-DPT Foundation Advancement save must remain exempt because reusing the student passport is intentional.');
+intake_assert_same(MC_Admissions_WordPress_Backend::FOUNDATION_ADVANCEMENT_BUSINESS_PROGRAMME, $GLOBALS['wpdb']->application['programmeCode'], 'The exempt Foundation Advancement draft must still be saved normally.');
 
 // Existing application saves require explicit optimistic concurrency. New
 // application creation remains compatible without an expected revision.
@@ -2145,6 +2510,13 @@ $GLOBALS['wpdb']->failAnnualSeatQuery = false;
 // for compatibility; agents receive an empty successful response while old
 // desktop versions update and never receive College-wide figures.
 $plugin->register_rest_routes();
+$passport_check_routes = array_values(array_filter($GLOBALS['mc_intake_routes'], static function ($route) {
+	return '/applications/passport-check' === $route['route'];
+}));
+intake_assert_same(1, count($passport_check_routes), 'The authenticated passport duplicate preflight route must be registered once.');
+intake_assert_same(WP_REST_Server::CREATABLE, $passport_check_routes[0]['args']['methods'], 'Passport duplicate preflight must be POST-only.');
+intake_assert_same(array($plugin, 'rest_check_application_passport'), $passport_check_routes[0]['args']['callback'], 'Passport duplicate preflight must use its privacy-preserving handler.');
+intake_assert_same(array($plugin, 'permission_authenticated'), $passport_check_routes[0]['args']['permission_callback'], 'Passport duplicate preflight must require an authenticated admissions session.');
 $capacity_routes = array_values(array_filter($GLOBALS['mc_intake_routes'], static function ($route) {
 	return '/intake-capacities' === $route['route'];
 }));

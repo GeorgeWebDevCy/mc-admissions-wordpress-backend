@@ -362,6 +362,6 @@ $final_reactivation = $plugin->rest_update_agent_status(new WP_REST_Request(arra
 agent_status_assert_same(200, $final_reactivation->get_status(), 'Reactivation must succeed after all critical writes can be verified.');
 
 $source = file_get_contents(dirname(__DIR__) . '/mc-admissions-wordpress-backend.php');
-agent_status_assert_same(true, false !== strpos($source, 'Version: 0.2.75'), 'The plugin header must advertise version 0.2.75.');
+agent_status_assert_same(true, false !== strpos($source, 'Version: 0.2.76'), 'The plugin header must advertise version 0.2.76.');
 
 echo "Agent status management tests passed.\n";
